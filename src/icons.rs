@@ -149,27 +149,27 @@ mod tests {
     #[test]
     fn every_icon_takes_one_column() {
         for icons in [NERD, PLAIN] {
-            for icon in [
-                icons.logo,
-                icons.account,
-                icons.inbox,
-                icons.sent,
-                icons.drafts,
-                icons.trash,
-                icons.junk,
-                icons.archive,
-                icons.all,
-                icons.folder,
-                icons.flagged,
-                icons.unread,
-                icons.replied,
-                icons.attachment,
-                icons.search,
-                icons.loading,
-                icons.offline,
-                icons.compose,
+            for (name, icon) in [
+                ("logo", icons.logo),
+                ("account", icons.account),
+                ("inbox", icons.inbox),
+                ("sent", icons.sent),
+                ("drafts", icons.drafts),
+                ("trash", icons.trash),
+                ("junk", icons.junk),
+                ("archive", icons.archive),
+                ("all", icons.all),
+                ("folder", icons.folder),
+                ("flagged", icons.flagged),
+                ("unread", icons.unread),
+                ("replied", icons.replied),
+                ("attachment", icons.attachment),
+                ("search", icons.search),
+                ("loading", icons.loading),
+                ("offline", icons.offline),
+                ("compose", icons.compose),
             ] {
-                assert_eq!(icon.width(), 1, "{icon:?}");
+                assert_eq!(icon.width(), 1, "{name}");
             }
         }
     }

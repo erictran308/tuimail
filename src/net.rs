@@ -370,13 +370,16 @@ mod tests {
     #[test]
     fn a_login_has_nothing_that_could_end_its_command() {
         assert!(check_login("me@example.org", "pass word").is_ok());
-        for (user, secret) in [
+        for (case, (user, secret)) in [
             ("me\r\nA1 DELETE INBOX", "x"),
             ("me", "x\0y"),
             ("me", "token\x01auth=Bearer other"),
             ("me\x01", "x"),
-        ] {
-            assert!(check_login(user, secret).is_err(), "{user:?} {secret:?}");
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(check_login(user, secret).is_err(), "case {case}");
         }
     }
 
