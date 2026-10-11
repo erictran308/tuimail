@@ -21,6 +21,8 @@ const MAX_LINE: usize = 8 * 1024;
 const MAX_DATA_LINE: usize = 4 << 20;
 /// The most a list (UIDL, LIST) may hold.
 const MAX_LIST: usize = 16 << 20;
+/// The most messages a POP3 listing may name.
+pub const MAX_IDS: usize = 100_000;
 
 pub struct Pop3<S> {
     stream: BufReader<S>,
@@ -175,9 +177,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Pop3<S> {
 
     /// Logs in with a password or, for `Auth::Oauth2`, a token.
     pub async fn login(&mut self, user: &str, secret: &str, auth: Auth) -> Result<()> {
-        if user.contains(['\r', '\n', '\0']) || secret.contains(['\r', '\n', '\0']) {
-            bail!("the username or password has a line break in it");
-        }
+        crate::net::check_login(user, secret)?;
         let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
         let result = match auth {
             Auth::Oauth2 => {
@@ -211,13 +211,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Pop3<S> {
             .context("the server can't list its messages' ids (UIDL)")?;
         let data = self.data(MAX_LIST).await?;
         let mut out = Vec::new();
+        let mut numbers = std::collections::HashSet::new();
+        let mut ids = std::collections::HashSet::new();
         for line in String::from_utf8_lossy(&data).lines() {
             let mut parts = line.split_whitespace();
             let (Some(n), Some(id)) = (parts.next(), parts.next()) else {
                 continue;
             };
-            if let (Ok(n), true) = (n.parse(), valid_uid(id)) {
+            // Each message once, each id once: a list repeating them is
+            // only longer, not more mail.
+            if let (Ok(n), true) = (n.parse::<u32>(), valid_uid(id))
+                && !numbers.contains(&n)
+                && !ids.contains(id)
+            {
+                numbers.insert(n);
+                ids.insert(id.to_string());
                 out.push((n, id.to_string()));
+            }
+            if out.len() > MAX_IDS {
+                bail!(
+                    "the server lists more than {MAX_IDS} messages: tuimail reads at most that many"
+                );
             }
         }
         Ok(out)
@@ -335,6 +349,42 @@ pub mod tests {
             }
         });
         client
+    }
+
+    #[tokio::test]
+    async fn a_listing_counts_each_message_once_and_has_a_limit() {
+        let login = |uidl: &'static str| {
+            scripted(vec![
+                ("", "+OK POP3 ready\r\n"),
+                ("CAPA", "+OK\r\nUSER\r\nUIDL\r\n.\r\n"),
+                ("USER me@example.org", "+OK\r\n"),
+                ("PASS secret", "+OK\r\n"),
+                ("UIDL", uidl),
+            ])
+        };
+        let mut pop = Pop3::new(login("+OK\r\n1 a\r\n1 b\r\n2 a\r\n2 c\r\n.\r\n"));
+        pop.greeting().await.unwrap();
+        pop.capa().await.unwrap();
+        pop.login("me@example.org", "secret", Auth::Password)
+            .await
+            .unwrap();
+        assert_eq!(
+            pop.uidl().await.unwrap(),
+            [(1, "a".into()), (2, "c".into())]
+        );
+
+        let mut many = String::from("+OK\r\n");
+        for n in 1..=MAX_IDS + 1 {
+            many.push_str(&format!("{n} id{n}\r\n"));
+        }
+        many.push_str(".\r\n");
+        let mut pop = Pop3::new(login(Box::leak(many.into_boxed_str())));
+        pop.greeting().await.unwrap();
+        pop.capa().await.unwrap();
+        pop.login("me@example.org", "secret", Auth::Password)
+            .await
+            .unwrap();
+        assert!(pop.uidl().await.is_err());
     }
 
     #[tokio::test]

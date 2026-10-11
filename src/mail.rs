@@ -14,12 +14,18 @@ use crate::text;
 /// The longest subject, name or address list kept, in characters.
 pub const MAX_SUBJECT: usize = 400;
 pub const MAX_NAME: usize = 120;
+/// The longest address SMTP carries (RFC 5321's path less its brackets).
+pub const MAX_ADDRESS: usize = 254;
 pub const MAX_ADDRESSES: usize = 2000;
 /// Message ids are kept up to this long, and at most this many references.
 const MAX_ID: usize = 250;
 const MAX_REFERENCES: usize = 50;
 /// The most HTML turned into text; past it the rest is cut, and said so.
 const MAX_HTML: usize = 2 << 20;
+/// The deepest nesting of HTML laid out as such; deeper is shown as its
+/// text alone. Real mail stays far below it, and html2text's time and
+/// stack grow with it (2M characters of nesting took 15 s to lay out).
+const MAX_DEPTH: usize = 2_000;
 /// The most plain text shown.
 const MAX_TEXT: usize = 4 << 20;
 
@@ -35,10 +41,19 @@ impl Addr {
     /// angle brackets or the like is quoted, so it reads back as one name
     /// and never as more addresses (`"Doe, John" <john@x.y>`).
     pub fn display(&self) -> String {
+        // An address that isn't a plain one (a sender can put a `"` in it)
+        // always goes in brackets, where a `"` quotes nothing.
+        let plain = crate::account::valid_address(&self.addr);
         if self.name.is_empty() || self.name == self.addr {
-            return self.addr.clone();
+            return if plain {
+                self.addr.clone()
+            } else {
+                format!("<{}>", self.addr)
+            };
         }
-        let special = |c: char| "()<>[]:;@\\,.\"".contains(c);
+        // Look-alikes of the characters that make a name read as an
+        // address (fullwidth ＜＞＠, single angle quotes) count too.
+        let special = |c: char| "()<>[]:;@\\,.\"＜＞＠‹›«»".contains(c);
         if self.name.chars().any(special) {
             let escaped = self.name.replace('\\', "\\\\").replace('"', "\\\"");
             format!("\"{escaped}\" <{}>", self.addr)
@@ -111,7 +126,9 @@ fn addrs(address: Option<&Address>) -> Vec<Addr> {
     address
         .iter()
         .filter_map(|a| {
-            let addr = text::one_line(a.address()?, MAX_NAME);
+            // Whole or not at all: a cut address is someone else's.
+            let addr = a.address().filter(|a| a.chars().count() <= MAX_ADDRESS)?;
+            let addr = text::one_line(addr, MAX_ADDRESS);
             let name = text::one_line(a.name().unwrap_or(""), MAX_NAME);
             // Quotes around a name are its spelling, not part of it.
             let name = name.trim_matches(['"', '\'']).trim().to_string();
@@ -217,25 +234,10 @@ pub fn parse(raw: &[u8]) -> Option<Parsed> {
         .attachments()
         .enumerate()
         .map(|(i, part)| {
-            let mime = part
-                .content_type()
-                .map(|ct| match ct.subtype() {
-                    Some(sub) => format!("{}/{}", ct.ctype(), sub),
-                    None => ct.ctype().to_string(),
-                })
-                .unwrap_or_else(|| "application/octet-stream".into())
-                .to_ascii_lowercase();
-            let name = match part.attachment_name() {
-                Some(name) => name.to_string(),
-                None if part.message().is_some() => "forwarded message.eml".into(),
-                None if mime.starts_with("image/") => {
-                    format!("image.{}", mime.trim_start_matches("image/"))
-                }
-                None => "attachment".into(),
-            };
+            let mime = mime_of(part);
             Attachment {
                 index: i as u32,
-                name: safe_file_name(&name),
+                name: part_name(part, &mime),
                 mime: text::one_line(&mime, 100),
                 size: part.len(),
             }
@@ -276,7 +278,7 @@ fn unsubscribe_link(value: &HeaderValue) -> Option<String> {
                 .collect::<Vec<_>>()
         })
         .find(|l| l.starts_with("https://") || l.starts_with("mailto:"))
-        .filter(|l| l.len() < 2000 && !l.chars().any(|c| c.is_whitespace() || c.is_control()))
+        .filter(|l| l.len() < 2000 && usable_link(l))
 }
 
 /// The start of a message's text for the list. Lays out HTML, so it runs
@@ -287,16 +289,36 @@ pub fn preview_of(raw: &[u8]) -> String {
         .unwrap_or_default()
 }
 
+/// An attachment's type, lower case: `image/png`.
+fn mime_of(part: &mail_parser::MessagePart) -> String {
+    part.content_type()
+        .map(|ct| match ct.subtype() {
+            Some(sub) => format!("{}/{}", ct.ctype(), sub),
+            None => ct.ctype().to_string(),
+        })
+        .unwrap_or_else(|| "application/octet-stream".into())
+        .to_ascii_lowercase()
+}
+
+/// An attachment's safe file name: the one listed, saved and opened
+/// alike, so what was checked before opening is what's opened.
+fn part_name(part: &mail_parser::MessagePart, mime: &str) -> String {
+    let name = match part.attachment_name() {
+        Some(name) => name.to_string(),
+        None if part.message().is_some() => "forwarded message.eml".into(),
+        None if mime.starts_with("image/") => {
+            format!("image.{}", mime.trim_start_matches("image/"))
+        }
+        None => "attachment".into(),
+    };
+    safe_file_name(&name)
+}
+
 /// The bytes of attachment `index`, and its safe file name.
 pub fn attachment(raw: &[u8], index: u32) -> Option<(String, Vec<u8>)> {
     let message = MessageParser::default().parse(raw)?;
     let part = message.attachment(index)?;
-    let name = match part.attachment_name() {
-        Some(name) => name.to_string(),
-        None if part.message().is_some() => "forwarded message.eml".into(),
-        None => "attachment".into(),
-    };
-    Some((safe_file_name(&name), part.contents().to_vec()))
+    Some((part_name(part, &mime_of(part)), part.contents().to_vec()))
 }
 
 /// A file name from a sender, made safe to save under: no folders, no
@@ -316,11 +338,25 @@ pub fn safe_file_name(name: &str) -> String {
         .trim_start_matches(['.', ' '])
         .trim_end_matches(['.', ' '])
         .to_string();
-    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.len() == 4
-            && stem.as_bytes()[3].is_ascii_digit());
+    // Windows takes a device name before the first dot, trailing spaces
+    // and dots dropped (`CON .txt` is the console), with COM and LPT
+    // numbered 0-9 or ¹²³.
+    let stem = cleaned.split('.').next().unwrap_or("");
+    let stem = stem.trim_end_matches([' ', '.']).to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        stem.strip_prefix(prefix).is_some_and(|n| {
+            let mut chars = n.chars();
+            matches!(
+                (chars.next(), chars.next()),
+                (Some('0'..='9' | '¹' | '²' | '³'), None)
+            )
+        })
+    };
+    let reserved = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || numbered("COM")
+        || numbered("LPT");
     if cleaned.is_empty() || reserved {
         cleaned = format!("attachment {cleaned}").trim().to_string();
     }
@@ -367,6 +403,35 @@ pub struct Body {
 }
 
 impl Body {
+    /// What link `n` says in the message ("Try it", "Unsubscribe"), to tell
+    /// links to one site apart in the `o` list. Empty when it says nothing,
+    /// or when what it says looks like an address: the list shows the real
+    /// one beside it, and a link's text can claim any site.
+    pub fn link_text(&self, n: usize) -> String {
+        let mut pieces: Vec<&str> = Vec::new();
+        for seg in self.lines.iter().flatten() {
+            if seg.role != Role::Link(n) {
+                continue;
+            }
+            // html2text marks headings with #: not part of what it says.
+            let piece = seg.text.trim().trim_start_matches(['#', ' ']).trim();
+            if !piece.is_empty() && !pieces.contains(&piece) {
+                pieces.push(piece);
+            }
+        }
+        let said = text::one_line(&pieces.join(" "), 60);
+        let lower = said.to_lowercase();
+        let looks_like_address = lower.contains("://")
+            || lower.starts_with("www.")
+            || lower.starts_with("mailto:")
+            || (!said.contains(' ') && (said.contains('.') || said.contains('@')));
+        if looks_like_address {
+            String::new()
+        } else {
+            said
+        }
+    }
+
     /// The number of link `url`; `None` past [`MAX_LINKS`].
     fn link(&mut self, url: &str) -> Option<usize> {
         match self.links.iter().position(|l| l == url) {
@@ -721,9 +786,16 @@ pub fn render_html(html: &str, width: usize) -> Body {
         Some((i, _)) => (&html[..i], true),
         None => (html, false),
     };
+    if too_deep(html) {
+        return render_text(&strip_tags(html), width, false);
+    }
+    // Too narrow is laid out anyway: html2text giving up there drops the
+    // sender's whole nesting by recursion, which can overflow even the
+    // render stack.
     let lines = html2text::config::rich()
         .link_footnotes(false)
         .no_table_borders()
+        .allow_width_overflow()
         .lines_from_read(html.as_bytes(), width);
     let Ok(lines) = lines else {
         return render_text(&strip_tags(html), width, false);
@@ -787,6 +859,47 @@ pub fn usable_link(url: &str) -> bool {
 }
 
 /// HTML without its tags: the fallback when html2text can't read it.
+/// Whether HTML nests deeper than [`MAX_DEPTH`], counted in one pass over
+/// its tags: an opening tag goes one in, a closing one out. Elements that
+/// have no end (`<br>`) or whose end is usually left out (`<p>`, `<li>`,
+/// table cells) don't count, so ordinary mail isn't taken for deep.
+fn too_deep(html: &str) -> bool {
+    const LOOSE: [&str; 22] = [
+        "br", "img", "hr", "meta", "link", "input", "area", "base", "col", "embed", "source",
+        "track", "wbr", "param", "p", "li", "td", "th", "tr", "option", "dt", "dd",
+    ];
+    let mut depth: usize = 0;
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while let Some(at) = bytes[i..].iter().position(|&b| b == b'<') {
+        i += at + 1;
+        let closing = bytes.get(i) == Some(&b'/');
+        let start = i + usize::from(closing);
+        let len = bytes[start..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric())
+            .count();
+        if len == 0 {
+            continue;
+        }
+        let name = html[start..start + len].to_ascii_lowercase();
+        if LOOSE.contains(&name.as_str()) {
+            continue;
+        }
+        let end = bytes[start..].iter().position(|&b| b == b'>');
+        let self_closing = end.is_some_and(|e| e > 0 && bytes[start + e - 1] == b'/');
+        if closing {
+            depth = depth.saturating_sub(1);
+        } else if !self_closing {
+            depth += 1;
+            if depth > MAX_DEPTH {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn strip_tags(html: &str) -> String {
     let mut out = String::new();
     let mut in_tag = false;
@@ -805,7 +918,7 @@ fn strip_tags(html: &str) -> String {
 /// forward: the plain part, else the HTML as text.
 pub fn plain_text(parsed: &Parsed) -> String {
     if let Some(text) = &parsed.text {
-        let text = text::clean(text);
+        let text = text::clean(text::first_chars(text, MAX_TEXT));
         return if parsed.flowed {
             unflow(&text).join("\n")
         } else {
@@ -816,9 +929,13 @@ pub fn plain_text(parsed: &Parsed) -> String {
         return String::new();
     };
     let html = text::first_chars(html, MAX_HTML);
+    if too_deep(html) {
+        return text::clean(&strip_tags(html));
+    }
     html2text::config::plain()
         .link_footnotes(true)
         .no_table_borders()
+        .allow_width_overflow()
         .string_from_read(html.as_bytes(), 76)
         .map(|t| text::clean(&t))
         .unwrap_or_else(|_| strip_tags(html))
@@ -1017,6 +1134,54 @@ see https://example.com/menu. Thanks!\r\n\
     }
 
     #[test]
+    fn a_link_says_what_its_text_says_unless_that_looks_like_an_address() {
+        let raw = b"From: a@b.c\r\nContent-Type: text/html\r\n\r\n\
+<h2><a href=\"https://r.example.com/1\">Aerial view</a></h2>\
+<p><a href=\"https://r.example.com/2\">Try it</a></p>\
+<p><a href=\"https://r.example.com/3\"><img src=\"x.png\" alt=\"Logo\"></a></p>\
+<p><a href=\"https://evil.example/a\">paypal.com</a></p>\
+<p><a href=\"https://evil.example/b\">https://paypal.com/login</a></p>\
+<p><a href=\"https://r.example.com/2\">Try it</a></p>";
+        let parsed = parse(raw).unwrap();
+        let body = render(&parsed, 60, false);
+        assert_eq!(body.links.len(), 5, "{:?}", body.links);
+        let said: Vec<String> = (0..body.links.len()).map(|n| body.link_text(n)).collect();
+        assert_eq!(said, ["Aerial view", "Try it", "", "", ""]);
+    }
+
+    #[test]
+    fn windows_device_names_never_pass() {
+        for name in [
+            "CON .txt",
+            "nul .pdf",
+            "PRN .txt",
+            "COM1 .txt",
+            "LPT1 .txt",
+            "COM\u{b9}.txt",
+            "LPT\u{b2}.txt",
+            "CONIN$.txt",
+            "CONOUT$.txt",
+            "CON\t.txt",
+            "aux",
+        ] {
+            assert!(safe_file_name(name).starts_with("attachment"), "{name}");
+        }
+        for fine in ["CONSOLE.txt", "COM10.txt", "nullish.pdf", "report.pdf"] {
+            assert!(!safe_file_name(fine).starts_with("attachment"), "{fine}");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_attachment_is_saved_under_the_name_it_was_listed_by() {
+        let raw = b"From: a@b.c\r\nSubject: x\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nsee\r\n\
+--b\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n\r\nPGh0bWw+PC9odG1sPg==\r\n--b--\r\n";
+        let listed = parse(raw).unwrap().attachments[0].name.clone();
+        assert_eq!(listed, "image.png");
+        assert_eq!(attachment(raw, 0).unwrap().0, listed);
+    }
+
+    #[test]
     fn plain_is_preferred_only_when_asked() {
         let raw = b"From: a@b.c\r\nContent-Type: multipart/alternative; boundary=x\r\n\r\n\
 --x\r\nContent-Type: text/plain\r\n\r\nplain version\r\n\
@@ -1105,6 +1270,30 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
             .unwrap();
         let body = handle.join().unwrap();
         assert!(!body.lines.is_empty());
+    }
+
+    /// The deepest nesting MAX_HTML allows, behind quotes that are too
+    /// wide for the width: html2text once gave up there and dropped the
+    /// whole deep tree by recursion, which a 256 MB stack may not hold.
+    #[test]
+    fn the_deepest_html_allowed_is_laid_out_on_the_render_stack() {
+        let quotes = "<blockquote>".repeat(200);
+        let depth = (MAX_HTML - quotes.len() - 1) / 3;
+        let html = format!("{quotes}{}x", "<b>".repeat(depth));
+        assert!(html.chars().count() <= MAX_HTML);
+        let raw = format!("From: a@b.c\r\nContent-Type: text/html\r\n\r\n{html}");
+        let parsed = parse(raw.as_bytes()).unwrap();
+        let handle = std::thread::Builder::new()
+            .stack_size(crate::mail::RENDER_STACK)
+            .spawn(move || (render(&parsed, 400, false), plain_text(&parsed)))
+            .unwrap();
+        let (body, plain) = handle.join().unwrap();
+        assert!(!body.lines.is_empty());
+        assert!(plain.contains('x'));
+        // Ordinary depth is still laid out as HTML.
+        assert!(!too_deep(&format!("{}x", "<div><p>".repeat(1_000))));
+        assert!(too_deep(&"<div>".repeat(MAX_DEPTH + 1)));
+        assert!(!too_deep(&"<div></div>".repeat(MAX_DEPTH * 2)));
     }
 
     #[test]

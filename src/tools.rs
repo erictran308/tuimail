@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config;
 
@@ -112,12 +112,13 @@ pub fn open_externally(target: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// File types opened without asking: documents and media that their apps
-/// open without running anything in them.
+/// File types opened without asking: pictures, sound, video, PDF and plain
+/// text, which their apps show without running anything in them. Office
+/// files (macros, linked content), spreadsheets' CSV (formulas), archives
+/// (what's inside), calendars and contacts (they're imported) ask first.
 const SAFE_TO_OPEN: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "avif", "bmp", "tif", "tiff", "mp4",
     "m4v", "mov", "mkv", "webm", "mp3", "m4a", "aac", "ogg", "opus", "wav", "flac", "pdf", "txt",
-    "md", "csv", "ics", "vcf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "zip",
 ];
 
 pub fn safe_to_open(name: &str) -> bool {
@@ -221,16 +222,9 @@ pub fn editor(setting: &[String]) -> Option<Vec<String>> {
 /// waits for it, and returns what it saved. The terminal must be given to
 /// it first.
 pub fn edit(argv: &[String], dir: &Path, text: &str) -> Result<String> {
-    use ring::rand::SecureRandom;
     std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    let mut random = [0u8; 8];
-    let _ = ring::rand::SystemRandom::new().fill(&mut random);
-    let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    yours_alone(dir)?;
+    let name = random_name()?;
     let path = dir.join(format!("message-{name}.txt"));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -238,22 +232,93 @@ pub fn edit(argv: &[String], dir: &Path, text: &str) -> Result<String> {
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     options.open(&path)?.write_all(text.as_bytes())?;
     let result = (|| {
+        // In the private folder, not wherever tuimail was started: an
+        // editor may read settings from the folder it runs in.
         let status = std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .arg(&path)
+            .current_dir(dir)
             .status()
             .with_context(|| format!("cannot run {}", crate::text::one_line(&argv[0], 80)))?;
         if !status.success() {
             bail!("the editor ended with {status}; the text wasn't changed");
         }
-        let meta = std::fs::metadata(&path)?;
-        if meta.len() > 16 << 20 {
-            bail!("the text is too long");
-        }
-        Ok(std::fs::read_to_string(&path)?)
+        read_back(&path)
     })();
     let _ = std::fs::remove_file(&path);
     result
+}
+
+/// 64 random bits as hex, for a file or folder name no one can guess.
+fn random_name() -> Result<String> {
+    use ring::rand::SecureRandom;
+    let mut random = [0u8; 8];
+    ring::rand::SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| anyhow!("the system's random numbers failed"))?;
+    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Checks that `dir` is a real folder that's yours and closed to others
+/// (made so if it can be): one someone else made first, in a shared place,
+/// could have the editor's file swapped or read.
+fn yours_alone(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let shown = config::shown(dir);
+        let meta = std::fs::symlink_metadata(dir)?;
+        if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != config::euid() {
+            bail!("{shown} isn't a folder of yours alone, so the editor isn't run there");
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("cannot protect {shown}"))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// A new folder of the user's alone in the system's temporary folder,
+/// named so no one can make it first: where the demo, which has no data
+/// folder, gives the editor its file.
+pub fn private_temp_dir() -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("tuimail-{}", random_name()?));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(&dir)
+        .with_context(|| format!("cannot create {}", config::shown(&dir)))?;
+    Ok(dir)
+}
+
+/// What the editor saved, if it's still a plain file of a sane size: read
+/// without following a link put in its place or waiting on a pipe.
+fn read_back(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        bail!("what the editor left isn't a plain file");
+    }
+    const MAX: u64 = 16 << 20;
+    if meta.len() > MAX {
+        bail!("the text is too long");
+    }
+    let mut text = String::new();
+    file.take(MAX + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX {
+        bail!("the text is too long");
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -289,6 +354,15 @@ mod tests {
         assert!(safe_to_open("photo.JPG"));
         assert!(!safe_to_open("invoice.pdf.exe"));
         assert!(!safe_to_open("macro.docm"));
+        for asks in [
+            "sheet.csv",
+            "letter.docx",
+            "files.zip",
+            "invite.ics",
+            "notes.md",
+        ] {
+            assert!(!safe_to_open(asks), "{asks}");
+        }
         assert!(!safe_to_open("noext"));
     }
 
@@ -307,5 +381,32 @@ mod tests {
         let failing = vec!["/bin/sh".to_string(), "-c".into(), "exit 1".into()];
         assert!(edit(&failing, &dir, "x").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_editor_works_only_in_a_folder_of_yours_on_a_plain_file() {
+        let sh = |script: &str| vec!["/bin/sh".to_string(), "-c".into(), script.into()];
+        let base = std::env::temp_dir().join(format!("tuimail-edit2-{}", std::process::id()));
+        let dir = base.join("drafts");
+        std::fs::create_dir_all(&dir).unwrap();
+        // What the editor leaves at the path must be a plain file: a pipe
+        // is refused at once, a link isn't followed.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (argv, d) = (sh("rm \"$0\"; mkfifo \"$0\""), dir.clone());
+        std::thread::spawn(move || tx.send(edit(&argv, &d, "x").is_err()));
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
+        assert!(edit(&sh("rm \"$0\"; ln -s /dev/null \"$0\""), &dir, "x").is_err());
+        // A folder through a link isn't used.
+        std::os::unix::fs::symlink(&dir, base.join("link")).unwrap();
+        assert!(edit(&sh("true"), &base.join("link"), "x").is_err());
+        // The demo's folder: new, the user's alone.
+        use std::os::unix::fs::PermissionsExt;
+        let private = private_temp_dir().unwrap();
+        let mode = std::fs::metadata(&private).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert_ne!(private, private_temp_dir().unwrap(), "a new one each time");
+        std::fs::remove_dir(&private).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

@@ -162,9 +162,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Smtp<S> {
     }
 
     pub async fn login(&mut self, user: &str, secret: &str, auth: Auth) -> Result<()> {
-        if user.contains(['\r', '\n', '\0']) || secret.contains(['\r', '\n', '\0']) {
-            bail!("the username or password has a line break in it");
-        }
+        crate::net::check_login(user, secret)?;
         let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
         let refused = |reply: Reply| anyhow!(Refused(text::one_line(&reply.text, 200)));
         match auth {
@@ -320,9 +318,13 @@ async fn open(endpoint: &Endpoint, user: &str, secret: &str, auth: Auth) -> Resu
         smtp = Smtp::<Conn>::new(net::start_tls(tcp, endpoint).await?);
         smtp.ehlo().await?;
     }
-    smtp.login(user, secret, auth)
-        .await
-        .context("cannot log in to send")?;
+    // A server that asks for no login gets no password: a relay on this
+    // computer has no use for it.
+    if smtp.extensions.iter().any(|e| e.starts_with("AUTH")) {
+        smtp.login(user, secret, auth)
+            .await
+            .context("cannot log in to send")?;
+    }
     Ok(smtp)
 }
 

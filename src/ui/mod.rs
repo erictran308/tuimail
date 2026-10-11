@@ -151,6 +151,42 @@ pub fn fit(text: &str, width: usize) -> String {
     out
 }
 
+/// `text` cut in the middle to `width` columns, with `…`: its start and
+/// its end stay (an address's name and its domain).
+pub fn fit_middle(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    if width < 3 {
+        return fit(text, width);
+    }
+    let tail = fit_end(text, (width - 1) / 2 + 1);
+    let head = fit(text, width - tail.width() + 1);
+    format!("{}{}", head.trim_end_matches('…'), tail)
+}
+
+/// `text` cut to `width` columns from the left, with `…`: what it ends
+/// with stays (a host's site).
+pub fn fit_end(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for ch in text.chars().rev() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width - 1 {
+            break;
+        }
+        used += w;
+        kept.push(ch);
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+}
+
 /// `text` cut or padded to exactly `width` columns.
 pub fn pad(text: &str, width: usize) -> String {
     let cut = fit(text, width);
@@ -339,7 +375,26 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::Links => " `Enter` open · `y` copy · `Esc` close ",
         PickerKind::Attachments => " `Enter` open · `s` save to Downloads · `Esc` close ",
     };
-    let widest = picker.items.iter().map(|i| i.width()).max().unwrap_or(0);
+    // Links in columns: the site (from the whole URL, never from what the
+    // link says), what it says, then the URL.
+    let columns =
+        matches!(picker.kind, PickerKind::Links) && picker.labels.len() == picker.items.len();
+    let label_width = |column: fn(&(String, String)) -> &String| {
+        picker
+            .labels
+            .iter()
+            .map(|l| column(l).width())
+            .max()
+            .unwrap_or(0)
+    };
+    let (hosts, saids) = if columns {
+        (label_width(|l| &l.0), label_width(|l| &l.1))
+    } else {
+        (0, 0)
+    };
+    let gap = |w: usize| if w > 0 { w + 2 } else { 0 };
+    let widest =
+        picker.items.iter().map(|i| i.width()).max().unwrap_or(0) + gap(hosts) + gap(saids);
     let width = (widest + 6)
         .max(picker.title.width() + 4)
         .max(hint.replace('`', "").width() + 4)
@@ -362,6 +417,7 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
     let rows = usize::from(inner.height);
     let scroll = picker.selected.saturating_sub(rows.saturating_sub(1));
     let room = usize::from(inner.width).saturating_sub(2);
+    let (host_width, said_width) = (hosts.min(room / 3), saids.min(room / 3));
     let lines: Vec<Line> = picker
         .items
         .iter()
@@ -376,6 +432,15 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(c.text)
             };
             let item = match picker.kind {
+                PickerKind::Links if columns => {
+                    let (host, said) = &picker.labels[i];
+                    let mut row = format!("{}  ", pad(&fit_end(host, host_width), host_width));
+                    if said_width > 0 {
+                        row.push_str(&format!("{}  ", pad(said, said_width)));
+                    }
+                    row.push_str(item);
+                    fit(&row, room)
+                }
                 // A link is cut from the left: its site stays in view.
                 PickerKind::Links if item.width() > room => {
                     let host = crate::app::link_host(item);
@@ -419,24 +484,42 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
             format!("{} will go to Trash.", plural(uids.len(), "message")),
             " `y` move · any other key keeps them ",
         ),
-        Confirm::Send { recipients } => {
-            let subject = app
-                .composer
-                .as_ref()
-                .map(|c| c.draft().subject)
-                .unwrap_or_default();
-            let text = if subject.trim().is_empty() {
+        Confirm::Send {
+            subject,
+            recipients,
+            attachments,
+            ..
+        } => {
+            // Every address it goes to (Bcc too) and every file, as asked
+            // about: what `y` sends.
+            let mut text = if subject.is_empty() {
                 format!(
                     "It has no subject. Send it to {} anyway?",
-                    plural(*recipients, "recipient")
+                    plural(recipients.len(), "recipient")
                 )
             } else {
                 format!(
                     "Send “{}” to {}?",
-                    fit(subject.trim(), 50),
-                    plural(*recipients, "recipient")
+                    fit(subject, 50),
+                    plural(recipients.len(), "recipient")
                 )
             };
+            const SHOWN: usize = 8;
+            for r in recipients.iter().take(SHOWN) {
+                text.push_str(&format!("\n  {}", fit_middle(r, 60)));
+            }
+            if recipients.len() > SHOWN {
+                text.push_str(&format!("\n  and {} more", recipients.len() - SHOWN));
+            }
+            if !attachments.is_empty() {
+                text.push_str(&format!("\n{}:", plural(attachments.len(), "file")));
+                for a in attachments.iter().take(4) {
+                    text.push_str(&format!("\n  {}", fit_middle(a, 60)));
+                }
+                if attachments.len() > 4 {
+                    text.push_str(&format!("\n  and {} more", attachments.len() - 4));
+                }
+            }
             (" Send? ", text, " `y` send · any other key keeps writing ")
         }
         Confirm::CloseComposer => (
@@ -451,6 +534,23 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
                 fit(name, 60)
             ),
             " `y` open · any other key cancels ",
+        ),
+        Confirm::OpenLink { url } => (
+            " Unsubscribe? ",
+            format!(
+                "Open the list's unsubscribe page on {}?\n  {}",
+                fit_middle(&crate::app::link_host(url), 50),
+                fit_middle(url, 60)
+            ),
+            " `y` open · any other key cancels ",
+        ),
+        Confirm::Quit { waiting } => (
+            " Quit? ",
+            format!(
+                "{} haven't reached the server yet (it's offline or busy). Quit anyway, and they're lost? Deletes for good are made at the next start.",
+                plural(*waiting, "change")
+            ),
+            " `y` quit · any other key stays ",
         ),
         Confirm::RemoveAccount(i) => (
             " Remove the account? ",

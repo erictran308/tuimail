@@ -95,7 +95,7 @@ fn titles(app: &App) -> (String, String) {
                 (f.unread, f.total.max(app.items.len() as u32))
             });
             (
-                format!("{name} · {}", a.account.shown_name()),
+                format!("{name} · {}", app.account_name(*account)),
                 unread_text(unread, total),
             )
         }
@@ -196,11 +196,7 @@ fn row(
         || matches!(app.place, Place::AllInboxes) && app.accounts.len() > 1
     {
         let label = match app.place {
-            Place::AllInboxes => app
-                .accounts
-                .get(item.account)
-                .map(|a| a.account.shown_name())
-                .unwrap_or_default(),
+            Place::AllInboxes => app.account_tag(item.account),
             _ => app.folder_name(item.account, &m.folder),
         };
         format!("[{}] ", fit(&label, 10))

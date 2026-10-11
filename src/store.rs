@@ -157,6 +157,16 @@ CREATE TABLE IF NOT EXISTS bodies (
     raw BLOB NOT NULL,
     PRIMARY KEY (account, folder, uid)
 );
+-- Deletes for good asked for and not yet confirmed by the server: made
+-- again at the next start, so quitting (or a lost connection) never leaves
+-- a message the user deleted on the server, or hidden there but kept.
+CREATE TABLE IF NOT EXISTS pending_deletes (
+    account TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    uidvalidity INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    PRIMARY KEY (account, folder, uid)
+);
 CREATE TABLE IF NOT EXISTS pop_seen (
     account TEXT NOT NULL,
     pop_id TEXT NOT NULL,
@@ -214,14 +224,17 @@ fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let shown = config::shown(path);
-        let db = Connection::open(path).with_context(|| format!("cannot open {shown}"))?;
+        // Not through a link: the cache is the file in the data folder.
+        let flags = rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let db = Connection::open_with_flags(path, flags)
+            .with_context(|| format!("cannot open {shown}"))?;
         // Deleted rows (a message deleted) are overwritten, not left
         // readable in the file's free pages; under WAL once checkpointed,
         // which removals do.
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA secure_delete = ON;")?;
         db.execute_batch(SCHEMA)
             .with_context(|| format!("cannot set up {shown}"))?;
-        Self::protect(path);
+        Self::protect(path).with_context(|| format!("cannot protect {shown}"))?;
         Ok(Self { db })
     }
 
@@ -234,18 +247,23 @@ impl Store {
 
     /// The database and its journal files readable only by you, whatever
     /// the umask.
-    fn protect(path: &Path) {
+    fn protect(path: &Path) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             for suffix in ["", "-wal", "-shm"] {
                 let mut file = path.as_os_str().to_owned();
                 file.push(suffix);
-                let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+                match std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)) {
+                    // The journal files come and go with the connection.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !suffix.is_empty() => {}
+                    result => result?,
+                }
             }
         }
         #[cfg(not(unix))]
         let _ = path;
+        Ok(())
     }
 
     /// Writes deleted pages out of the journal, so removed mail is gone
@@ -668,6 +686,67 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Notes deletes for good on their way to the server.
+    pub fn add_pending_deletes(
+        &mut self,
+        account: &str,
+        folder: &str,
+        uidvalidity: u32,
+        uids: &[u32],
+    ) -> Result<()> {
+        let tx = self.db.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO pending_deletes (account, folder, uidvalidity, uid)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for uid in uids {
+                stmt.execute(params![account, folder, uidvalidity, uid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Deletes the server has made.
+    pub fn done_deletes(&mut self, account: &str, folder: &str, uids: &[u32]) -> Result<()> {
+        let tx = self.db.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "DELETE FROM pending_deletes WHERE account = ?1 AND folder = ?2 AND uid = ?3",
+            )?;
+            for uid in uids {
+                stmt.execute(params![account, folder, uid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The deletes still to make, by folder: (folder, UIDVALIDITY, UIDs).
+    pub fn pending_deletes(&self, account: &str) -> Result<Vec<(String, u32, Vec<u32>)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT folder, uidvalidity, uid FROM pending_deletes WHERE account = ?1
+             ORDER BY folder, uidvalidity, uid",
+        )?;
+        let rows = stmt.query_map(params![account], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, u32>(2)?,
+            ))
+        })?;
+        let mut out: Vec<(String, u32, Vec<u32>)> = Vec::new();
+        for row in rows {
+            let (folder, uidvalidity, uid) = row?;
+            match out.last_mut() {
+                Some(last) if last.0 == folder && last.1 == uidvalidity => last.2.push(uid),
+                _ => out.push((folder, uidvalidity, vec![uid])),
+            }
+        }
+        Ok(out)
+    }
+
     /// Remembers a POP3 id that wasn't downloaded, so it isn't asked about
     /// again.
     pub fn pop_skip(&self, account: &str, pop_id: &str) -> Result<()> {
@@ -675,6 +754,21 @@ impl Store {
             "INSERT OR IGNORE INTO pop_seen (account, pop_id) VALUES (?1, ?2)",
             params![account, pop_id],
         )?;
+        Ok(())
+    }
+
+    /// [`Store::pop_skip`] for many ids, in one write: a server listing
+    /// thousands costs one commit, not one each.
+    pub fn pop_skip_all(&mut self, account: &str, pop_ids: &[String]) -> Result<()> {
+        let tx = self.db.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT OR IGNORE INTO pop_seen (account, pop_id) VALUES (?1, ?2)")?;
+            for id in pop_ids {
+                stmt.execute(params![account, id])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -701,15 +795,20 @@ impl Store {
     }
 
     /// Forgets POP3 ids the server no longer has: they can't come back.
-    pub fn pop_forget(&self, account: &str, keep: &HashSet<String>) -> Result<()> {
-        for id in self.pop_seen(account)? {
-            if !keep.contains(&id) {
-                self.db.execute(
-                    "DELETE FROM pop_seen WHERE account = ?1 AND pop_id = ?2",
-                    params![account, id],
-                )?;
+    pub fn pop_forget(&mut self, account: &str, keep: &HashSet<String>) -> Result<()> {
+        let gone: Vec<String> = self
+            .pop_seen(account)?
+            .into_iter()
+            .filter(|id| !keep.contains(id))
+            .collect();
+        let tx = self.db.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM pop_seen WHERE account = ?1 AND pop_id = ?2")?;
+            for id in &gone {
+                stmt.execute(params![account, id])?;
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -717,7 +816,8 @@ impl Store {
 
     /// Remembers addresses written to (`used`) or seen. A name seen in mail
     /// never replaces one already known: anyone can put any name on any
-    /// address.
+    /// address. Nor does a name sent to an address already written to: a
+    /// reply-all carries the names its sender chose for everyone on it.
     pub fn remember(&self, addrs: &[Addr], used: bool, now: i64) -> Result<()> {
         for a in addrs.iter().take(100) {
             if !crate::account::valid_address(&a.addr) {
@@ -726,9 +826,11 @@ impl Store {
             self.db.execute(
                 "INSERT INTO addresses (addr, name, used, last) VALUES (lower(?1), ?2, ?3, ?4)
                  ON CONFLICT(addr) DO UPDATE SET
-                     name = CASE WHEN excluded.name = ''
-                         OR (excluded.used = 0 AND addresses.name != '')
-                         THEN addresses.name ELSE excluded.name END,
+                     name = CASE
+                         WHEN excluded.name = '' THEN addresses.name
+                         WHEN addresses.name = '' THEN excluded.name
+                         WHEN excluded.used = 1 AND addresses.used = 0 THEN excluded.name
+                         ELSE addresses.name END,
                      used = addresses.used + excluded.used, last = MAX(addresses.last, excluded.last)",
                 params![a.addr, a.name, i64::from(used), now],
             )?;
@@ -767,7 +869,13 @@ impl Store {
 
     /// Forgets everything about an account: it was removed.
     pub fn forget_account(&self, account: &str) -> Result<()> {
-        for table in ["folders", "messages", "bodies", "pop_seen"] {
+        for table in [
+            "folders",
+            "messages",
+            "bodies",
+            "pop_seen",
+            "pending_deletes",
+        ] {
             self.db.execute(
                 &format!("DELETE FROM {table} WHERE account = ?1"),
                 params![account],
@@ -993,6 +1101,14 @@ Hi,\r\n\r\nthe numbers are in.\r\n> old quote\r\n-- \r\nAlice\r\n";
         };
         store.remember(&[spoofed], false, 3).unwrap();
         assert_eq!(store.complete("bob", 5).unwrap()[0].name, "Bob");
+        // Nor a name sent on: Alice, written to, keeps hers when a reply-all
+        // carries another sender's name for her.
+        let renamed = Addr {
+            name: "A. R. (old)".into(),
+            addr: "alice@example.com".into(),
+        };
+        store.remember(&[renamed], true, 4).unwrap();
+        assert_eq!(store.complete("riv", 5).unwrap()[0].name, "Alice Rivera");
         let found = store.complete("riv", 5).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].addr, "alice@example.com");

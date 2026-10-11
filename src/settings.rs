@@ -82,7 +82,7 @@ impl Settings {
     /// The settings, and the names in the file tuimail doesn't know: a typo
     /// (`mark_raed = false`) would otherwise be ignored without a word.
     pub fn load_checked(path: &Path) -> Result<(Self, Vec<String>)> {
-        let text = match std::fs::read_to_string(path) {
+        let text = match config::read_small(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok((Self::default(), Vec::new()));
@@ -141,7 +141,7 @@ impl Settings {
     /// settings the file now holds.
     pub fn save_one(path: &Path, key: &str, value: toml::Value) -> Result<Self> {
         let shown = config::shown(path);
-        let mut table: toml::Table = match std::fs::read_to_string(path) {
+        let mut table: toml::Table = match config::read_small(path) {
             Ok(text) => toml::from_str(&text)
                 .with_context(|| format!("{shown} is invalid, so it wasn't changed"))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),

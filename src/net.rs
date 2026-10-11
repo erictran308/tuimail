@@ -102,20 +102,102 @@ impl Endpoint {
 /// Opens the TCP connection, and for `Security::Tls` the TLS session on it.
 /// STARTTLS endpoints come back plain: the protocol asks for TLS first
 /// ([`start_tls`]).
+/// A username and password (or token) that can go in a login command:
+/// nothing that ends a line, a string (NUL) or one of XOAUTH2's fields
+/// (`\x01`).
+pub fn check_login(user: &str, secret: &str) -> Result<()> {
+    let bad = ['\r', '\n', '\0', '\x01'];
+    if user.contains(bad) || secret.contains(bad) {
+        bail!("the username or password has a line break or control character in it");
+    }
+    Ok(())
+}
+
 pub async fn connect(endpoint: &Endpoint) -> Result<Conn> {
     if endpoint.security == Security::None && !account::is_local(&endpoint.host) {
         bail!("refusing to connect to {} without TLS", endpoint.shown());
     }
     let host = endpoint.host.trim_matches(|c| c == '[' || c == ']');
+    // Without TLS the password goes in clear, so only to this computer's
+    // own address, never to whatever a name resolves to.
+    let host = match endpoint.security {
+        Security::None if host.eq_ignore_ascii_case("localhost") => "127.0.0.1",
+        _ => host,
+    };
     let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, endpoint.port)))
         .await
         .map_err(|_| anyhow!("{} didn't answer", endpoint.shown()))?
         .with_context(|| format!("cannot connect to {}", endpoint.shown()))?;
     let _ = tcp.set_nodelay(true);
+    if endpoint.security == Security::None {
+        let peer = tcp.peer_addr()?;
+        if !peer.ip().is_loopback() {
+            bail!(
+                "{} isn't on this computer: not sending it a password without TLS",
+                peer
+            );
+        }
+        listener_is_ours(&tcp)
+            .with_context(|| format!("not sending a password without TLS to {peer}"))?;
+    }
     match endpoint.security {
         Security::Tls => start_tls(tcp, endpoint).await,
         Security::Starttls | Security::None => Ok(Conn::Plain(tcp)),
     }
+}
+
+/// On Linux: that the program answering on this computer runs as this
+/// user (or the system), not as another account that took the port while
+/// the user's own server was down. Elsewhere there's no way to ask.
+#[cfg(target_os = "linux")]
+fn listener_is_ours(tcp: &TcpStream) -> Result<()> {
+    let (me, them) = (tcp.local_addr()?, tcp.peer_addr()?);
+    let table = if them.is_ipv4() {
+        "/proc/net/tcp"
+    } else {
+        "/proc/net/tcp6"
+    };
+    let text = std::fs::read_to_string(table).with_context(|| format!("cannot read {table}"))?;
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [_, local, remote, _, _, _, _, uid, ..] = fields.as_slice() else {
+            continue;
+        };
+        if proc_addr(local) == Some(them) && proc_addr(remote) == Some(me) {
+            let uid: u32 = uid.parse().context("an unreadable socket owner")?;
+            // SAFETY: geteuid has no preconditions and can't fail.
+            let euid = unsafe { libc::geteuid() };
+            if uid == euid || uid == 0 {
+                return Ok(());
+            }
+            bail!("the server on {them} is another account's");
+        }
+    }
+    bail!("can't tell whose server answers on {them}")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listener_is_ours(_tcp: &TcpStream) -> Result<()> {
+    Ok(())
+}
+
+/// An address as /proc/net/tcp writes it: the IP's 32-bit words in the
+/// machine's byte order, in hex, then the port in hex.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_addr(text: &str) -> Option<std::net::SocketAddr> {
+    let (ip, port) = text.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let mut bytes = Vec::with_capacity(16);
+    for word in ip.as_bytes().chunks(8) {
+        let word = u32::from_str_radix(std::str::from_utf8(word).ok()?, 16).ok()?;
+        bytes.extend(word.to_ne_bytes());
+    }
+    let ip: std::net::IpAddr = match bytes.len() {
+        4 => <[u8; 4]>::try_from(bytes).ok()?.into(),
+        16 => <[u8; 16]>::try_from(bytes).ok()?.into(),
+        _ => return None,
+    };
+    Some((ip, port).into())
 }
 
 /// TLS over `tcp`, the server checked as `endpoint.host`.
@@ -166,11 +248,8 @@ pub fn tls_config(certificate: Option<&Path>) -> Result<Arc<ClientConfig>> {
 /// The certificates in a PEM file: at most 1 MB, a plain file.
 fn read_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let shown = config::shown(path);
-    let meta = std::fs::metadata(path).with_context(|| format!("cannot read {shown}"))?;
-    if !meta.is_file() || meta.len() > 1 << 20 {
-        bail!("{shown} isn't a certificate file");
-    }
-    let pem = std::fs::read(path).with_context(|| format!("cannot read {shown}"))?;
+    let pem = config::read_capped(path, 1 << 20)
+        .with_context(|| format!("{shown} isn't a certificate file tuimail can read"))?;
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow!("{shown} isn't a PEM certificate: {e}"))?;
@@ -288,6 +367,19 @@ pub async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_login_has_nothing_that_could_end_its_command() {
+        assert!(check_login("me@example.org", "pass word").is_ok());
+        for (user, secret) in [
+            ("me\r\nA1 DELETE INBOX", "x"),
+            ("me", "x\0y"),
+            ("me", "token\x01auth=Bearer other"),
+            ("me\x01", "x"),
+        ] {
+            assert!(check_login(user, secret).is_err(), "{user:?} {secret:?}");
+        }
+    }
+
     #[tokio::test]
     async fn lines_are_read_whole_and_capped() {
         let data: &[u8] = b"+OK hello\r\nsecond\nthird";
@@ -310,6 +402,27 @@ mod tests {
         };
         let error = connect(&endpoint).await.unwrap_err().to_string();
         assert!(error.contains("without TLS"), "{error}");
+    }
+
+    #[test]
+    fn socket_tables_are_read_as_linux_writes_them() {
+        let addr = |ip: &str| -> String {
+            // The kernel prints each 32-bit word as the machine holds it.
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            let bytes = match ip {
+                std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+                std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+            };
+            bytes
+                .chunks(4)
+                .map(|w| format!("{:08X}", u32::from_ne_bytes([w[0], w[1], w[2], w[3]])))
+                .collect()
+        };
+        let v4 = format!("{}:1F90", addr("127.0.0.1"));
+        assert_eq!(proc_addr(&v4), Some("127.0.0.1:8080".parse().unwrap()));
+        let v6 = format!("{}:0477", addr("::1"));
+        assert_eq!(proc_addr(&v6), Some("[::1]:1143".parse().unwrap()));
+        assert_eq!(proc_addr("zz:1"), None);
     }
 
     #[test]

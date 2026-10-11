@@ -66,10 +66,10 @@ pub struct Composer {
     pub references: String,
     /// The message replied to: (account, folder, UID), marked answered once
     /// this is sent.
-    pub replying: Option<(usize, String, u32)>,
+    pub replying: Option<crate::app::Kept>,
     /// The saved draft this one replaces: (folder, UID), deleted once this
     /// is sent or saved again.
-    pub draft_of: Option<(String, u32)>,
+    pub draft_of: Option<crate::app::Kept>,
     /// Addresses offered for the word being typed in To, Cc or Bcc.
     pub suggestions: Vec<Addr>,
     pub suggestion: usize,

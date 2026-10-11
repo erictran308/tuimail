@@ -7,12 +7,12 @@
 A terminal email client (TUI): IMAP and POP3 to read, SMTP to send, several accounts side by side.<br>
 Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from the internet when you read.
 
+[![Release](https://img.shields.io/github/v/release/erictran308/tuimail)](https://github.com/erictran308/tuimail/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/tuimail.svg)](https://crates.io/crates/tuimail)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
 
 **[Get started](#get-started)** · **[Keys](#keys)** · **[Accounts](#accounts)** · **[Settings](#settings)** · **[Privacy](#privacy-and-security)**
-
-<sub>A sibling of [tuigram](https://github.com/erictran308/tuigram) (Telegram) and [tuitube](https://github.com/erictran308/tuitube) (YouTube): same look, same keys, same themes.</sub>
 
 </div>
 
@@ -37,7 +37,7 @@ Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from
  Enter open · c write · r reply · a all · f forward · d delete · e archive · s star · / search · ? help                    demo
 ```
 
-<sub>The demo's made-up mail: <code>tuimail --demo</code></sub>
+<div align="center"><sub>The demo's made-up mail: <code>tuimail --demo</code></sub></div>
 
 ---
 
@@ -46,30 +46,53 @@ Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from
 - **IMAP, POP3 and SMTP.** IMAP accounts keep mail on the server, in its folders; POP3 accounts download the inbox and keep Sent, Drafts, Archive and Trash on your computer. Both send through SMTP, with TLS or STARTTLS.
 - **New mail at once.** Where the server can (IMAP IDLE), new mail shows the moment it arrives, with a notification through your terminal. Elsewhere tuimail checks every few minutes, and `R` checks now.
 - **Several accounts.** Each in the sidebar with its folders, and **All inboxes** together at the top. Write from any of them (`←` `→` on From).
-- **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` opens, `gg` / `G`, `Ctrl-d` / `Ctrl-u`. `?` lists every key.
+- **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` opens, `gg` / `G`, `Ctrl-d` / `Ctrl-u`. `?` lists every key, and `O` opens the settings.
 - **Reading made calm.** HTML mail is shown as text (bold, italics, links numbered), with nothing it points to fetched: no tracking pixels, no "read" receipts by image. Quotes are colored by depth. `H` shows the plain-text part instead, `o` lists the links, `A` the attachments.
 - **Writing in place, or in your editor.** To, Cc, Bcc and Subject with addresses completed from people you've written to or heard from; the text in place, or `Ctrl-e` for `$EDITOR`. Drop a file on the window to attach it. Replies quote, forwards carry the attachments, drafts go to Drafts and open again where you left them.
 - **Quick to tidy.** `d` deletes (to Trash), `e` archives, `!` marks junk, `m` moves anywhere, `s` stars, `u` marks read or unread. `Space` marks several messages for any of these at once. `U` unsubscribes from a mailing list.
 - **Search.** `/` finds mail by sender, recipients, subject or text: at once in what's on your computer, then on the server, which searches whole messages.
 - **Works offline.** Headers and the messages you've opened are kept in a local cache, so the list and what you've read are there without a connection.
 - **Set up in a minute.** Type your address and password: the servers fill in for Gmail, iCloud, Outlook, Yahoo, Fastmail, Proton (through its Bridge), Zoho, GMX, WEB.DE, Yandex, Mail.ru, Posteo, mailbox.org and more, or are guessed for others. tuimail logs in to check before saving.
-- **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes, Nerd Font icons where your terminal has them.
+- **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes (picked in the settings, `O`), and Nerd Font icons where your terminal has them.
+- **Private by design.** No account with anyone but your mail provider, no telemetry, no servers in between. Your mail, accounts and settings stay in one folder on your computer, readable only by you.
 
 ## Get started
 
-**1. Install.** With Rust and [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+**1. Install tuimail.** If you have Rust and [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), that's one command, on any system:
 
 ```sh
 cargo binstall tuimail
 ```
 
-Or build from source (Rust 1.90 or newer, and a C compiler for SQLite):
+Otherwise, on macOS or Linux, paste this into a terminal. It puts `tuimail` in `~/.local/bin`:
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/erictran308/tuimail/releases/latest/download/tuimail-aarch64-apple-darwin.tar.gz | tar xz -C ~/.local/bin tuimail
+```
+
+Swap the file name for your computer's:
+
+| Computer | File |
+| --- | --- |
+| Mac with Apple silicon (M1 or later) | [`tuimail-aarch64-apple-darwin.tar.gz`](https://github.com/erictran308/tuimail/releases/latest/download/tuimail-aarch64-apple-darwin.tar.gz) |
+| Mac with Intel | [`tuimail-x86_64-apple-darwin.tar.gz`](https://github.com/erictran308/tuimail/releases/latest/download/tuimail-x86_64-apple-darwin.tar.gz) |
+| Linux, x86_64 | [`tuimail-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/erictran308/tuimail/releases/latest/download/tuimail-x86_64-unknown-linux-gnu.tar.gz) |
+| Linux, ARM64 | [`tuimail-aarch64-unknown-linux-gnu.tar.gz`](https://github.com/erictran308/tuimail/releases/latest/download/tuimail-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows, x86_64 | [`tuimail-x86_64-pc-windows-msvc.zip`](https://github.com/erictran308/tuimail/releases/latest/download/tuimail-x86_64-pc-windows-msvc.zip) |
+| Windows, ARM64 | [`tuimail-aarch64-pc-windows-msvc.zip`](https://github.com/erictran308/tuimail/releases/latest/download/tuimail-aarch64-pc-windows-msvc.zip) |
+
+- **Windows:** download the `.zip`, unzip it, and run `tuimail.exe` from Windows Terminal.
+- **Linux:** needs glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36, RHEL 9 or later.
+- **macOS:** if you downloaded the file in a browser instead, macOS blocks the app. Run `xattr -d com.apple.quarantine tuimail` once to allow it.
+
+If `tuimail` isn't found afterwards, add `~/.local/bin` to your `PATH`. Each file comes with a signed record of the commit it was built from; to check one, run `gh attestation verify <file> --repo erictran308/tuimail --signer-workflow erictran308/tuimail/.github/workflows/release.yml`.
+
+**Or build it from source** (Rust 1.90 or newer, and a C compiler for SQLite):
 
 ```sh
 cargo install tuimail --locked
 ```
-
-Release builds for macOS, Linux and Windows (x86_64 and ARM64) are on the [releases page](https://github.com/erictran308/tuimail/releases/latest); each comes with a signed record of the commit it was built from (`gh attestation verify <file> --repo erictran308/tuimail`).
 
 **2. Run it.**
 
@@ -77,13 +100,21 @@ Release builds for macOS, Linux and Windows (x86_64 and ARM64) are on the [relea
 tuimail
 ```
 
-The first start asks for an account: your address and password (for Gmail, iCloud, Yahoo and others, an **app password**: see [Accounts](#accounts)). The servers fill in; `Ctrl-s` logs in to check them and saves the account, with the password in your system's keychain.
+The first start asks for an account: your address and password (for Gmail, iCloud, Yahoo and others, an **app password**: see [App passwords](#app-passwords)). The servers fill in; `Ctrl-s` logs in to check them and saves the account, with the password in your system's keychain.
 
-To look around first, `tuimail --demo` shows made-up accounts and mail, connecting nowhere. `tuimail --check` says where your data is and which accounts it found.
+To look around first, `tuimail --demo` shows made-up accounts and mail, connecting nowhere and sending nothing.
+
+### Check your setup
+
+```sh
+tuimail --check
+```
+
+It says where your data folder is, whether a keychain is there for passwords, and each account it found: its servers, security and where its password comes from. An account it can't use, or a line in `accounts.toml` it doesn't understand, shows up as a warning.
 
 ## Keys
 
-The status bar shows the keys for where you are, and `?` lists them all.
+The status bar shows the keys for where you are, and `?` lists them all. `Tab` there goes to the settings.
 
 | Key | Action |
 | --- | --- |
@@ -104,7 +135,7 @@ The status bar shows the keys for where you are, and `?` lists them all.
 | `U` | Unsubscribe from a mailing list |
 | `R` | Check for mail now |
 | `+` / `x` / `P` | Add an account / remove it (on its row) / type its password |
-| `?` / `O` | Keys / settings and themes |
+| `?` / `O` | Every key / the settings and themes |
 | `q` | Quit |
 
 Writing:
@@ -122,7 +153,7 @@ Writing:
 
 ## Accounts
 
-Accounts are kept in `accounts.toml` in tuimail's data folder (`tuimail --help` says where). The setup screen (`+`) writes it; you can also edit it while tuimail isn't running:
+Accounts are kept in `accounts.toml` in [your data folder](#your-data). The setup screen (`+`) writes it; you can also edit it while tuimail isn't running:
 
 ```toml
 [[account]]
@@ -132,7 +163,7 @@ display_name = "Sam Taylor"        # your name, as recipients see it
 protocol = "imap"                  # or "pop3"
 host = "imap.example.org"
 port = 993                         # if not the usual one
-security = "tls"                   # "tls", "starttls", or "none" (this computer only)
+security = "tls"                   # "tls", "starttls", or "none" (this computer only, unencrypted)
 smtp_host = "smtp.example.org"
 smtp_port = 465
 smtp_security = "tls"
@@ -141,6 +172,8 @@ signature = "Sam"
 ```
 
 More keys: `username` and `smtp_username` (if not the address), `password_command` (below), `save_sent` (copy sent mail to Sent; off by default for Gmail and Outlook, which do it themselves), `certificate` (a server certificate to trust, for Proton Mail Bridge or your own server), `leave_on_server` (POP3, on by default), and `sent_folder`, `drafts_folder`, `trash_folder`, `archive_folder`, `junk_folder` when the server doesn't say which folder is which.
+
+`x` on an account's row in the sidebar removes it, its cached mail, and its password from the keychain.
 
 ### App passwords
 
@@ -186,43 +219,81 @@ certificate = "/Users/you/Documents/bridge/cert.pem"
 
 ## Settings
 
-`O` opens the settings: the preview beside the list, plain text or HTML, marking read, asking before deleting and sending, notifications, and the theme. They're kept in `settings.toml` beside `accounts.toml`, which also takes:
+`O` (or `?` then `Tab`) opens the settings: the message beside the list, plain text or HTML, marking read, asking before deleting and before sending, notifications, and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments).
 
-| Setting | Default | What |
-| --- | --- | --- |
-| `check_minutes` | 5 | How often to check for mail where the server can't say at once |
-| `fetch_count` | 300 | How many of a folder's newest messages to fetch at first (older ones as you scroll) |
-| `sidebar_width` | 28 | The sidebar's width in columns |
-| `downloads` | your Downloads folder | Where `s` saves attachments |
-| `editor` | `$VISUAL` / `$EDITOR` | The editor for `Ctrl-e`, as a list: `["/usr/bin/vim"]` |
-| `notifications` | `"auto"` | `"auto"`, `"off"`, `"bell"`, `"osc9"`, `"osc777"` or `"osc99"` |
-| `icons` | `"auto"` | `"auto"`, `"nerd"` or `"plain"` |
+Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuimail starts:
 
-Environment: `TM_DATA_DIR` keeps everything in another folder (a full path); `TM_ICONS` picks the icons.
+```toml
+theme = "mocha"          # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine
+icons = "auto"           # auto (Nerd Font icons in Ghostty, kitty and WezTerm), nerd or plain
+notifications = "auto"   # auto (what your terminal understands), off, bell, osc9, osc777 or osc99
+preview = true           # the open message beside the list, when the window is wide enough
+prefer_plain = false     # a message's plain-text part rather than its HTML, when it has both
+mark_read = true         # mark a message read once it's shown
+confirm_delete = false   # ask before moving mail to Trash
+confirm_send = true      # ask before sending (a message without a subject always asks)
+check_minutes = 5        # how often to check where the server can't say at once, and folders other than the inbox (1 to 1440)
+fetch_count = 300        # how many of a folder's newest messages to fetch at first (20 to 5000); older ones as you scroll
+sidebar_width = 28       # in columns (16 to 50)
+
+# Where `s` saves attachments, if not your Downloads folder:
+# downloads = "/Users/you/Mail attachments"
+# The editor for Ctrl-e, as a full path with its arguments, if not $VISUAL or $EDITOR:
+# editor = ["/usr/bin/vim"]
+```
 
 ## Privacy and security
 
 - **Nothing fetched to read.** HTML is turned into text on your computer; pictures are shown by their description, never downloaded, so senders can't tell when you read their mail.
 - **Passwords stay out of files.** They're in your system's keychain (macOS Keychain, Windows Credential Manager, the Secret Service on Linux), asked for at each start, or printed by your own command. Never in `accounts.toml`, never on a command line.
-- **TLS, checked.** Connections use TLS (or STARTTLS, which must succeed before anything is sent) and your system's trusted certificates. An unencrypted connection is allowed only to a server on your own computer.
+- **TLS, checked.** Connections use TLS (or STARTTLS, which must succeed before anything is sent) and your system's trusted certificates. An unencrypted connection is allowed only to a server on your own computer, at its loopback address; on Linux, only if that server runs as you or the system. On a computer shared with other accounts, prefer STARTTLS with `certificate` (as for Proton Mail Bridge): there, any account could answer on a free port.
 - **Nothing about your computer in what you send.** Messages go out with a random Message-ID and a UTC date, and tuimail greets SMTP servers as `[127.0.0.1]`, so your computer's name never ends up in mail headers.
 - **Text from senders can't take over your terminal.** Control characters, escape sequences and direction-changing characters are taken out of everything shown, copied or notified.
-- **Attachments are handled with care.** File names are cleaned (no folders, no hidden extensions), files never overwrite one another, they're marked as downloaded from the internet, and types that can run code ask before opening. Links open only through your browser, and only `http`, `https` and `mailto`.
+- **Attachments are handled with care.** File names are cleaned (no folders, no hidden extensions), files never overwrite one another, they're marked as downloaded from the internet, and only pictures, sound, video, PDF and plain text open without asking (Office files, archives, CSV and the rest ask first). Web links open only through your browser, and only `http` and `https`; the link list shows where each one really goes, with look-alike letters spelled out (`xn--`). `mailto` links and `U`'s addresses open here, as a message to write; `U`'s web page is shown before it opens.
+- **Pastes stay text.** A paste that arrives as keystrokes (as it always does on Windows) is never taken for commands, and a question that waits for `y` ignores one typed too soon.
 - **Local data is yours alone.** The data folder is made readable only by you; the cache (`tuimail.db`) overwrites what's deleted.
 
-See [SECURITY.md](SECURITY.md) to report a problem.
+To report a problem, see [SECURITY.md](SECURITY.md).
 
-## Building and testing
+## Your data
+
+Everything is in one folder on your machine (`tuimail --help` prints its path):
+
+| OS | Location |
+| --- | --- |
+| macOS | `~/Library/Application Support/tuimail` |
+| Linux | `~/.local/share/tuimail` |
+| Windows | `%LOCALAPPDATA%\tuimail` |
+
+It holds `accounts.toml`, `settings.toml`, and `tuimail.db`: the cache of your folders, headers and the messages you've opened, POP3 accounts' mail, and the addresses used for completing To, Cc and Bcc. Attachments you open go to its `opened/` folder. Passwords aren't in it: they're in your system's keychain. Deleting the folder starts tuimail afresh; remove the accounts with `x` first to take their passwords out of the keychain too.
+
+| Variable | Use |
+| --- | --- |
+| `TM_DATA_DIR` | Keep the data folder somewhere else (a full path) |
+| `TM_ICONS` | Which icons: `auto`, `nerd` or `plain` |
+
+## Development
 
 ```sh
-cargo build
-cargo test                    # offline tests
+cargo test                       # offline tests
 cargo clippy --all-targets
-tuimail --demo                # the UI with made-up mail
+TM_DATA_DIR=$HOME/tm-test cargo run   # a separate data folder (a full path) for trying things
+cargo run -- --demo              # made-up accounts and mail, nothing connects or is sent
 ```
 
-The tests against a real server run against [GreenMail](https://greenmail-mail-test.github.io/greenmail/) in Docker; see the top of `src/live.rs`.
+The tests against a real server run against [GreenMail](https://greenmail-mail-test.github.io/greenmail/) in Docker (IMAP, POP3 and SMTP over TLS); the commands are at the top of `src/live.rs`.
+
+Only development builds read a `.env`, and only from the source folder, never the folder they're started from, and only its `TM_*` lines: an installed tuimail ignores it, so a `.env` in a folder you cloned can't change where your mail is kept.
+
+## Built with
+
+- [ratatui](https://ratatui.rs), [crossterm](https://github.com/crossterm-rs/crossterm) and [ratatui-textarea](https://github.com/ratatui/ratatui-textarea)
+- [async-imap](https://github.com/async-email/async-imap) for IMAP; POP3 and SMTP written here
+- [mail-parser](https://github.com/stalwartlabs/mail-parser) and [mail-builder](https://github.com/stalwartlabs/mail-builder) from Stalwart, and [html2text](https://github.com/jugglerchris/rust-html2text)
+- [rustls](https://github.com/rustls/rustls) with [rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier), [rusqlite](https://github.com/rusqlite/rusqlite), and [keyring-core](https://github.com/open-source-cooperative/keyring-core) for the keychain
+- The same UI groundwork, themes and safety rules as [tuigram](https://github.com/erictran308/tuigram), [tuitube](https://github.com/erictran308/tuitube) and [tuimeta](https://github.com/erictran308/tuimeta)
+- Colors from [Catppuccin](https://catppuccin.com), [Tokyo Night](https://github.com/folke/tokyonight.nvim), [Dracula](https://draculatheme.com), [Gruvbox](https://github.com/morhetz/gruvbox), [Nord](https://www.nordtheme.com) and [Rosé Pine](https://rosepinetheme.com)
 
 ## License
 
-MIT
+[MIT](LICENSE)

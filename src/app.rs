@@ -80,12 +80,14 @@ pub enum AppEvent {
         account: usize,
         kind: Kind,
         draft: Option<Draft>,
-        replying: Option<(usize, String, u32)>,
-        draft_of: Option<(String, u32)>,
+        replying: Option<Kept>,
+        draft_of: Option<Kept>,
     },
     /// An attachment taken out of its message: saved, or to open.
     Extracted {
         open: bool,
+        /// The user said yes to opening it.
+        confirmed: bool,
         result: Result<PathBuf, String>,
     },
     /// The start of messages' text, for the list, made in the background.
@@ -100,12 +102,25 @@ pub enum AppEvent {
     Quit,
 }
 
+/// A message held on to for later (the one being replied to, the saved
+/// draft being replaced): its account by id, so switching From or removing
+/// another account can't point it at someone else's mail, and what its
+/// folder's UIDs meant when it was taken, so a folder made again on the
+/// server can't point it at another message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub account: String,
+    pub folder: String,
+    pub uid: u32,
+    pub uidvalidity: u32,
+}
+
 /// What follows a send that worked: the copy for Sent, and what to mark.
 pub struct SentCopy {
     pub raw: Vec<u8>,
     pub to: Vec<Addr>,
-    pub replying: Option<(usize, String, u32)>,
-    pub draft_of: Option<(String, u32)>,
+    pub replying: Option<Kept>,
+    pub draft_of: Option<Kept>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +184,8 @@ pub struct AccountState {
     popped_once: bool,
     /// POP3: a check was asked for while one ran: another follows it.
     pop_again: bool,
+    /// Changes (moves, flags, deletes) not yet made on the server.
+    waiting: usize,
 }
 
 impl AccountState {
@@ -252,6 +269,7 @@ pub enum PickerKind {
         account: usize,
         folder: String,
         uids: Vec<u32>,
+        uidvalidity: u32,
         /// The folders' server names, in the items' order.
         targets: Vec<String>,
     },
@@ -263,6 +281,9 @@ pub struct Picker {
     pub kind: PickerKind,
     pub title: String,
     pub items: Vec<String>,
+    /// Links only: each one's site, from the whole URL, and what it says
+    /// in the message (empty if nothing, or something like an address).
+    pub labels: Vec<(String, String)>,
     pub selected: usize,
 }
 
@@ -272,6 +293,7 @@ pub enum Confirm {
     DeleteForever {
         account: usize,
         folder: String,
+        uidvalidity: u32,
         uids: Vec<u32>,
     },
     /// Move to Trash, with `confirm_delete` on.
@@ -279,9 +301,15 @@ pub enum Confirm {
         account: usize,
         folder: String,
         uids: Vec<u32>,
+        uidvalidity: u32,
     },
+    /// Send the message, as it was when asked: `print` is the draft's
+    /// digest with its account, and a `y` sends nothing else.
     Send {
-        recipients: usize,
+        print: u64,
+        subject: String,
+        recipients: Vec<String>,
+        attachments: Vec<String>,
     },
     /// Esc in a composer with something written: `y` saves a draft, `n`
     /// discards it.
@@ -291,6 +319,14 @@ pub enum Confirm {
         name: String,
     },
     RemoveAccount(usize),
+    /// `U`'s web page, shown before it opens.
+    OpenLink {
+        url: String,
+    },
+    /// Quit with changes not yet made on the server.
+    Quit {
+        waiting: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,10 +373,7 @@ enum Append {
     /// The copy of a message sent, for Sent.
     SentCopy,
     /// A draft; the composer waits for it, then the draft it replaces goes.
-    Draft {
-        account: usize,
-        draft_of: Option<(String, u32)>,
-    },
+    Draft { draft_of: Option<Kept> },
 }
 
 /// A reply, forward or draft waiting for its message to download.
@@ -599,6 +632,7 @@ impl App {
             checks: 0,
             popped_once: false,
             pop_again: false,
+            waiting: 0,
         });
         self.accounts.len() - 1
     }
@@ -614,6 +648,7 @@ impl App {
         quit_on_hangup(self.tx.clone())?;
         notify::send(notify::SAVE_TITLE);
         for i in 0..self.accounts.len() {
+            self.redo_deletes(i);
             self.check(i, true);
         }
         loop {
@@ -876,6 +911,11 @@ impl App {
                 replying,
                 draft_of,
             } => match draft {
+                // A reply made ready late never takes the place of a
+                // message being written, or of the one a question is about.
+                Some(_) if self.composer.is_some() || self.confirm.is_some() => {
+                    self.info("A message is open: finish it, then start the reply again")
+                }
                 Some(draft) if account < self.accounts.len() => {
                     let mut composer = Composer::new(account, kind, draft);
                     composer.replying = replying;
@@ -884,7 +924,25 @@ impl App {
                 }
                 _ => self.error("That message can't be read"),
             },
-            AppEvent::Extracted { open, result } => match result {
+            AppEvent::Extracted {
+                open,
+                confirmed,
+                result,
+            } => match result {
+                // What's opened without a yes is checked again, by the name
+                // it was saved under.
+                Ok(path)
+                    if open
+                        && !confirmed
+                        && !path
+                            .file_name()
+                            .is_some_and(|n| tools::safe_to_open(&n.to_string_lossy())) =>
+                {
+                    self.error(format!(
+                        "Not opened: {} is a kind of file that asks first",
+                        crate::config::shown(&path)
+                    ))
+                }
                 Ok(path) if open => {
                     if let Err(e) = tools::open_externally(&path.to_string_lossy()) {
                         self.error(format!("Couldn't open it: {e}"));
@@ -917,14 +975,14 @@ impl App {
         use worker::Event as E;
         match event {
             E::State(state) => {
-                let name = self.accounts[i].account.shown_name();
+                let name = self.account_name(i);
                 if let State::NeedPassword { refused } = &state {
                     let refused = *refused;
                     let from_command = self.accounts[i].account.password == PasswordFrom::Command
                         || self.accounts[i].account.auth == account::Auth::Oauth2;
                     if from_command {
                         self.error(format!(
-                            "{name}: the server refused password_command's password"
+                            "{name}: the server refused password_command's password; R tries again"
                         ));
                     } else if self.prompt.is_none()
                         && self.composer.is_none()
@@ -1036,15 +1094,24 @@ impl App {
                 }
             }
             E::Done { folder } => self.folder_changed(i, &folder),
+            E::Waiting(n) => self.accounts[i].waiting = n,
+            E::Deleted { folder, uids, all } => {
+                let id = self.accounts[i].id.clone();
+                if all {
+                    let _ = self.store.done_deletes(&id, &folder, &uids);
+                } else {
+                    self.info(
+                        "Deleted here; on the server they stay marked until another program's deletions there are done",
+                    );
+                }
+            }
             E::Appended { folder, id, error } => {
                 match (self.appends.remove(&id), error) {
-                    (Some(Append::Draft { account, draft_of }), None) => {
+                    (Some(Append::Draft { draft_of }), None) => {
                         if self.composer.as_ref().is_some_and(|c| c.saving == Some(id)) {
                             self.composer = None;
                         }
-                        if let Some((old_folder, uid)) = draft_of {
-                            self.delete_forever(account, &old_folder, &[uid]);
-                        }
+                        self.replace_draft(draft_of);
                         self.info("Saved in Drafts");
                     }
                     (Some(Append::Draft { .. }), Some(e)) => {
@@ -1078,7 +1145,7 @@ impl App {
                 if error == "offline" {
                     return;
                 }
-                let name = self.accounts[i].account.shown_name();
+                let name = self.account_name(i);
                 self.error(format!("{name}: {what} failed: {error}"));
             }
             E::Changed { folder } => self.sync_folder(i, &folder),
@@ -1171,6 +1238,7 @@ impl App {
                     Request::Headers {
                         folder: s.folder.clone(),
                         uids: missing,
+                        uidvalidity: s.uidvalidity,
                     },
                 );
             }
@@ -1244,9 +1312,7 @@ impl App {
         self.make_previews(i, previews);
         let senders: Vec<Addr> = summaries.iter().map(|s| s.from.clone()).collect();
         let _ = self.store.remember(&senders, false, now());
-        for skipped in &popped.skipped {
-            let _ = self.store.pop_skip(&id, skipped);
-        }
+        let _ = self.store.pop_skip_all(&id, &popped.skipped);
         let mut keep = popped.on_server.clone();
         for gone in &popped.deleted {
             keep.remove(gone);
@@ -1274,7 +1340,7 @@ impl App {
     /// Tells the user about new mail, if notifications are on.
     fn announce<'a>(&mut self, i: usize, summaries: impl Iterator<Item = &'a mail::Summary>) {
         let account = if self.accounts.len() > 1 {
-            self.accounts[i].account.shown_name()
+            self.account_name(i)
         } else {
             String::new()
         };
@@ -1309,6 +1375,124 @@ impl App {
             Place::Folder { account, folder: f } => *account == i && f == folder,
             Place::AllInboxes => self.accounts[i].inbox() == folder,
         }
+    }
+
+    /// Deletes for good the server hadn't confirmed when tuimail last
+    /// quit: asked for again, unless their folder was made again since
+    /// (then those messages are gone anyway).
+    fn redo_deletes(&mut self, i: usize) {
+        if self.demo || self.accounts[i].is_pop() || self.accounts[i].worker.is_none() {
+            return;
+        }
+        let id = self.accounts[i].id.clone();
+        for (folder, uidvalidity, uids) in self.store.pending_deletes(&id).unwrap_or_default() {
+            let now = self.uidvalidity(i, &folder);
+            if now != 0 && uidvalidity != 0 && now != uidvalidity {
+                let _ = self.store.done_deletes(&id, &folder, &uids);
+                continue;
+            }
+            self.send(
+                i,
+                Request::Delete {
+                    folder,
+                    uids,
+                    uidvalidity,
+                },
+            );
+        }
+    }
+
+    /// `q` or Ctrl-C: quits, asking first if changes haven't reached the
+    /// server yet (they would be lost).
+    fn ask_quit(&mut self) {
+        let waiting: usize =
+            self.accounts.iter().map(|a| a.waiting).sum::<usize>() + self.appends.len();
+        if waiting > 0 {
+            self.confirm(Confirm::Quit { waiting });
+        } else {
+            self.quit = true;
+        }
+    }
+
+    /// What `folder`'s UIDs mean: the UIDVALIDITY the cache knows it by. 0
+    /// for local folders and folders not checked yet.
+    fn uidvalidity(&self, account: usize, folder: &str) -> u32 {
+        self.accounts.get(account).map_or(0, |a| {
+            self.store.known(&a.id, folder).map_or(0, |k| k.uidvalidity)
+        })
+    }
+
+    /// Whether UIDs read in `folder` under `uidvalidity` still mean the
+    /// same messages; if not, says so (nothing is done to them).
+    fn still_means(&mut self, account: usize, folder: &str, uidvalidity: u32) -> bool {
+        let now = self.uidvalidity(account, folder);
+        let same = uidvalidity == 0 || now == 0 || now == uidvalidity;
+        if !same {
+            self.error("That folder was made again on the server: nothing was done");
+        }
+        same
+    }
+
+    /// A message to hold on to for later.
+    fn kept(&self, key: &(usize, String, u32)) -> Kept {
+        Kept {
+            account: self.accounts[key.0].id.clone(),
+            folder: key.1.clone(),
+            uid: key.2,
+            uidvalidity: self.uidvalidity(key.0, &key.1),
+        }
+    }
+
+    /// A held message as a key, if its account is still here and its UID
+    /// still means it.
+    fn resolve(&mut self, kept: &Kept) -> Option<(usize, String, u32)> {
+        let i = self.account_index(&kept.account)?;
+        self.still_means(i, &kept.folder, kept.uidvalidity)
+            .then(|| (i, kept.folder.clone(), kept.uid))
+    }
+
+    /// Deletes the saved draft a sent or saved message replaces: in its own
+    /// account, only if it's still that message.
+    fn replace_draft(&mut self, draft_of: Option<Kept>) {
+        if let Some((i, folder, uid)) = draft_of.and_then(|k| self.resolve(&k)) {
+            self.delete_forever(i, &folder, &[uid]);
+        }
+    }
+
+    /// What the sidebar, the list's title and messages call account `i`:
+    /// its name, or its address when another account goes by the same name
+    /// (two accounts both called "gmail.com").
+    pub fn account_name(&self, i: usize) -> String {
+        let Some(a) = self.accounts.get(i) else {
+            return String::new();
+        };
+        let name = a.account.shown_name();
+        let shared = self
+            .accounts
+            .iter()
+            .enumerate()
+            .any(|(j, b)| j != i && b.account.shown_name() == name);
+        if shared {
+            text::one_line(&a.account.email, 60)
+        } else {
+            name
+        }
+    }
+
+    /// The list's `[tag]` for account `i` in All inboxes, where there's
+    /// little room: its short name, or its whole name where another
+    /// account's short name is the same.
+    pub fn account_tag(&self, i: usize) -> String {
+        let Some(a) = self.accounts.get(i) else {
+            return String::new();
+        };
+        let short = a.account.short_name();
+        let shared = self
+            .accounts
+            .iter()
+            .enumerate()
+            .any(|(j, b)| j != i && b.account.short_name() == short);
+        if shared { self.account_name(i) } else { short }
     }
 
     pub fn folder_name(&self, i: usize, folder: &str) -> String {
@@ -1514,6 +1698,7 @@ impl App {
                 Request::Body {
                     folder: item.message.folder.clone(),
                     uid: item.message.uid,
+                    uidvalidity: self.uidvalidity(item.account, &item.message.folder),
                 },
             );
         }
@@ -1664,6 +1849,7 @@ impl App {
                 self.send(
                     account,
                     Request::Flag {
+                        uidvalidity: self.uidvalidity(account, &folder),
                         folder,
                         uids,
                         flag,
@@ -1740,6 +1926,7 @@ impl App {
                     folder: folder.to_string(),
                     uids: uids.to_vec(),
                     to: to.to_string(),
+                    uidvalidity: self.uidvalidity(account, folder),
                 },
             );
         }
@@ -1788,6 +1975,7 @@ impl App {
             let forever = trash.as_deref().is_none_or(|t| t == folder);
             if forever && !confirmed {
                 self.confirm(Confirm::DeleteForever {
+                    uidvalidity: self.uidvalidity(account, &folder),
                     account,
                     folder,
                     uids,
@@ -1796,6 +1984,7 @@ impl App {
             }
             if !forever && !confirmed && self.settings.confirm_delete {
                 self.confirm(Confirm::Delete {
+                    uidvalidity: self.uidvalidity(account, &folder),
                     account,
                     folder,
                     uids,
@@ -1831,11 +2020,26 @@ impl App {
             for key in &keys {
                 self.local_removed.insert(key.clone(), Instant::now());
             }
+            // Kept until the server says it's done, so quitting first
+            // doesn't lose it; with any still pending in the folder, which
+            // a plain EXPUNGE must count as ours.
+            let uidvalidity = self.uidvalidity(account, folder);
+            let _ = self
+                .store
+                .add_pending_deletes(&id, folder, uidvalidity, uids);
+            let ours = self
+                .store
+                .pending_deletes(&id)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(f, v, _)| f == folder && *v == uidvalidity)
+                .map_or_else(|| uids.to_vec(), |(_, _, all)| all);
             self.send(
                 account,
                 Request::Delete {
                     folder: folder.to_string(),
-                    uids: uids.to_vec(),
+                    uids: ours,
+                    uidvalidity,
                 },
             );
             self.note_removed(account, folder, uids.len(), unread);
@@ -1865,7 +2069,7 @@ impl App {
                 };
                 self.error(format!(
                     "{} has no {what} folder: set {what}_folder in accounts.toml",
-                    self.accounts[account].account.shown_name()
+                    self.account_name(account)
                 ));
                 return;
             };
@@ -1902,10 +2106,12 @@ impl App {
                 account: *account,
                 folder: folder.clone(),
                 uids: uids.clone(),
+                uidvalidity: self.uidvalidity(*account, folder),
                 targets: folders.iter().map(|f| f.name.clone()).collect(),
             },
             title: format!(" Move {} to ", plural(uids.len(), "message")),
             items: folders.iter().map(|f| folder_label(f)).collect(),
+            labels: Vec::new(),
             selected: 0,
         });
     }
@@ -1933,6 +2139,9 @@ impl App {
             body: compose::signature(&self.accounts[account].account),
             ..Draft::default()
         };
+        // A reply waiting for its message is given up: it won't open later
+        // over this one.
+        self.pending = None;
         self.composer = Some(Composer::new(account, Kind::New, draft));
     }
 
@@ -1964,6 +2173,7 @@ impl App {
             Request::Body {
                 folder: key.1.clone(),
                 uid: key.2,
+                uidvalidity: self.uidvalidity(key.0, &key.1),
             },
         );
         self.pending = Some((key, pending));
@@ -1971,6 +2181,7 @@ impl App {
 
     fn draft_from(&mut self, key: (usize, String, u32), raw: Arc<Vec<u8>>, pending: Pending) {
         let account = self.accounts[key.0].account.clone();
+        let kept = self.kept(&key);
         let tx = self.tx.clone();
         let index = key.0;
         mail::in_background(
@@ -1988,15 +2199,15 @@ impl App {
                     Pending::EditDraft => (
                         Kind::Draft,
                         compose::from_saved(&parsed, &raw),
-                        Some((key.1.clone(), key.2)),
+                        Some(kept.clone()),
                     ),
                 })
-                .map(|(kind, draft, draft_of)| (kind, draft, draft_of, key))
+                .map(|(kind, draft, draft_of)| (kind, draft, draft_of, kept))
             },
             move |result| {
                 let (kind, draft, draft_of, replying) = match result.flatten() {
-                    Some((kind, draft, draft_of, key)) => {
-                        let replying = (kind == Kind::Reply).then_some(key);
+                    Some((kind, draft, draft_of, kept)) => {
+                        let replying = (kind == Kind::Reply).then_some(kept);
                         (kind, Some(draft), draft_of, replying)
                     }
                     None => (Kind::New, None, None, None),
@@ -2026,7 +2237,7 @@ impl App {
         };
         match composer.on_key(key, &self.store) {
             composer::Action::None => {}
-            composer::Action::Send => self.send_message(false),
+            composer::Action::Send => self.send_message(None),
             composer::Action::SaveDraft => self.save_draft(),
             composer::Action::Close => {
                 if composer.changed() {
@@ -2057,14 +2268,21 @@ impl App {
             self.error("No editor found: set editor in settings.toml, or $EDITOR");
             return;
         };
-        let dir = self
-            .data_dir
-            .clone()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("drafts");
+        // The data folder's drafts/; without one (the demo), a new folder of
+        // the user's own, never a shared one someone could make first.
+        let (dir, temporary) = match &self.data_dir {
+            Some(data) => (data.join("drafts"), false),
+            None => match tools::private_temp_dir() {
+                Ok(dir) => (dir, true),
+                Err(e) => return self.error(format!("{e:#}")),
+            },
+        };
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         ratatui::restore();
         let result = tools::edit(&argv, &dir, &composer.draft().body);
+        if temporary {
+            let _ = std::fs::remove_dir(&dir);
+        }
         match result {
             Ok(text) => {
                 let text = text::clean(&text);
@@ -2083,14 +2301,19 @@ impl App {
         }
     }
 
-    fn send_message(&mut self, confirmed: bool) {
+    /// Sends the composer's message; `confirmed` is the digest the user
+    /// said yes to.
+    fn send_message(&mut self, confirmed: Option<u64>) {
         let Some(composer) = self.composer.as_ref() else {
             return;
         };
         let i = composer.account;
         let account = self.accounts[i].account.clone();
         let draft = composer.draft();
-        let message_id = compose::new_message_id(&account.email);
+        let message_id = match compose::new_message_id(&account.email) {
+            Ok(id) => id,
+            Err(e) => return self.error(format!("Not sent: {e:#}")),
+        };
         let date = now();
         let built = compose::build(&draft, &account, &message_id, date, false).and_then(|sent| {
             Ok((
@@ -2105,15 +2328,21 @@ impl App {
         if sent.rcpts.is_empty() {
             return self.error("Who is it to? Write an address in To");
         }
-        if draft.subject.trim().is_empty() && !confirmed && self.confirm.is_none() {
-            // Sent without a subject only after a yes.
+        let print = draft.print() ^ (i as u64).rotate_left(32);
+        // What a yes was for may not be what's in the composer now (a
+        // paste, or another message in its place): then ask about this one.
+        let changed = confirmed.is_some_and(|asked| asked != print);
+        let unasked = confirmed != Some(print);
+        if unasked && (self.settings.confirm_send || draft.subject.trim().is_empty() || changed) {
+            // Sent without a subject only after a yes, always.
+            if changed {
+                self.info("The message changed: check it again");
+            }
             return self.confirm(Confirm::Send {
-                recipients: sent.rcpts.len(),
-            });
-        }
-        if self.settings.confirm_send && !confirmed {
-            return self.confirm(Confirm::Send {
-                recipients: sent.rcpts.len(),
+                print,
+                subject: draft.subject.trim().to_string(),
+                recipients: sent.rcpts.clone(),
+                attachments: draft.attachments.iter().map(|a| a.name()).collect(),
             });
         }
         let replying = composer.replying.clone();
@@ -2225,11 +2454,11 @@ impl App {
                 },
             );
         }
-        if let Some(key) = sent.replying {
+        if let Some(key) = sent.replying.and_then(|k| self.resolve(&k)) {
             self.set_flag(&[key], FlagKind::Answered, true);
         }
-        if let Some((folder, uid)) = sent.draft_of {
-            self.delete_forever(i, &folder, &[uid]);
+        if sent.draft_of.is_some() {
+            self.replace_draft(sent.draft_of);
             self.info(format!("Sent to {}", plural(n, "recipient")));
         }
     }
@@ -2242,7 +2471,10 @@ impl App {
         let i = composer.account;
         let account = self.accounts[i].account.clone();
         let draft = composer.draft();
-        let message_id = compose::new_message_id(&account.email);
+        let message_id = match compose::new_message_id(&account.email) {
+            Ok(id) => id,
+            Err(e) => return self.error(format!("Not saved: {e:#}")),
+        };
         let built = match compose::build(&draft, &account, &message_id, now(), true) {
             Ok(built) => built,
             Err(e) => return self.error(format!("Not saved: {e:#}")),
@@ -2268,23 +2500,18 @@ impl App {
                 self.reload();
             }
             self.composer = None;
-            if let Some((folder, uid)) = draft_of {
-                self.delete_forever(i, &folder, &[uid]);
-            }
+            self.replace_draft(draft_of);
             self.info("Saved in Drafts");
             return;
         }
         if !matches!(self.accounts[i].state, State::Online | State::Connecting) {
             return self.error(format!(
                 "{} isn't connected, so the draft can't be saved there now",
-                self.accounts[i].account.shown_name()
+                self.account_name(i)
             ));
         }
         // The composer waits until the server has it (Event::Appended).
-        let id = self.next_append_id(Append::Draft {
-            account: i,
-            draft_of,
-        });
+        let id = self.next_append_id(Append::Draft { draft_of });
         self.send(
             i,
             Request::Append {
@@ -2318,20 +2545,23 @@ impl App {
         if !path.is_absolute() || crate::config::maybe_remote(&path) {
             return self.error("Give the file's full path (or drop it on the window)");
         }
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.is_file() => {
-                if meta.len() > compose::MAX_ATTACHMENT {
-                    return self.error(format!(
-                        "{} is too big to send ({})",
+        match compose::Attachment::snapshot(&path) {
+            Ok(attachment) => {
+                if let Some(composer) = self.composer.as_mut() {
+                    composer.attachments.push(attachment);
+                }
+                // A path through a link says where the file really is.
+                if let Ok(real) = std::fs::canonicalize(&path)
+                    && real != path
+                {
+                    self.info(format!(
+                        "Attached {}, which is {}",
                         crate::config::shown(&path),
-                        mail::size(meta.len() as usize)
+                        crate::config::shown(&real)
                     ));
                 }
-                if let Some(composer) = self.composer.as_mut() {
-                    composer.attachments.push(compose::Attachment::File(path));
-                }
             }
-            _ => self.error(format!("{} isn't a file", crate::config::shown(&path))),
+            Err(e) => self.error(format!("{e:#}")),
         }
     }
 
@@ -2346,16 +2576,21 @@ impl App {
             return self.info("No links in this message");
         }
         let items = body.links.iter().map(|l| text::one_line(l, 300)).collect();
+        let labels = (body.links.iter().enumerate())
+            .map(|(n, l)| (link_host(l), body.link_text(n)))
+            .collect();
         self.picker = Some(Picker {
             kind: PickerKind::Links,
             title: " Open a link ".into(),
             items,
+            labels,
             selected: 0,
         });
     }
 
     /// `U`: the List-Unsubscribe link of a mailing list's message: a web
-    /// page opens in the browser; an address gets a message to write.
+    /// page opens in the browser once the user has seen where it goes; an
+    /// address gets a message to write.
     fn unsubscribe(&mut self) {
         let Some(reader) = self.reader.as_ref() else {
             return;
@@ -2364,22 +2599,15 @@ impl App {
         let Some(link) = reader.parsed.as_ref().and_then(|p| p.unsubscribe.clone()) else {
             return self.info("This message doesn't say how to unsubscribe");
         };
-        if let Some(mailto) = link.strip_prefix("mailto:") {
-            let (to, query) = mailto.split_once('?').unwrap_or((mailto, ""));
-            let subject = query
-                .split('&')
-                .find_map(|p| p.strip_prefix("subject="))
-                .map(|s| text::one_line(&s.replace("%20", " ").replace('+', " "), 200))
-                .unwrap_or_else(|| "unsubscribe".into());
-            let draft = Draft {
-                to: text::one_line(to, 300),
-                subject,
-                body: "unsubscribe\n".into(),
-                ..Draft::default()
-            };
+        if let Some(mut draft) = mailto_draft(&link) {
+            if draft.subject.is_empty() {
+                draft.subject = "unsubscribe".into();
+            }
+            draft.body = "unsubscribe\n".into();
+            self.pending = None;
             self.composer = Some(Composer::new(account, Kind::New, draft));
         } else {
-            self.open_link(&link);
+            self.confirm(Confirm::OpenLink { url: link });
         }
     }
 
@@ -2400,16 +2628,23 @@ impl App {
             kind: PickerKind::Attachments,
             title: " Attachments ".into(),
             items,
+            labels: Vec::new(),
             selected: 0,
         });
     }
 
     /// Saves attachment `index` of the reader's message to the downloads
     /// folder; with `open`, into tuimail's own folder and opens it.
-    fn extract(&mut self, index: u32, open: bool) {
+    /// Saves or opens attachment `index`, which was listed as `listed`;
+    /// `confirmed` when the user said yes to opening it.
+    fn extract(&mut self, index: u32, listed: &str, open: bool, confirmed: bool) {
         let Some(raw) = self.reader.as_ref().and_then(|r| r.raw.clone()) else {
             return;
         };
+        if self.demo {
+            return self.info("The demo's files are made up: nothing is saved");
+        }
+        let listed = listed.to_string();
         let dir = if open {
             self.data_dir.as_ref().map(|d| d.join("opened"))
         } else {
@@ -2423,18 +2658,41 @@ impl App {
             move || {
                 let (name, bytes) =
                     mail::attachment(&raw, index).ok_or("That attachment can't be read")?;
+                // The message under the reader may have been fetched again
+                // since its files were listed: the file is the one shown, or
+                // nothing.
+                if name != listed {
+                    return Err(
+                        "The message changed since its files were listed: open it again"
+                            .to_string(),
+                    );
+                }
                 tools::save_new(&dir, &name, &bytes).map_err(|e| format!("{e:#}"))
             },
             move |result| {
                 let result = result.unwrap_or_else(|| Err("That attachment can't be read".into()));
-                let _ = tx.send(AppEvent::Extracted { open, result });
+                let _ = tx.send(AppEvent::Extracted {
+                    open,
+                    confirmed,
+                    result,
+                });
             },
         );
     }
 
+    /// Opens a web link in the browser; a `mailto:` one is written here,
+    /// from the reader's account.
     fn open_link(&mut self, url: &str) {
         if !mail::usable_link(url) {
             return self.error("tuimail opens only http, https and mailto links");
+        }
+        if let Some(draft) = mailto_draft(url) {
+            let Some(account) = self.reader.as_ref().map(|r| r.account) else {
+                return;
+            };
+            self.pending = None;
+            self.composer = Some(Composer::new(account, Kind::New, draft));
+            return;
         }
         if self.demo {
             return self.info(format!("Would open {}", text::one_line(url, 80)));
@@ -2468,7 +2726,9 @@ impl App {
         for event in events.into_iter().filter(|e| !matches!(e, Event::Key(_))) {
             self.on_terminal(event);
         }
-        let writing = self.prompt.is_some() || self.composer.is_some() || self.setup.is_some();
+        // Under a question, keys answer it: nothing is written.
+        let writing = self.confirm.is_none()
+            && (self.prompt.is_some() || self.composer.is_some() || self.setup.is_some());
         if !writing {
             if presses.len() >= PASTED_KEYS {
                 return self.info("Pasted text goes where you write: press c, / or Tab first");
@@ -2506,6 +2766,10 @@ impl App {
     fn on_terminal(&mut self, event: Event) {
         match event {
             Event::Key(key) => self.on_key(key),
+            // A paste never answers a question, nor changes what it's about.
+            Event::Paste(_) if self.confirm.is_some() => {
+                self.info("Answer the question first: y, or any other key")
+            }
             Event::Paste(pasted) => {
                 let pasted = text::first_chars(&pasted, 4 << 20).to_string();
                 if let Some(prompt) = self.prompt.as_mut() {
@@ -2545,10 +2809,13 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('c') && self.composer.is_none() && self.setup.is_none()
+        if ctrl
+            && key.code == KeyCode::Char('c')
+            && self.composer.is_none()
+            && self.setup.is_none()
+            && self.confirm.is_none()
         {
-            self.quit = true;
-            return;
+            return self.ask_quit();
         }
         if self.confirm.is_some() {
             return self.on_confirm_key(key);
@@ -2577,8 +2844,7 @@ impl App {
         if !ctrl {
             match key.code {
                 KeyCode::Char('q') if self.focus != Focus::Reader || self.wide.get() => {
-                    self.quit = true;
-                    return;
+                    return self.ask_quit();
                 }
                 KeyCode::Char('?') => return self.help = Some(HelpMenu::new(HelpTab::Keys)),
                 KeyCode::Char('O') => return self.help = Some(HelpMenu::new(HelpTab::Settings)),
@@ -2590,6 +2856,9 @@ impl App {
                 }
                 KeyCode::Char('R') => {
                     for i in 0..self.accounts.len() {
+                        if let Some(worker) = &self.accounts[i].worker {
+                            worker.creds.retry();
+                        }
                         self.check(i, true);
                     }
                     if !self.demo {
@@ -2979,10 +3248,14 @@ impl App {
                             account,
                             folder,
                             uids,
+                            uidvalidity,
                             targets,
                         },
                         KeyCode::Enter,
                     ) => {
+                        if !self.still_means(account, &folder, uidvalidity) {
+                            return;
+                        }
                         if let Some(to) = targets.get(n) {
                             self.move_messages(account, &folder, &uids, to);
                             let name = self.folder_name(account, to);
@@ -3011,10 +3284,10 @@ impl App {
                             .and_then(|p| p.attachments.get(n).cloned());
                         if let Some(a) = attachment {
                             if code == KeyCode::Char('s') {
-                                self.extract(a.index, false);
+                                self.extract(a.index, &a.name, false, false);
                             } else if code == KeyCode::Enter {
                                 if tools::safe_to_open(&a.name) {
-                                    self.extract(a.index, true);
+                                    self.extract(a.index, &a.name, true, false);
                                 } else {
                                     self.confirm(Confirm::OpenAttachment {
                                         index: a.index,
@@ -3067,11 +3340,23 @@ impl App {
                 account,
                 folder,
                 uids,
-            } if yes => self.delete_forever(account, &folder, &uids),
+                uidvalidity,
+            } if yes => {
+                if self.still_means(account, &folder, uidvalidity) {
+                    self.delete_forever(account, &folder, &uids)
+                }
+            }
+            Confirm::Delete {
+                account,
+                ref folder,
+                uidvalidity,
+                ..
+            } if yes && !self.still_means(account, folder, uidvalidity) => {}
             Confirm::Delete {
                 account,
                 folder,
                 uids,
+                ..
             } if yes => {
                 if let Some(trash) = self.accounts[account]
                     .folder_for(Role::Trash)
@@ -3080,14 +3365,18 @@ impl App {
                     self.move_messages(account, &folder, &uids, &trash);
                 }
             }
-            Confirm::Send { .. } if yes => self.send_message(true),
+            Confirm::Send { print, .. } if yes => self.send_message(Some(print)),
             Confirm::CloseComposer if yes => self.save_draft(),
             Confirm::CloseComposer if no => {
                 self.composer = None;
                 self.info("Discarded");
             }
-            Confirm::OpenAttachment { index, .. } if yes => self.extract(index, true),
+            Confirm::OpenAttachment { index, name } if yes => {
+                self.extract(index, &name, true, true)
+            }
+            Confirm::OpenLink { url } if yes => self.open_link(&url),
             Confirm::RemoveAccount(i) if yes => self.remove_account(i),
+            Confirm::Quit { .. } if yes => self.quit = true,
             confirm if early => self.confirm = Some(confirm),
             _ => {}
         }
@@ -3117,7 +3406,14 @@ impl App {
         self.marked.clear();
         self.pending = None;
         self.local_flags.clear();
+        self.local_removed.clear();
         self.picker = None;
+        self.prompt = None;
+        match self.composer.as_mut() {
+            Some(c) if c.account == i => self.composer = None,
+            Some(c) if c.account > i => c.account -= 1,
+            _ => {}
+        }
         self.place = match self.accounts.first() {
             Some(first) => Place::Folder {
                 account: 0,
@@ -3453,12 +3749,152 @@ pub fn plural(n: usize, what: &str) -> String {
     }
 }
 
-/// A link's host, for saying where it went.
+/// A link's host, for saying where it goes: where a browser takes it.
+/// A `mailto:` link as a message to write: its addresses and subject.
+/// Its body and any other header are left out: the sender wrote them.
+pub fn mailto_draft(link: &str) -> Option<Draft> {
+    let rest = link
+        .get(..7)
+        .filter(|s| s.eq_ignore_ascii_case("mailto:"))
+        .map(|_| &link[7..])?;
+    let (to, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let subject = query
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case("subject"))
+        .map(|(_, v)| text::one_line(&percent_decoded(v), mail::MAX_SUBJECT))
+        .unwrap_or_default();
+    Some(Draft {
+        to: text::one_line(&percent_decoded(to), 1000),
+        subject,
+        ..Draft::default()
+    })
+}
+
+/// `%XX` escapes decoded (RFC 3986); bytes that aren't UTF-8 become �.
+fn percent_decoded(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub fn link_host(url: &str) -> String {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Browsers skip any `/` and `\` after the scheme, and end the host at
+    // `\` as at `/`, in http and https.
+    let rest = url.split_once(':').map_or(url, |(_, r)| r);
+    let rest = rest.trim_start_matches(['/', '\\']);
+    let host = rest.split(['/', '\\', '?', '#']).next().unwrap_or(rest);
     let host = host.rsplit('@').next().unwrap_or(host);
-    text::one_line(host, 80)
+    let host = text::one_line(host, host.len());
+    // Letters from other alphabets are shown as the browser sends them
+    // (punycode, `xn--`): `аpple.com` with a Cyrillic а isn't apple.com.
+    let host = if host.is_ascii() {
+        host
+    } else {
+        host.to_lowercase()
+            .split(['.', '。', '．', '｡'])
+            .map(ascii_label)
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    // A long host keeps its end: the site it belongs to is there.
+    let count = host.chars().count();
+    if count <= 80 {
+        host
+    } else {
+        format!("…{}", host.chars().skip(count - 79).collect::<String>())
+    }
+}
+
+/// A host's label as DNS has it: punycode for one with letters outside
+/// ASCII (RFC 3492). Longer than DNS allows, its other letters are `?`.
+fn ascii_label(label: &str) -> String {
+    const BASE: u32 = 36;
+    const T_MIN: u32 = 1;
+    const T_MAX: u32 = 26;
+    fn digit(d: u32) -> char {
+        char::from(if d < 26 {
+            b'a' + d as u8
+        } else {
+            b'0' + (d - 26) as u8
+        })
+    }
+    fn adapt(delta: u32, points: u32, first: bool) -> u32 {
+        let mut delta = delta / if first { 700 } else { 2 };
+        delta += delta / points;
+        let mut k = 0;
+        while delta > ((BASE - T_MIN) * T_MAX) / 2 {
+            delta /= BASE - T_MIN;
+            k += BASE;
+        }
+        k + (BASE - T_MIN + 1) * delta / (delta + 38)
+    }
+    if label.is_ascii() {
+        return label.to_string();
+    }
+    let points: Vec<u32> = label.chars().map(u32::from).collect();
+    let unreadable = || {
+        label
+            .chars()
+            .map(|c| if c.is_ascii() { c } else { '?' })
+            .collect()
+    };
+    if points.len() > 63 {
+        return unreadable();
+    }
+    let mut out: String = label.chars().filter(char::is_ascii).collect();
+    let basic = out.len() as u32;
+    if basic > 0 {
+        out.push('-');
+    }
+    let (mut n, mut delta, mut bias, mut done) = (128u32, 0u32, 72u32, basic);
+    while (done as usize) < points.len() {
+        let Some(m) = points.iter().copied().filter(|&c| c >= n).min() else {
+            return unreadable();
+        };
+        delta += (m - n) * (done + 1);
+        n = m;
+        for &c in &points {
+            if c < n {
+                delta += 1;
+            } else if c == n {
+                let (mut q, mut k) = (delta, BASE);
+                loop {
+                    let t = k.saturating_sub(bias).clamp(T_MIN, T_MAX);
+                    if q < t {
+                        break;
+                    }
+                    out.push(digit(t + (q - t) % (BASE - t)));
+                    q = (q - t) / (BASE - t);
+                    k += BASE;
+                }
+                out.push(digit(q));
+                bias = adapt(delta, done + 1, done == basic);
+                delta = 0;
+                done += 1;
+            }
+        }
+        delta += 1;
+        n += 1;
+    }
+    format!("xn--{out}")
 }
 
 /// Asks the terminal to put `text` on the clipboard (OSC 52).
@@ -3555,6 +3991,194 @@ pub mod tests {
     }
 
     /// Fills `app` with the demo's mail.
+    #[tokio::test]
+    async fn the_link_list_says_what_each_link_says_beside_its_real_site() {
+        let mut app = app();
+        with_mail(&mut app);
+        let links = [
+            "https://r.example.com/a?id=1",
+            "https://r.example.com/b?id=2",
+            "https://evil.example/x",
+        ];
+        app.picker = Some(Picker {
+            kind: PickerKind::Links,
+            title: " Open a link ".into(),
+            items: links.iter().map(|l| l.to_string()).collect(),
+            labels: [
+                ("r.example.com", "Aerial view"),
+                ("r.example.com", "Try it"),
+                ("evil.example", ""),
+            ]
+            .iter()
+            .map(|(h, s)| (h.to_string(), s.to_string()))
+            .collect(),
+            selected: 0,
+        });
+        let shown = crate::ui::tests::screen(&mut app, 160, 30);
+        let row = |said: &str| {
+            shown
+                .lines()
+                .find(|l| l.contains(said))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let aerial = row("Aerial view");
+        assert!(
+            aerial.contains("r.example.com") && aerial.contains("id=1"),
+            "{shown}"
+        );
+        assert!(row("Try it").contains("id=2"), "{shown}");
+        assert!(row("evil.example/x").contains("evil.example  "), "{shown}");
+    }
+
+    #[test]
+    fn a_link_site_comes_from_the_whole_url() {
+        // What's before the @ is a user name, however long.
+        let url = format!("https://bank.example{}@evil.example/x", "-".repeat(400));
+        assert_eq!(link_host(&url), "evil.example");
+        // Where browsers end it: a `\` before the @.
+        assert_eq!(
+            link_host("https://evil.example\\@bank.example/x"),
+            "evil.example"
+        );
+        assert_eq!(
+            link_host("https://\\evil.example\\@bank.example/x"),
+            "evil.example"
+        );
+        assert_eq!(
+            link_host("mailto:someone@example.org?subject=x"),
+            "example.org"
+        );
+        // A long host keeps the site it belongs to.
+        let long = format!("https://bank.example.{}.evil.example/x", "a".repeat(120));
+        let host = link_host(&long);
+        assert!(
+            host.ends_with(".evil.example") && host.starts_with('…'),
+            "{host}"
+        );
+        assert_eq!(host.chars().count(), 80);
+    }
+
+    #[test]
+    fn a_site_with_letters_from_other_alphabets_shows_as_its_browser_sends_it() {
+        // A Cyrillic а in place of a.
+        assert_eq!(
+            link_host("https://\u{430}pple.com/login"),
+            "xn--pple-43d.com"
+        );
+        assert_eq!(link_host("https://M\u{fc}nchen.DE/"), "xn--mnchen-3ya.de");
+        assert_eq!(
+            link_host("https://\u{3b1}\u{3b2}\u{3b3}.gr"),
+            "xn--mxacd.gr"
+        );
+        assert_eq!(link_host("https://\u{fc}.example"), "xn--tda.example");
+        // Dots of other alphabets end a label as `.` does.
+        assert_eq!(
+            link_host("https://b\u{fc}cher\u{3002}de"),
+            "xn--bcher-kva.de"
+        );
+        let long = format!("https://{}\u{430}.com", "a".repeat(80));
+        let host = link_host(&long);
+        assert!(host.ends_with("a?.com"), "{host}");
+        assert!(host.trim_start_matches('…').is_ascii(), "{host}");
+    }
+
+    #[test]
+    fn a_mailto_link_gives_only_its_addresses_and_subject() {
+        let draft = mailto_draft(
+            "MAILTO:list%40example.org?Subject=Hi%20there%0D%0ABcc:%20x@evil.example\
+             &body=Send%20your%20password&bcc=spy@evil.example&cc=more@evil.example",
+        )
+        .unwrap();
+        assert_eq!(draft.to, "list@example.org");
+        assert_eq!(draft.subject, "Hi there Bcc: x@evil.example");
+        assert_eq!(draft.body, "");
+        assert_eq!(draft.cc, "");
+        assert_eq!(draft.bcc, "");
+        assert!(mailto_draft("https://example.org").is_none());
+        // A stray `%` or one cut short stays as it is.
+        assert_eq!(mailto_draft("mailto:a%b@c%4").unwrap().to, "a%b@c%4");
+    }
+
+    #[tokio::test]
+    async fn unsubscribing_on_a_web_page_shows_where_it_goes_first() {
+        let mut app = app();
+        with_mail(&mut app);
+        open_first(&mut app).await;
+        let reader = app.reader.as_mut().unwrap();
+        let mut parsed = (**reader.parsed.as_ref().unwrap()).clone();
+        parsed.unsubscribe = Some("https://lists.example.org/u?id=42".into());
+        reader.parsed = Some(Arc::new(parsed));
+        app.on_key(key(KeyCode::Char('U')));
+        assert!(matches!(app.confirm, Some(Confirm::OpenLink { .. })));
+        let screen = crate::ui::tests::screen(&mut app, 120, 40);
+        assert!(screen.contains("lists.example.org/u?id=42"), "{screen}");
+        // Anything but `y` opens nothing.
+        app.confirm_at = Instant::now() - CONFIRM_GRACE;
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(app.confirm.is_none());
+        assert!(app.status.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_mailto_link_is_written_in_tuimail() {
+        let mut app = app();
+        with_mail(&mut app);
+        open_first(&mut app).await;
+        let account = app.reader.as_ref().unwrap().account;
+        app.open_link("mailto:help@example.org?subject=Question&body=x");
+        let composer = app.composer.as_ref().expect("a message to write");
+        assert_eq!(composer.account, account);
+        let draft = composer.draft();
+        assert_eq!(draft.to, "help@example.org");
+        assert_eq!(draft.subject, "Question");
+        assert_eq!(draft.body, "");
+    }
+
+    #[tokio::test]
+    async fn accounts_at_one_provider_are_told_apart() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut accounts = crate::demo::accounts();
+        // As the setup form used to name them: both after the domain.
+        for (a, email) in accounts
+            .iter_mut()
+            .zip(["sam@gmail.com", "sam.work@gmail.com"])
+        {
+            a.name = "gmail.com".into();
+            a.email = email.into();
+        }
+        let mut app = App::new(
+            Store::in_memory(),
+            Settings::default(),
+            accounts,
+            false,
+            None,
+            tx,
+            true,
+        );
+        app.icons = crate::icons::PLAIN;
+        with_mail(&mut app);
+        app.open_place(Place::AllInboxes);
+        assert_eq!(app.account_name(0), "sam@gmail.com");
+        assert_eq!(app.account_name(1), "sam.work@gmail.com");
+        let shown = crate::ui::tests::screen(&mut app, 160, 30);
+        assert!(shown.contains("sam@gmail.com"), "{shown}");
+        assert!(shown.contains("sam.work@gmail.com"), "{shown}");
+        assert!(!shown.contains("[gmail.com]"), "{shown}");
+
+        // Unnamed, as the setup form makes them now: the address in the
+        // sidebar, what's before the @ in All inboxes' tags.
+        for a in &mut app.accounts {
+            Arc::make_mut(&mut a.account).name.clear();
+        }
+        assert_eq!(app.account_name(1), "sam.work@gmail.com");
+        assert_eq!(app.account_tag(0), "sam");
+        assert_eq!(app.account_tag(1), "sam.work");
+        let shown = crate::ui::tests::screen(&mut app, 160, 30);
+        assert!(shown.contains("[sam]"), "{shown}");
+        assert!(shown.contains("[sam.work]"), "{shown}");
+    }
+
     pub fn with_mail(app: &mut App) {
         let accounts: Vec<Account> = app.accounts.iter().map(|a| (*a.account).clone()).collect();
         crate::demo::fill(&mut app.store, &accounts);
@@ -3722,6 +4346,261 @@ pub mod tests {
             .unwrap()
             .unwrap();
         assert!(original.flags.answered, "marked answered");
+    }
+
+    /// Opens a new message, writes `to` and `subject`, and presses Ctrl-s.
+    fn write_and_send(app: &mut App, to: &str, subject: &str) {
+        app.on_key(key(KeyCode::Char('c')));
+        for c in to.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Tab));
+        }
+        for c in subject.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    }
+
+    async fn settle(app: &mut App) {
+        for _ in 0..50 {
+            app.drain_for_tests();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn sent_subjects(app: &App) -> Vec<String> {
+        let sent = app.store.messages(&app.accounts[0].id, "Sent", 20).unwrap();
+        sent.iter().map(|m| m.summary.subject.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_reply_made_ready_late_does_not_take_over_a_send_question() {
+        let mut app = app();
+        with_mail(&mut app);
+        open_first(&mut app).await;
+        // The reply is laid out in the background; another message is
+        // written and sent meanwhile.
+        app.on_key(key(KeyCode::Char('r')));
+        write_and_send(&mut app, "x@y.z", "Mine");
+        assert!(matches!(app.confirm, Some(Confirm::Send { .. })));
+        settle(&mut app).await;
+        let composer = app.composer.as_ref().unwrap();
+        assert_eq!(composer.kind, Kind::New);
+        assert_eq!(composer.draft().subject, "Mine");
+        app.confirm_at = Instant::now() - CONFIRM_GRACE;
+        app.on_key(key(KeyCode::Char('y')));
+        app.wait_until(|app| app.composer.is_none()).await;
+        let sent = sent_subjects(&app);
+        assert!(sent.contains(&"Mine".to_string()), "{sent:?}");
+        assert!(!sent.iter().any(|s| s.starts_with("Re:")), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_yes_sends_only_the_message_it_was_asked_about() {
+        let mut app = app();
+        with_mail(&mut app);
+        let before = sent_subjects(&app);
+        write_and_send(&mut app, "x@y.z", "Mine");
+        let Some(Confirm::Send { recipients, .. }) = app.confirm.clone() else {
+            panic!("asked");
+        };
+        assert_eq!(recipients, ["x@y.z"]);
+        // A paste under the question changes nothing.
+        app.on_terminal(Event::Paste(", other@example.net".into()));
+        assert_eq!(app.composer.as_ref().unwrap().draft().to, "x@y.z");
+        // Another message in its place: the yes doesn't send it, the
+        // question comes back about it.
+        let other = Draft {
+            to: "z@y.x".into(),
+            subject: "Other".into(),
+            ..Draft::default()
+        };
+        app.composer = Some(Composer::new(0, Kind::New, other));
+        app.confirm_at = Instant::now() - CONFIRM_GRACE;
+        app.on_key(key(KeyCode::Char('y')));
+        settle(&mut app).await;
+        assert_eq!(sent_subjects(&app), before);
+        let Some(Confirm::Send {
+            recipients,
+            subject,
+            ..
+        }) = app.confirm.clone()
+        else {
+            panic!("asked again");
+        };
+        assert_eq!(
+            (recipients, subject),
+            (vec!["z@y.x".to_string()], "Other".to_string())
+        );
+    }
+
+    /// An app with both demo accounts: work (IMAP) and home (POP3).
+    fn two_accounts() -> App {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            Store::in_memory(),
+            Settings::default(),
+            crate::demo::accounts(),
+            false,
+            None,
+            tx,
+            true,
+        );
+        app.icons = crate::icons::PLAIN;
+        app.test_rx = Some(rx);
+        with_mail(&mut app);
+        app
+    }
+
+    /// Opens work's saved draft in the composer.
+    async fn edit_works_draft(app: &mut App) {
+        app.open_place(Place::Folder {
+            account: 0,
+            folder: "Drafts".into(),
+        });
+        app.focus = Focus::List;
+        app.selected = 0;
+        app.open_selected(true);
+        app.wait_until(|a| a.composer.is_some()).await;
+    }
+
+    fn drafts(app: &App, account: usize) -> Vec<String> {
+        let id = &app.accounts[account].id;
+        let list = app.store.messages(id, "Drafts", 20).unwrap();
+        list.iter().map(|m| m.summary.subject.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_draft_sent_from_another_account_leaves_that_accounts_mail_alone() {
+        let mut app = two_accounts();
+        let home = app.accounts[1].id.clone();
+        let raw =
+            b"From: Sam <sam@home.example>\r\nTo: x@y.z\r\nSubject: Home draft\r\n\r\nkeep\r\n";
+        let flags = Flags {
+            seen: true,
+            draft: true,
+            ..Flags::default()
+        };
+        assert_eq!(
+            app.store
+                .add_local(&home, "Drafts", raw, flags, None)
+                .unwrap(),
+            1
+        );
+        edit_works_draft(&mut app).await;
+        let work_draft = drafts(&app, 0);
+        // From switched to home, then sent.
+        app.composer.as_mut().unwrap().field = composer::Field::From;
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.composer.as_ref().unwrap().account, 1);
+        app.settings.confirm_send = false;
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.wait_until(|a| a.composer.is_none()).await;
+        assert_eq!(drafts(&app, 1), ["Home draft"], "home's draft stays");
+        assert!(
+            drafts(&app, 0).len() < work_draft.len(),
+            "work's draft goes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_made_again_on_the_server_keeps_its_new_messages_safe() {
+        let mut app = two_accounts();
+        let work = app.accounts[0].id.clone();
+        let known = |uidvalidity| crate::store::Known {
+            uidvalidity,
+            low: 1,
+            high: 10,
+        };
+        app.store.set_known(&work, "Drafts", known(1)).unwrap();
+        edit_works_draft(&mut app).await;
+        let before = drafts(&app, 0);
+        // The server makes Drafts again: UID 1 is another message now.
+        app.store.set_known(&work, "Drafts", known(999)).unwrap();
+        app.settings.confirm_send = false;
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.wait_until(|a| a.composer.is_none()).await;
+        assert_eq!(
+            drafts(&app, 0),
+            before,
+            "nothing deleted under a new UIDVALIDITY"
+        );
+
+        // A question asked before the change does nothing after it.
+        app.store.set_known(&work, "Drafts", known(1)).unwrap();
+        let uids = vec![app.store.messages(&work, "Drafts", 1).unwrap()[0].uid];
+        app.confirm(Confirm::DeleteForever {
+            account: 0,
+            folder: "Drafts".into(),
+            uids,
+            uidvalidity: 1,
+        });
+        app.store.set_known(&work, "Drafts", known(999)).unwrap();
+        app.confirm_at = Instant::now() - CONFIRM_GRACE;
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(drafts(&app, 0), before);
+    }
+
+    #[tokio::test]
+    async fn a_file_is_opened_only_as_the_one_it_was_listed_as() {
+        let mut app = app();
+        with_mail(&mut app);
+        open_first(&mut app).await;
+        let dir = std::env::temp_dir().join(format!("tuimail-open-{}", std::process::id()));
+        app.data_dir = Some(dir.clone());
+        app.demo = false;
+        // The server sends the message again with other files in it.
+        let other = b"From: a@b.c\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nx\r\n\
+--b\r\nContent-Type: application/octet-stream; name=\"run.desktop\"\r\n\r\nx\r\n--b--\r\n";
+        app.reader.as_mut().unwrap().raw = Some(Arc::new(other.to_vec()));
+        app.extract(0, "photo.jpg", true, false);
+        app.wait_until(|a| a.status.as_ref().is_some_and(|s| s.error))
+            .await;
+        let status = app.status.as_ref().unwrap().text.clone();
+        assert!(status.contains("changed"), "{status}");
+        assert!(!dir.join("opened").join("run.desktop").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn quitting_with_changes_on_their_way_asks_first() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.accounts[0].waiting = 2;
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.quit);
+        assert_eq!(app.confirm, Some(Confirm::Quit { waiting: 2 }));
+        app.confirm_at = Instant::now() - CONFIRM_GRACE;
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(!app.quit, "stays");
+        app.accounts[0].waiting = 0;
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.quit, "nothing waiting: quits at once");
+    }
+
+    #[tokio::test]
+    async fn a_delete_for_good_is_kept_until_the_server_has_made_it() {
+        let mut app = app();
+        with_mail(&mut app);
+        let id = app.accounts[0].id.clone();
+        let uid = app.store.messages(&id, "INBOX", 1).unwrap()[0].uid;
+        app.delete_forever(0, "INBOX", &[uid]);
+        assert_eq!(
+            app.store.pending_deletes(&id).unwrap(),
+            [("INBOX".to_string(), 0, vec![uid])]
+        );
+        app.on_worker(
+            0,
+            worker::Event::Deleted {
+                folder: "INBOX".into(),
+                uids: vec![uid],
+                all: true,
+            },
+        );
+        assert!(app.store.pending_deletes(&id).unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -51,24 +51,32 @@ pub enum Request {
         below: u32,
         count: u32,
     },
+    // The requests on UIDs carry `uidvalidity`, what the UIDs meant when
+    // they were taken (0: not known, no check): if the server has given
+    // the folder a new one since, they mean other messages, and nothing is
+    // done to them.
     Body {
         folder: String,
         uid: u32,
+        uidvalidity: u32,
     },
     Flag {
         folder: String,
         uids: Vec<u32>,
         flag: FlagKind,
         on: bool,
+        uidvalidity: u32,
     },
     Move {
         folder: String,
         uids: Vec<u32>,
         to: String,
+        uidvalidity: u32,
     },
     Delete {
         folder: String,
         uids: Vec<u32>,
+        uidvalidity: u32,
     },
     /// Adds a message to a folder, made first if it isn't there. `id`
     /// comes back with [`Event::Appended`]. With `retry`, a connection
@@ -87,6 +95,7 @@ pub enum Request {
     Headers {
         folder: String,
         uids: Vec<u32>,
+        uidvalidity: u32,
     },
     Search {
         folder: String,
@@ -104,7 +113,7 @@ pub enum Request {
 impl Request {
     /// Whether it changes mail on the server: such a request isn't dropped
     /// while the connection is down, but made once it's back.
-    fn changes(&self) -> bool {
+    pub fn changes(&self) -> bool {
         matches!(
             self,
             Request::Flag { .. }
@@ -203,6 +212,14 @@ pub enum Event {
     Done {
         folder: String,
     },
+    /// Deletes for good the server made (`all`: and expunged).
+    Deleted {
+        folder: String,
+        uids: Vec<u32>,
+        all: bool,
+    },
+    /// How many changes haven't reached the server yet.
+    Waiting(usize),
     /// A message was added to `folder` (`error` if it wasn't).
     Appended {
         folder: String,
@@ -393,6 +410,13 @@ async fn run_imap(
     let mut watcher = Watcher::default();
     // Changes asked for while the connection was down, in order.
     let mut held: VecDeque<Request> = VecDeque::new();
+    let mut waiting = 0;
+    let mut report = |n: usize, sink: &Sink| {
+        if n != waiting {
+            waiting = n;
+            sink(Event::Waiting(n));
+        }
+    };
     loop {
         let fresh = if held.is_empty() {
             match rx.recv().await {
@@ -412,6 +436,8 @@ async fn run_imap(
         let mut requests: VecDeque<Request> = std::mem::take(&mut held);
         requests.extend(fresh);
         while let Some(request) = requests.pop_front() {
+            let queued = requests.iter().filter(|r| r.changes()).count();
+            report(held.len() + queued + usize::from(request.changes()), &sink);
             if session.is_none() {
                 let recently = failed_at.is_some_and(|at| at.elapsed() < OFFLINE_FOR);
                 let retrying = !held.is_empty();
@@ -469,10 +495,29 @@ async fn run_imap(
                 }
             }
         }
+        report(held.len(), &sink);
     }
     if let Some((s, _)) = session {
         imap::logout(s).await;
     }
+}
+
+/// SELECTs `folder` for something done to UIDs read under `uidvalidity`
+/// (0: unknown). A folder the server has made again since has other
+/// messages under those UIDs: that's refused, not done.
+async fn select_same(s: &mut Session, folder: &str, uidvalidity: u32) -> Result<()> {
+    let selected = imap::select(s, folder).await?;
+    if uidvalidity != 0 && selected.uidvalidity != uidvalidity {
+        return Err(imap::Said(format!(
+            "{} was made again on the server, so its messages changed: nothing was done",
+            text::one_line(
+                &crate::utf7::decode(folder).unwrap_or_else(|| folder.to_string()),
+                60
+            )
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 async fn handle_imap(
@@ -523,9 +568,15 @@ async fn handle_imap(
                 low,
             });
         }
-        Request::Body { folder, uid } => {
-            imap::select(s, &folder).await?;
-            let result = imap::body(s, uid).await;
+        Request::Body {
+            folder,
+            uid,
+            uidvalidity,
+        } => {
+            let result = match select_same(s, &folder, uidvalidity).await {
+                Ok(()) => imap::body(s, uid).await,
+                Err(e) => Err(e),
+            };
             match result {
                 Ok(raw) => sink(Event::Body {
                     folder,
@@ -545,18 +596,29 @@ async fn handle_imap(
             uids,
             flag,
             on,
+            uidvalidity,
         } => {
-            imap::select(s, &folder).await?;
+            select_same(s, &folder, uidvalidity).await?;
             imap::set_flag(s, &uids, flag, on).await?;
         }
-        Request::Move { folder, uids, to } => {
-            imap::select(s, &folder).await?;
+        Request::Move {
+            folder,
+            uids,
+            to,
+            uidvalidity,
+        } => {
+            select_same(s, &folder, uidvalidity).await?;
             imap::move_to(s, caps, &uids, &to).await?;
             sink(Event::Done { folder: to });
         }
-        Request::Delete { folder, uids } => {
-            imap::select(s, &folder).await?;
-            imap::delete(s, caps, &uids).await?;
+        Request::Delete {
+            folder,
+            uids,
+            uidvalidity,
+        } => {
+            select_same(s, &folder, uidvalidity).await?;
+            let all = imap::delete(s, caps, &uids).await?;
+            sink(Event::Deleted { folder, uids, all });
         }
         Request::Append {
             folder,
@@ -579,8 +641,12 @@ async fn handle_imap(
                 error: None,
             });
         }
-        Request::Headers { folder, uids } => {
-            imap::select(s, &folder).await?;
+        Request::Headers {
+            folder,
+            uids,
+            uidvalidity,
+        } => {
+            select_same(s, &folder, uidvalidity).await?;
             let headers = imap::headers(s, &uids).await?;
             sink(Event::Headers { folder, headers });
         }
@@ -635,9 +701,16 @@ async fn sync(s: &mut Session, folder: &str, known: Known, count: u32) -> Result
         uids.sort_unstable();
         uids
     } else {
-        let mut uids = imap::search(s, &format!("UID {}:*", known.high + 1)).await?;
-        uids.retain(|&u| u > known.high);
-        uids
+        // Past the last UID there are none (`high + 1` would wrap to 0, and
+        // `0:*` is every message).
+        match known.high.checked_add(1) {
+            Some(next) => {
+                let mut uids = imap::search(s, &format!("UID {next}:*")).await?;
+                uids.retain(|&u| u > known.high);
+                uids
+            }
+            None => Vec::new(),
+        }
     };
     let gap = new_uids.len() > count;
     if gap {

@@ -302,11 +302,9 @@ impl Setup {
         };
         let (guess, _) = account::guess(&email, self.protocol);
         let name = value(&self.name);
+        // No `name`: the sidebar shows the address, which tells two
+        // accounts at one provider apart.
         let account = Account {
-            name: email
-                .rsplit_once('@')
-                .map(|(_, d)| d.to_string())
-                .unwrap_or_default(),
             email: email.clone(),
             display_name: name,
             protocol: self.protocol,

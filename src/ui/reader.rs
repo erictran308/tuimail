@@ -8,9 +8,44 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use super::{border, bordered, fit, hint_spans, scrollbar};
+use super::{border, bordered, fit, fit_middle, hint_spans, scrollbar};
 use crate::app::{App, Focus};
-use crate::mail::{self, Role};
+use crate::mail::{self, Addr, Role};
+use crate::theme::Colors;
+
+/// A sender as the reader shows it: the address always in full (cut in
+/// the middle, so its domain shows, if even it doesn't fit), then the name
+/// the sender chose in what room is left, quoted when it could pass for an
+/// address. A name can never push the address out of view.
+fn sender<'a>(label: Span<'a>, from: &Addr, room: usize, c: &Colors) -> Line<'a> {
+    let named = !from.name.is_empty() && from.name != from.addr;
+    if !named {
+        return Line::from(vec![
+            label,
+            Span::styled(
+                fit_middle(&from.addr, room),
+                Style::new().fg(c.text).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+    let addr = format!("<{}>", fit_middle(&from.addr, room.saturating_sub(2)));
+    let shown = from.display();
+    let name = shown
+        .strip_suffix(&format!(" <{}>", from.addr))
+        .unwrap_or(&from.name)
+        .to_string();
+    let name_room = room.saturating_sub(addr.width() + 1);
+    let mut spans = vec![label];
+    if name_room >= 4 {
+        spans.push(Span::styled(
+            fit(&name, name_room),
+            Style::new().fg(c.text).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(addr, Style::new().fg(c.text)));
+    Line::from(spans)
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let c = app.colors.clone();
@@ -65,27 +100,23 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     lines.push(Line::default());
     let label = |name: &str| Span::styled(format!("{name:<6}"), Style::new().fg(c.subtext));
     let parsed = reader.parsed.as_ref();
-    let from = parsed
-        .and_then(|p| p.from.first().cloned())
-        .unwrap_or_else(|| m.summary.from.clone());
-    lines.push(Line::from(vec![
-        label("From"),
-        Span::styled(
-            fit(from.short(), width.saturating_sub(6)),
-            Style::new().fg(c.text).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if from.name.is_empty() {
-                String::new()
-            } else {
-                fit(
-                    &format!(" <{}>", from.addr),
-                    width.saturating_sub(6 + from.short().width()),
-                )
-            },
-            Style::new().fg(c.subtext),
-        ),
-    ]));
+    let froms: Vec<Addr> = match parsed {
+        Some(p) if !p.from.is_empty() => p.from.clone(),
+        _ => vec![m.summary.from.clone()],
+    };
+    for (i, from) in froms.iter().take(4).enumerate() {
+        let name = if i == 0 { "From" } else { "" };
+        lines.push(sender(label(name), from, width.saturating_sub(6), &c));
+    }
+    if froms.len() > 4 {
+        lines.push(Line::from(vec![
+            label(""),
+            Span::styled(
+                format!("and {} more", froms.len() - 4),
+                Style::new().fg(c.dim),
+            ),
+        ]));
+    }
     let address_line = |name: &str, list: &str, lines: &mut Vec<Line>| {
         if list.is_empty() {
             return;
@@ -109,10 +140,22 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     address_line("To", &m.summary.to, &mut lines);
     address_line("Cc", &m.summary.cc, &mut lines);
-    if let Some(reply_to) = parsed.and_then(|p| p.reply_to.first())
-        && !reply_to.addr.eq_ignore_ascii_case(&from.addr)
-    {
-        address_line("Reply", &reply_to.display(), &mut lines);
+    // Where a reply goes when that isn't only the sender: every address,
+    // those that aren't the sender's first, without the names (which could
+    // pass for addresses, or push one out of view).
+    if let Some(p) = parsed {
+        let theirs = |a: &Addr| froms.iter().any(|f| f.addr.eq_ignore_ascii_case(&a.addr));
+        let (same, other): (Vec<&Addr>, Vec<&Addr>) = p.reply_to.iter().partition(|a| theirs(a));
+        if !other.is_empty() {
+            let mut seen: Vec<String> = Vec::new();
+            for a in other.iter().chain(&same) {
+                let addr = a.addr.to_lowercase();
+                if !seen.contains(&addr) {
+                    seen.push(addr);
+                }
+            }
+            address_line("Reply", &seen.join(", "), &mut lines);
+        }
     }
     let date = mail::long_date(m.summary.date);
     if !date.is_empty() {
@@ -207,7 +250,66 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 mod tests {
     use crate::app::Focus;
     use crate::app::tests::{app, open_first, with_mail};
+    use crate::store::Flags;
     use crate::ui::tests::screen;
+
+    /// The reader on a message with these headers, at 160 columns.
+    async fn reading(headers: &str) -> String {
+        let mut app = app();
+        with_mail(&mut app);
+        let id = app.accounts[0].id.clone();
+        let raw = format!(
+            "{headers}\r\nTo: me@example.org\r\nSubject: Account review\r\n\
+             Date: Mon, 1 Jan 2035 00:00:00 +0000\r\nMessage-ID: <x1@evil.example>\r\n\r\nhi\r\n"
+        );
+        app.store
+            .add_local(&id, "INBOX", raw.as_bytes(), Flags::default(), None)
+            .unwrap();
+        app.reload();
+        app.focus = Focus::List;
+        screen(&mut app, 160, 40);
+        open_first(&mut app).await;
+        screen(&mut app, 160, 40)
+    }
+
+    #[tokio::test]
+    async fn a_long_sender_name_never_hides_the_address() {
+        let shown = reading(
+            "From: \"service@paypal.com <service@paypal.com> on behalf of PayPal Account \
+             Review Department, case 4471-2209-118\" <attacker@evil.example>",
+        )
+        .await;
+        let row = shown.lines().find(|l| l.contains("From")).unwrap();
+        assert!(row.contains("<attacker@evil.example>"), "{row}");
+
+        // A name that could pass for an address is quoted, as in To and Cc.
+        let shown = reading("From: \"PayPal <service@paypal.com>\" <attacker2@evil.example>").await;
+        assert!(
+            shown.contains("\"PayPal <service@paypal.com>\" <attacker2@evil.example>"),
+            "{shown}"
+        );
+
+        // A long address keeps its domain.
+        let shown = reading(
+            "From: <service@paypal.com.account-verification-secure-login-center-7781-\
+             and-some-more-padding.evil.example>",
+        )
+        .await;
+        let row = shown.lines().find(|l| l.contains("From")).unwrap();
+        assert!(row.contains("evil.example"), "{row}");
+    }
+
+    #[tokio::test]
+    async fn every_reply_destination_is_shown() {
+        let long = format!("Alice Rivera, Finance, {}", "x".repeat(90));
+        let shown = reading(&format!(
+            "From: \"Alice Rivera\" <alice@example.com>\r\nReply-To: \"Alice Rivera\" \
+             <alice@example.com>, <evil@evil.example>, \"{long}\" <alice@example.com>"
+        ))
+        .await;
+        let row = shown.lines().find(|l| l.contains("Reply")).expect(&shown);
+        assert!(row.contains("evil@evil.example"), "{row}");
+    }
 
     #[tokio::test]
     async fn a_message_shows_its_headers_then_its_text() {

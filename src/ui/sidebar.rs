@@ -72,7 +72,7 @@ fn line(app: &App, row: Row, selected: bool, focused: bool, width: usize) -> Lin
             (
                 0,
                 icons.account,
-                format!("{}{state}{fold}", a.account.shown_name()),
+                format!("{}{state}{fold}", app.account_name(i)),
                 0,
                 Style::new().fg(c.subtext).add_modifier(Modifier::BOLD),
             )

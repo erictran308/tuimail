@@ -8,6 +8,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address as BuilderAddress;
+use mail_builder::headers::content_type::ContentType;
+use mail_builder::mime::MimePart;
 
 use crate::account::{self, Account};
 use crate::mail::{self, Addr, Parsed};
@@ -32,6 +34,50 @@ pub enum Attachment {
 }
 
 impl Attachment {
+    /// A file on this computer, read now, once: what's sent, kept in Sent
+    /// and shown is these bytes, whatever the path names later (another
+    /// account that can change its folder can't swap the file before the
+    /// send). Opened without waiting on a pipe, and only a plain file.
+    pub fn snapshot(path: &std::path::Path) -> Result<Attachment> {
+        use std::io::Read;
+        let shown = crate::config::shown(path);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options
+            .open(path)
+            .with_context(|| format!("cannot read {shown}"))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("cannot read {shown}"))?;
+        if !meta.is_file() {
+            bail!("{shown} isn't a file");
+        }
+        if meta.len() > MAX_ATTACHMENT {
+            bail!(
+                "{shown} is too big to send ({})",
+                mail::size(meta.len() as usize)
+            );
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_ATTACHMENT + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("cannot read {shown}"))?;
+        if bytes.len() as u64 > MAX_ATTACHMENT {
+            bail!("{shown} is too big to send");
+        }
+        let name = Attachment::File(path.to_path_buf()).name();
+        Ok(Attachment::Data {
+            mime: mime_of(&name).to_string(),
+            name,
+            bytes: Arc::new(bytes),
+        })
+    }
+
     pub fn name(&self) -> String {
         match self {
             Attachment::File(path) => mail::safe_file_name(
@@ -129,6 +175,37 @@ pub struct Draft {
     pub attachments: Vec<Attachment>,
 }
 
+impl Draft {
+    /// A digest of everything the message says, to tell whether it changed
+    /// between being shown and being sent.
+    pub fn print(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for field in [
+            &self.to,
+            &self.cc,
+            &self.bcc,
+            &self.subject,
+            &self.body,
+            &self.in_reply_to,
+            &self.references,
+        ] {
+            field.hash(&mut h);
+        }
+        for a in &self.attachments {
+            match a {
+                Attachment::File(path) => path.hash(&mut h),
+                Attachment::Data { name, mime, bytes } => {
+                    name.hash(&mut h);
+                    mime.hash(&mut h);
+                    bytes.hash(&mut h);
+                }
+            }
+        }
+        h.finish()
+    }
+}
+
 /// A message ready to go.
 pub struct Built {
     pub raw: Vec<u8>,
@@ -159,7 +236,9 @@ pub fn parse_addresses(input: &str) -> Result<Vec<Addr>, String> {
                 escaped = true;
                 current.push(c);
             }
-            '"' => {
+            // Only a name is quoted: a `"` in an address, between the
+            // brackets, is part of it (and makes it invalid).
+            '"' if !angle => {
                 quoted = !quoted;
                 current.push(c);
             }
@@ -232,17 +311,25 @@ fn builder_list(addrs: &[Addr]) -> BuilderAddress<'static> {
 
 /// A new Message-ID at the sender's domain: random, so it says nothing
 /// about this computer.
-pub fn new_message_id(from: &str) -> String {
-    use ring::rand::SecureRandom;
-    let mut bytes = [0u8; 16];
-    let _ = ring::rand::SystemRandom::new().fill(&mut bytes);
-    let random: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+pub fn new_message_id(from: &str) -> Result<String> {
+    let random = random_hex()?;
     let domain = from
         .rsplit_once('@')
         .map(|(_, d)| d)
         .filter(|d| account::valid_host(d))
         .unwrap_or("tuimail.invalid");
-    format!("{random}@{domain}")
+    Ok(format!("{random}@{domain}"))
+}
+
+/// 128 random bits as hex, from the system's generator. If it fails,
+/// nothing is sent: an id or boundary that isn't random says something.
+fn random_hex() -> Result<String> {
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("the system's random numbers failed"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Builds the message `draft` describes, from `account`, dated `date`. With
@@ -305,7 +392,8 @@ pub fn build(
     if !body.ends_with('\n') {
         body.push('\n');
     }
-    builder = builder.text_body(body.replace('\n', "\r\n"));
+    let text = MimePart::new("text/plain", body.replace('\n', "\r\n"));
+    let mut parts = vec![text];
     let mut total = 0;
     for attachment in &draft.attachments {
         let (mime, name, bytes) = attachment.read()?;
@@ -316,8 +404,17 @@ pub fn build(
                 mail::size(MAX_TOTAL as usize)
             );
         }
-        builder = builder.attachment(mime, name, bytes);
+        parts.push(MimePart::new(mime, bytes).attachment(name));
     }
+    builder = if parts.len() == 1 {
+        builder.body(parts.remove(0))
+    } else {
+        // The boundary is random, as the Message-ID: mail-builder's own is
+        // made of the time and a number kept for the whole process, which
+        // would tie together everything sent in one run, from any account.
+        let mixed = ContentType::new("multipart/mixed").attribute("boundary", random_hex()?);
+        builder.body(MimePart::new(mixed, parts))
+    };
     let raw = builder.write_to_vec().context("cannot build the message")?;
     let mut rcpts: Vec<String> = to
         .iter()
@@ -389,18 +486,29 @@ fn start_with(account: &Account, rest: &str) -> String {
 pub fn reply(parsed: &Parsed, account: &Account, all: bool) -> Draft {
     let me = account.email.trim().to_lowercase();
     let not_me = |a: &&Addr| a.addr.to_lowercase() != me;
-    let mut to: Vec<Addr> = if parsed.reply_to.is_empty() {
-        parsed.from.clone()
-    } else {
-        parsed.reply_to.clone()
+    // Only addresses mail can go to: a sender's `x"@y` is no recipient.
+    let usable = |list: &[Addr]| -> Vec<Addr> {
+        list.iter()
+            .filter(|a| account::valid_address(&a.addr))
+            .cloned()
+            .collect()
     };
+    let mut to = usable(if parsed.reply_to.is_empty() {
+        &parsed.from
+    } else {
+        &parsed.reply_to
+    });
     // Replying to your own message goes to whom it was to.
     if to.iter().all(|a| a.addr.to_lowercase() == me) && !parsed.to.is_empty() {
-        to = parsed.to.clone();
+        to = usable(&parsed.to);
     }
     let mut cc = Vec::new();
     if all {
-        for a in parsed.to.iter().chain(&parsed.cc).filter(not_me) {
+        for a in usable(&parsed.to)
+            .iter()
+            .chain(&usable(&parsed.cc))
+            .filter(not_me)
+        {
             let known = |list: &[Addr]| list.iter().any(|b| b.addr.eq_ignore_ascii_case(&a.addr));
             if !known(&to) && !known(&cc) {
                 cc.push(a.clone());
@@ -525,6 +633,140 @@ mod tests {
     }
 
     #[test]
+    fn an_attached_file_is_the_one_read_when_attached() {
+        let dir = std::env::temp_dir().join(format!("tuimail-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("report.pdf");
+        std::fs::write(&report, b"REPORT").unwrap();
+        let attached = Attachment::snapshot(&report).unwrap();
+        // The file changes, or becomes something else, before the send.
+        std::fs::write(&report, b"DUMMY-SECRET").unwrap();
+        let draft = Draft {
+            to: "x@y.z".into(),
+            attachments: vec![attached],
+            ..Draft::default()
+        };
+        let id = new_message_id("me@example.org").unwrap();
+        let built = build(&draft, &me(), &id, 0, false).unwrap();
+        let (name, bytes) = mail::attachment(&built.raw, 0).unwrap();
+        assert_eq!(
+            (name.as_str(), bytes.as_slice()),
+            ("report.pdf", &b"REPORT"[..])
+        );
+        // Not a plain file: refused, without waiting.
+        assert!(Attachment::snapshot(&dir).is_err());
+        #[cfg(unix)]
+        {
+            let fifo = dir.join("pipe");
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            // SAFETY: a valid C string path and mode.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            assert!(Attachment::snapshot(&fifo).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sent_mail_has_nothing_that_links_two_accounts() {
+        let draft = |email: &str| {
+            let account = Account {
+                email: email.into(),
+                ..Account::default()
+            };
+            let draft = Draft {
+                to: "x@example.com".into(),
+                attachments: vec![Attachment::Data {
+                    name: "a.txt".into(),
+                    mime: "text/plain".into(),
+                    bytes: Arc::new(b"x".to_vec()),
+                }],
+                ..Draft::default()
+            };
+            let id = new_message_id(email).unwrap();
+            let raw = build(&draft, &account, &id, 1_791_715_320, false)
+                .unwrap()
+                .raw;
+            let raw = String::from_utf8(raw).unwrap();
+            let at = raw.find("boundary=\"").unwrap() + 10;
+            raw[at..at + raw[at..].find('"').unwrap()].to_string()
+        };
+        let (a, b) = (draft("a@work.example"), draft("b@persona.example"));
+        assert_eq!(a.len(), 32, "{a}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_ne!(a, b);
+        assert!(!a.contains('_') && !b.contains('_'), "{a} {b}");
+    }
+
+    #[test]
+    fn a_quote_in_an_address_never_turns_a_name_into_a_recipient() {
+        let raw = [
+            "From: Mallory <m@evil.example>",
+            "To: me@example.org",
+            r#"Cc: <x"@a.example>, "a <evil@evil.example>, b" <ap@corp.example>"#,
+            "Subject: s",
+            "Message-ID: <1@evil.example>",
+            "",
+            "hi",
+            "",
+        ]
+        .join("\r\n");
+        let parsed = mail::parse(raw.as_bytes()).unwrap();
+        let d = reply(&parsed, &me(), true);
+        let b = build(&d, &me(), "id@example.org", 0, false).unwrap();
+        assert!(
+            !b.rcpts.iter().any(|r| r == "evil@evil.example"),
+            "{:?}",
+            b.rcpts
+        );
+        assert!(
+            b.rcpts.iter().any(|r| r == "ap@corp.example"),
+            "{:?}",
+            b.rcpts
+        );
+
+        let raw = [
+            "From: Mallory <m@evil.example>",
+            "To: me@example.org",
+            r#"Cc: <o"brien@partner.example>, Bob <bob@corp.example>, Carol <carol@corp.example>"#,
+            "Subject: s",
+            "",
+            "hi",
+            "",
+        ]
+        .join("\r\n");
+        let parsed = mail::parse(raw.as_bytes()).unwrap();
+        let d = reply(&parsed, &me(), true);
+        let b = build(&d, &me(), "id@example.org", 0, false).unwrap();
+        assert!(
+            b.rcpts.iter().any(|r| r == "bob@corp.example"),
+            "{:?}",
+            b.rcpts
+        );
+        assert!(
+            b.rcpts.iter().any(|r| r == "carol@corp.example"),
+            "{:?}",
+            b.rcpts
+        );
+
+        // Typed or completed: a quote between brackets quotes nothing, and
+        // the address is refused rather than another one taken.
+        let typed = format!(
+            "{}, {}",
+            Addr {
+                name: "".into(),
+                addr: "x\"@a.example".into()
+            }
+            .display(),
+            Addr {
+                name: "a <evil@evil.example>, b".into(),
+                addr: "ap@corp.example".into()
+            }
+            .display()
+        );
+        assert!(parse_addresses(&typed).is_err(), "{typed}");
+    }
+
+    #[test]
     fn addresses_are_read_as_people_type_them() {
         let list =
             parse_addresses("Alice <alice@example.com>, bob@example.org; \"Doe, Jane\" <jane@x.y>")
@@ -570,7 +812,7 @@ mod tests {
                 bytes: Arc::new(b"soup".to_vec()),
             }],
         };
-        let id = new_message_id("me@example.org");
+        let id = new_message_id("me@example.org").unwrap();
         assert!(id.ends_with("@example.org") && id.len() > 40);
         let built = build(&draft, &me(), &id, 1_791_715_320, false).unwrap();
         assert_eq!(built.from, "me@example.org");

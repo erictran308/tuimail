@@ -154,6 +154,17 @@ impl Account {
         text::one_line(name, 60)
     }
 
+    /// A shorter name for tight places: `name`, else the part of the
+    /// address before the `@`.
+    pub fn short_name(&self) -> String {
+        if !self.name.trim().is_empty() {
+            return self.shown_name();
+        }
+        let email = self.email.trim();
+        let local = email.rsplit_once('@').map_or(email, |(local, _)| local);
+        text::one_line(local, 60)
+    }
+
     pub fn username(&self) -> &str {
         let name = self.username.trim();
         if name.is_empty() {
@@ -272,17 +283,27 @@ pub fn valid_host(host: &str) -> bool {
 }
 
 /// An address mail can go to: something@domain, without spaces, control
-/// characters or the characters that end an address in a protocol line.
+/// characters or the characters that end an address in a protocol line,
+/// and without the quoting and comment characters (`"`, `\`, `()`, `[]`,
+/// `:`) a header's parsers can read differently: a `"` in an address once
+/// let a quoted name's address be taken for a recipient.
 pub fn valid_address(addr: &str) -> bool {
     let Some((local, domain)) = addr.rsplit_once('@') else {
         return false;
     };
     !local.is_empty()
         && !domain.is_empty()
+        && !local.contains('@')
         && addr.len() <= 254
-        && !addr
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | ',' | ';'))
+        && !addr.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || text::is_hidden(c)
+                || matches!(
+                    c,
+                    '<' | '>' | ',' | ';' | '"' | '\\' | '(' | ')' | '[' | ']' | ':'
+                )
+        })
         && !domain.starts_with('.')
         && !domain.ends_with('.')
 }
@@ -301,7 +322,7 @@ pub fn path(data_dir: &Path) -> PathBuf {
 /// names tuimail doesn't know, accounts it can't use.
 pub fn load(path: &Path) -> Result<(Vec<Account>, Vec<String>)> {
     let shown = config::shown(path);
-    let text = match read_small(path) {
+    let text = match config::read_small(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(e).with_context(|| format!("cannot read {shown}")),
@@ -326,16 +347,6 @@ pub fn load(path: &Path) -> Result<(Vec<Account>, Vec<String>)> {
         }
     }
     Ok((accounts, warnings))
-}
-
-/// Reads a file tuimail keeps, refusing anything that isn't a plain file of
-/// a sane size, so a link to `/dev/zero` or a pipe can't hang the start.
-fn read_small(path: &Path) -> std::io::Result<String> {
-    let meta = std::fs::metadata(path)?;
-    if !meta.is_file() || meta.len() > 1 << 20 {
-        return Err(std::io::Error::other("not a plain file under 1 MB"));
-    }
-    std::fs::read_to_string(path)
 }
 
 /// Keys in `[[account]]` tables that tuimail doesn't read.
@@ -375,7 +386,7 @@ fn unknown_keys(text: &str) -> Vec<String> {
 /// Adds `account` to the file, or replaces the one with its address.
 pub fn save(path: &Path, account: &Account) -> Result<()> {
     let shown = config::shown(path);
-    let mut file: AccountsFile = match read_small(path) {
+    let mut file: AccountsFile = match config::read_small(path) {
         Ok(text) => toml::from_str(&text)
             .with_context(|| format!("{shown} is invalid, so it wasn't changed"))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => AccountsFile::default(),
@@ -391,7 +402,7 @@ pub fn save(path: &Path, account: &Account) -> Result<()> {
 /// Takes the account with address `id` out of the file.
 pub fn remove(path: &Path, id: &str) -> Result<()> {
     let shown = config::shown(path);
-    let text = read_small(path).with_context(|| format!("cannot read {shown}"))?;
+    let text = config::read_small(path).with_context(|| format!("cannot read {shown}"))?;
     let mut file: AccountsFile = toml::from_str(&text)
         .with_context(|| format!("{shown} is invalid, so it wasn't changed"))?;
     file.accounts.retain(|a| a.id() != id);
@@ -670,6 +681,16 @@ mod tests {
         assert!(!valid_address("a b@c.d"));
         assert!(!valid_address("<a@c.d>"));
         assert!(valid_address("a.b+tag@c.d"));
+        for bad in [
+            "x\"@a.example",
+            "a(b)@c.d",
+            "a\\b@c.d",
+            "a@b@c.d",
+            "a@[1.2.3.4]",
+            "a:b@c.d",
+        ] {
+            assert!(!valid_address(bad), "{bad}");
+        }
     }
 
     #[test]

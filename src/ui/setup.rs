@@ -184,7 +184,7 @@ fn security(s: Security) -> &'static str {
     match s {
         Security::Tls => "TLS",
         Security::Starttls => "STARTTLS",
-        Security::None => "none (this computer only)",
+        Security::None => "none (this computer only, unencrypted)",
     }
 }
 

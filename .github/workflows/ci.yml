@@ -44,5 +44,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: stable
-      - run: cargo install cargo-audit --locked
+      - run: cargo install cargo-audit --locked --version 0.22.2
       - run: cargo audit

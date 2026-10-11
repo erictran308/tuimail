@@ -28,6 +28,35 @@ impl Config {
 /// made, mode 0700, or found to be a real folder (not a link) that's yours;
 /// then set to 0700 again, and on macOS cleared of access rules inherited
 /// from above, which would let others in whatever the mode says.
+/// Reads a file tuimail keeps, refusing anything that isn't a plain file of
+/// a sane size, so a link to `/dev/zero` or a pipe can't hang the start.
+pub fn read_small(path: &Path) -> std::io::Result<String> {
+    String::from_utf8(read_capped(path, 1 << 20)?).map_err(std::io::Error::other)
+}
+
+/// The bytes of `path` if it's a plain file of at most `cap` bytes: checked
+/// and read through one open file (nothing can be put in its place between
+/// the two), never waiting on a pipe, and never more than `cap` read.
+pub fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    let too_big = || std::io::Error::other(format!("not a plain file under {} KB", cap >> 10));
+    if !meta.is_file() || meta.len() > cap {
+        return Err(too_big());
+    }
+    let mut bytes = Vec::new();
+    file.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(too_big());
+    }
+    Ok(bytes)
+}
+
 #[cfg(unix)]
 fn make_private_dir(dir: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -53,6 +82,32 @@ fn make_private_dir(dir: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot protect {shown}"))?;
     #[cfg(target_os = "macos")]
     clear_acls(&dir);
+    // What's in it must be yours alone too: a link or file another account
+    // left while it could still write here would stay in use (a link at
+    // accounts.toml choosing the program that gives your password).
+    for (entry, folder) in [
+        ("accounts.toml", false),
+        ("settings.toml", false),
+        ("tuimail.db", false),
+        ("tuimail.db-wal", false),
+        ("tuimail.db-shm", false),
+        ("drafts", true),
+        ("opened", true),
+    ] {
+        let Ok(meta) = std::fs::symlink_metadata(dir.join(entry)) else {
+            continue;
+        };
+        let kind = if folder {
+            meta.is_dir()
+        } else {
+            meta.is_file() && meta.nlink() == 1
+        };
+        if meta.file_type().is_symlink() || !kind || meta.uid() != euid() {
+            bail!(
+                "{entry} in {shown} isn't yours alone (a link, or another account's): move it away"
+            );
+        }
+    }
     Ok(dir)
 }
 
@@ -90,7 +145,7 @@ fn clear_acls(dir: &Path) {
 
 /// The user tuimail runs as.
 #[cfg(unix)]
-fn euid() -> u32 {
+pub fn euid() -> u32 {
     // SAFETY: geteuid can't fail and touches no memory.
     unsafe { libc::geteuid() }
 }
@@ -220,6 +275,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn small_files_are_read_whole_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("tuimail-capped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small");
+        std::fs::write(&small, b"12345").unwrap();
+        assert_eq!(read_capped(&small, 5).unwrap(), b"12345");
+        assert!(read_capped(&small, 4).is_err());
+        assert!(read_capped(&dir, 1 << 20).is_err());
+        // A pipe in a file's place is refused, not waited on.
+        #[cfg(unix)]
+        {
+            let fifo = dir.join("fifo");
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            assert!(read_capped(&fifo, 1 << 20).is_err());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_data_folder_on_another_machine_is_refused() {
         for dir in ["//evil.example/s/tt", "\\\\evil.example\\s\\tt"] {
             assert!(data_dir_from(Some(dir.into())).is_err(), "{dir}");
@@ -282,6 +357,18 @@ mod tests {
         std::os::unix::fs::symlink(&target, parent.join("link")).unwrap();
         assert!(make_private_dir(&parent.join("link")).is_err());
         assert_eq!(mode_of(&target), 0o755, "not changed through the link");
+        // What's left in a data folder that was open to others: a link at
+        // accounts.toml, a second name for settings.toml.
+        let outside = parent.join("outside.toml");
+        std::fs::write(&outside, "").unwrap();
+        std::os::unix::fs::symlink(&outside, made.join("accounts.toml")).unwrap();
+        assert!(make_private_dir(&made).is_err(), "a link is refused");
+        std::fs::remove_file(made.join("accounts.toml")).unwrap();
+        std::fs::hard_link(&outside, made.join("settings.toml")).unwrap();
+        assert!(make_private_dir(&made).is_err(), "a second name is refused");
+        std::fs::remove_file(made.join("settings.toml")).unwrap();
+        std::fs::write(made.join("accounts.toml"), "").unwrap();
+        make_private_dir(&made).unwrap();
         std::fs::remove_dir_all(&parent).unwrap();
     }
 

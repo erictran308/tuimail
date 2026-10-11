@@ -108,6 +108,11 @@ pub async fn run_command(argv: &[String], interactive: bool) -> Result<Secret> {
         .args(&argv[1..])
         .stdout(Stdio::piped())
         .kill_on_drop(true);
+    // Not wherever tuimail was started: a script there could be picked up
+    // by the program as its own.
+    if let Some(home) = dirs::home_dir() {
+        command.current_dir(home);
+    }
     if interactive {
         command.stdin(Stdio::inherit()).stderr(Stdio::inherit());
     } else {
@@ -203,6 +208,15 @@ impl Credentials {
     /// keychain, else the command's; `NeedPassword` if it must be asked.
     pub async fn get(&self) -> Result<Secret> {
         if self.uses_command() {
+            // After a refusal, no login until the user asks again (R):
+            // trying the same refused password at every check can lock the
+            // account.
+            if self
+                .keychain_refused
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(anyhow!(NeedPassword));
+            }
             // A token may be short-lived: the command is asked each time.
             return run_command(&self.account.password_command, false).await;
         }
@@ -230,8 +244,18 @@ impl Credentials {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// The user asks to try again (R): a password command is run again
+    /// after a refusal.
+    pub fn retry(&self) {
+        if self.uses_command() {
+            self.keychain_refused
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// The server refused the password: it's forgotten, and not read from
-    /// the keychain again, so tuimail asks.
+    /// the keychain again, so tuimail asks; a password command isn't run
+    /// again until the user asks (R).
     pub async fn refused(&self) {
         *self.secret.lock().await = None;
         self.keychain_refused
@@ -303,6 +327,18 @@ mod tests {
             ..Account::default()
         };
         let creds = Credentials::new(Arc::new(account), false);
+        assert_eq!(creds.get().await.unwrap().expose(), "token-1");
+        // Refused: not run again until the user asks.
+        creds.refused().await;
+        assert!(
+            creds
+                .get()
+                .await
+                .unwrap_err()
+                .downcast_ref::<NeedPassword>()
+                .is_some()
+        );
+        creds.retry();
         assert_eq!(creds.get().await.unwrap().expose(), "token-1");
         let ask = Account {
             email: "me@example.org".into(),

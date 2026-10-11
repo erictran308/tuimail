@@ -87,7 +87,7 @@ async fn send(from: &Worker, to: &str, subject: &str) {
         ..Draft::default()
     };
     let account = from.creds.account().clone();
-    let id = compose::new_message_id(&account.email);
+    let id = compose::new_message_id(&account.email).unwrap();
     let built =
         compose::build(&draft, &account, &id, chrono::Utc::now().timestamp(), false).unwrap();
     worker::send(
@@ -168,6 +168,7 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
 
     bob.tx
         .send(Request::Body {
+            uidvalidity: synced.uidvalidity,
             folder: "INBOX".into(),
             uid: header.uid,
         })
@@ -190,6 +191,7 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
     // Flags set, then seen by the next sync.
     bob.tx
         .send(Request::Flag {
+            uidvalidity: synced.uidvalidity,
             folder: "INBOX".into(),
             uids: vec![header.uid],
             flag: FlagKind::Flagged,
@@ -244,6 +246,7 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
 
     bob.tx
         .send(Request::Move {
+            uidvalidity: synced.uidvalidity,
             folder: "INBOX".into(),
             uids: vec![header.uid],
             to: "Archive".into(),
@@ -312,6 +315,7 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
     assert!(copies.iter().any(|h| h.flags.seen));
     bob.tx
         .send(Request::Delete {
+            uidvalidity: archive.uidvalidity,
             folder: "Archive".into(),
             uids: copies.iter().map(|h| h.uid).collect(),
         })
@@ -510,6 +514,7 @@ async fn live_a_change_made_offline_reaches_the_server_once_back() {
     proxy.cut();
     bob.tx
         .send(Request::Flag {
+            uidvalidity: synced.uidvalidity,
             folder: "INBOX".into(),
             uids: vec![uid],
             flag: FlagKind::Flagged,

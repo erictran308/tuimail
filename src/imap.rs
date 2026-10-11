@@ -21,6 +21,8 @@ pub const TIMEOUT: Duration = Duration::from_secs(60);
 const BODY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// The biggest message downloaded to read.
 pub const MAX_MESSAGE: u32 = 60 << 20;
+/// The most flags one check reads back.
+const MAX_FLAGS: usize = 100_000;
 /// UIDs per command, so no command line gets too long.
 const UIDS_PER_COMMAND: usize = 400;
 
@@ -87,6 +89,7 @@ pub async fn connect(
     secret: &str,
     auth: Auth,
 ) -> Result<(Session, Caps)> {
+    net::check_login(user, secret)?;
     let conn = net::connect(endpoint).await?;
     let mut client = async_imap::Client::new(conn);
     let greeting = tokio::time::timeout(TIMEOUT, client.read_response())
@@ -178,6 +181,7 @@ pub async fn folders(session: &mut Session, account: &Account) -> Result<Vec<Fol
         session.list(Some(""), Some("*")).await?.try_collect().await
     })
     .await?;
+    let mut said = Vec::new();
     let mut folders: Vec<Folder> = names
         .iter()
         .take(2000)
@@ -191,8 +195,10 @@ pub async fn folders(session: &mut Session, account: &Account) -> Result<Vec<Fol
                 && !attributes.iter().any(|a| {
                     matches!(a, NameAttribute::Extension(e) if e.eq_ignore_ascii_case("\\NonExistent"))
                 });
+            let role = role_of(&raw, &shown, name.delimiter(), attributes);
+            said.push(role.map(|(_, by)| by));
             Folder {
-                role: role_of(&raw, &shown, attributes),
+                role: role.map(|(role, _)| role),
                 shown: text::one_line(&shown, 200),
                 name: raw,
                 delimiter: name.delimiter().map(|d| text::one_line(d, 2)),
@@ -202,15 +208,61 @@ pub async fn folders(session: &mut Session, account: &Account) -> Result<Vec<Fol
             }
         })
         .collect();
-    apply_overrides(&mut folders, account);
-    dedupe_roles(&mut folders);
+    apply_overrides(&mut folders, &mut said, account);
+    dedupe_roles(&mut folders, &said);
     Ok(folders)
 }
 
-/// The role of a folder: SPECIAL-USE attributes, else its name.
-fn role_of(raw: &str, shown: &str, attributes: &[NameAttribute]) -> Option<Role> {
+/// Where a folder's role came from, the surest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RoleFrom {
+    /// accounts.toml names it.
+    Setting,
+    /// The server marks it (SPECIAL-USE).
+    Attribute,
+    /// Its name is one a role usually has.
+    Name,
+}
+
+/// Folders of other users, shared and public ones, by the names servers
+/// give their namespaces (`shared/bob@x.y/Sent`, `Other Users/bob/Sent`):
+/// never one of the account's roles, or its sent mail (Bcc and all),
+/// drafts and deleted mail would go to a mailbox someone else owns.
+fn other_namespace(parts: &[&str]) -> bool {
+    parts.len() > 1
+        && matches!(
+            parts[0].to_lowercase().as_str(),
+            "shared"
+                | "shared folders"
+                | "other users"
+                | "public"
+                | "public folders"
+                | "#shared"
+                | "#public"
+                | "#users"
+                | "user"
+                | "users"
+        )
+}
+
+/// The role of a folder: SPECIAL-USE attributes, else its name, which
+/// counts only at the top or right under INBOX or [Gmail] (deeper is a
+/// folder of the user's own, or someone else's).
+fn role_of(
+    raw: &str,
+    shown: &str,
+    delimiter: Option<&str>,
+    attributes: &[NameAttribute],
+) -> Option<(Role, RoleFrom)> {
     if raw.eq_ignore_ascii_case("INBOX") {
-        return Some(Role::Inbox);
+        return Some((Role::Inbox, RoleFrom::Attribute));
+    }
+    let parts: Vec<&str> = match delimiter.filter(|d| !d.is_empty()) {
+        Some(d) => shown.split(d).collect(),
+        None => shown.split(['/', '.']).collect(),
+    };
+    if other_namespace(&parts) {
+        return None;
     }
     for a in attributes {
         let role = match a {
@@ -223,15 +275,22 @@ fn role_of(raw: &str, shown: &str, attributes: &[NameAttribute]) -> Option<Role>
             NameAttribute::Flagged => Role::Flagged,
             _ => continue,
         };
-        return Some(role);
+        return Some((role, RoleFrom::Attribute));
     }
     // The last part of the name, for "INBOX.Sent" and "[Gmail]/Spam".
-    let leaf = shown
-        .rsplit(['/', '.'])
-        .next()
-        .unwrap_or(shown)
-        .to_lowercase();
-    Some(match leaf.as_str() {
+    let personal = match parts.as_slice() {
+        [_] => true,
+        [parent, _] => matches!(
+            parent.to_lowercase().as_str(),
+            "inbox" | "[gmail]" | "[google mail]"
+        ),
+        _ => false,
+    };
+    if !personal {
+        return None;
+    }
+    let leaf = parts.last().unwrap_or(&shown).to_lowercase();
+    let role = match leaf.as_str() {
         "sent" | "sent items" | "sent messages" | "sent mail" | "gesendet"
         | "gesendete elemente" | "envoyés" | "enviados" => Role::Sent,
         "drafts" | "draft" | "entwürfe" | "brouillons" | "borradores" => Role::Drafts,
@@ -240,11 +299,12 @@ fn role_of(raw: &str, shown: &str, attributes: &[NameAttribute]) -> Option<Role>
         "junk" | "spam" | "junk e-mail" | "junk email" | "bulk mail" => Role::Junk,
         "archive" | "archives" | "archiv" => Role::Archive,
         _ => return None,
-    })
+    };
+    Some((role, RoleFrom::Name))
 }
 
 /// Folders named in accounts.toml take their role from there.
-fn apply_overrides(folders: &mut [Folder], account: &Account) {
+fn apply_overrides(folders: &mut [Folder], said: &mut [Option<RoleFrom>], account: &Account) {
     let overrides = [
         (&account.sent_folder, Role::Sent),
         (&account.drafts_folder, Role::Drafts),
@@ -258,24 +318,34 @@ fn apply_overrides(folders: &mut [Folder], account: &Account) {
             continue;
         }
         if folders.iter().any(|f| f.shown == name || f.name == name) {
-            for f in folders.iter_mut() {
+            for (f, said) in folders.iter_mut().zip(said.iter_mut()) {
                 if f.role == Some(role) {
                     f.role = None;
                 }
                 if f.shown == name || f.name == name {
                     f.role = Some(role);
+                    *said = Some(RoleFrom::Setting);
                 }
             }
         }
     }
 }
 
-/// One folder per role: the first that says so (by attribute, as listed).
-fn dedupe_roles(folders: &mut [Folder]) {
-    let mut seen = std::collections::HashSet::new();
-    for f in folders.iter_mut() {
+/// One folder per role: the surest (setting, then the server's attribute,
+/// then the name), the first listed of equals.
+fn dedupe_roles(folders: &mut [Folder], said: &[Option<RoleFrom>]) {
+    let mut best: std::collections::HashMap<Role, (RoleFrom, usize)> = Default::default();
+    for (i, f) in folders.iter().enumerate() {
+        if let (Some(role), Some(by)) = (f.role, said.get(i).copied().flatten()) {
+            let entry = best.entry(role).or_insert((by, i));
+            if by < entry.0 {
+                *entry = (by, i);
+            }
+        }
+    }
+    for (i, f) in folders.iter_mut().enumerate() {
         if let Some(role) = f.role
-            && !seen.insert(role)
+            && best.get(&role).is_none_or(|&(_, j)| j != i)
         {
             f.role = None;
         }
@@ -301,11 +371,50 @@ pub struct Selected {
 }
 
 pub async fn select(session: &mut Session, folder: &str) -> Result<Selected> {
+    drain(session);
     let mailbox = timed(TIMEOUT, "SELECT", session.select(folder)).await?;
     Ok(Selected {
         uidvalidity: mailbox.uid_validity.unwrap_or(0),
         exists: mailbox.exists,
     })
+}
+
+/// Drops what the server said that no command asked for: kept, it would
+/// stay in memory as long as the session (up to 100 of any size).
+fn drain(session: &mut Session) {
+    while session.unsolicited_responses.try_recv().is_ok() {}
+}
+
+/// A FETCH's answers, at most `max` of them and `max_bytes` of message
+/// data: a server can't make tuimail hold more than it asked for. Past
+/// either, the connection is dropped (an error that isn't [`Said`]), since
+/// what's still coming would be read as the next command's answer.
+async fn collect(
+    what: &str,
+    timeout: Duration,
+    stream: impl futures::Future<
+        Output = async_imap::error::Result<
+            impl futures::Stream<Item = async_imap::error::Result<Fetch>>,
+        >,
+    >,
+    max: usize,
+    max_bytes: usize,
+) -> Result<Vec<Fetch>> {
+    timed(timeout, what, async {
+        let stream = stream.await?;
+        futures::pin_mut!(stream);
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(fetch) = stream.try_next().await? {
+            bytes += fetch.body().map_or(0, <[u8]>::len) + fetch.header().map_or(0, <[u8]>::len);
+            out.push(fetch);
+            if out.len() > max || bytes > max_bytes {
+                return Ok(Err(anyhow!("the server sent more than was asked for")));
+            }
+        }
+        Ok(Ok(out))
+    })
+    .await?
 }
 
 /// The UIDs `criteria` finds, in order.
@@ -373,12 +482,22 @@ pub async fn headers(session: &mut Session, uids: &[u32]) -> Result<Vec<Header>>
     let mut out = Vec::new();
     for set in uid_sets(uids) {
         let query = format!("(UID FLAGS RFC822.SIZE INTERNALDATE {HEADER_FIELDS})");
-        let fetched: Vec<Fetch> = timed(TIMEOUT, "FETCH", async {
-            session.uid_fetch(&set, &query).await?.try_collect().await
-        })
+        let asked = set_uids(&set);
+        let fetched = collect(
+            "FETCH",
+            TIMEOUT,
+            session.uid_fetch(&set, &query),
+            asked.len() + 16,
+            MAX_MESSAGE as usize,
+        )
         .await?;
         for fetch in &fetched {
-            let Some(uid) = fetch.uid.filter(|_| !deleted(fetch)) else {
+            // Only what was asked for: a FETCH the server adds unasked
+            // isn't a header to keep.
+            let Some(uid) = fetch
+                .uid
+                .filter(|uid| !deleted(fetch) && asked.contains(uid))
+            else {
                 continue;
             };
             let mut summary = mail::summarize(fetch.header().unwrap_or(b""));
@@ -401,13 +520,14 @@ pub async fn flags(session: &mut Session, low: u32, high: u32) -> Result<Vec<(u3
     if low == 0 || high < low {
         return Ok(Vec::new());
     }
-    let fetched: Vec<Fetch> = timed(TIMEOUT, "FETCH", async {
-        session
-            .uid_fetch(format!("{low}:{high}"), "(UID FLAGS)")
-            .await?
-            .try_collect()
-            .await
-    })
+    let range = (high - low) as usize + 1;
+    let fetched = collect(
+        "FETCH",
+        TIMEOUT,
+        session.uid_fetch(format!("{low}:{high}"), "(UID FLAGS)"),
+        range.min(MAX_FLAGS) + 16,
+        MAX_MESSAGE as usize,
+    )
     .await?;
     Ok(fetched
         .iter()
@@ -419,13 +539,13 @@ pub async fn flags(session: &mut Session, low: u32, high: u32) -> Result<Vec<(u3
 
 /// A whole message, without marking it read; `None` if it's gone.
 pub async fn body(session: &mut Session, uid: u32) -> Result<Option<Vec<u8>>> {
-    let size: Vec<Fetch> = timed(TIMEOUT, "FETCH", async {
-        session
-            .uid_fetch(uid.to_string(), "(UID RFC822.SIZE)")
-            .await?
-            .try_collect()
-            .await
-    })
+    let size = collect(
+        "FETCH",
+        TIMEOUT,
+        session.uid_fetch(uid.to_string(), "(UID RFC822.SIZE)"),
+        16,
+        1 << 20,
+    )
     .await?;
     let Some(size) = size.iter().find(|f| f.uid == Some(uid)).map(|f| f.size) else {
         return Ok(None);
@@ -436,18 +556,24 @@ pub async fn body(session: &mut Session, uid: u32) -> Result<Option<Vec<u8>>> {
             mail::size(size.unwrap_or(0) as usize)
         )));
     }
-    let fetched: Vec<Fetch> = timed(BODY_TIMEOUT, "FETCH", async {
-        session
-            .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
-            .await?
-            .try_collect()
-            .await
-    })
+    // The size the server gave is only its word: the bytes that come are
+    // held to the cap too.
+    let fetched = collect(
+        "FETCH",
+        BODY_TIMEOUT,
+        session.uid_fetch(uid.to_string(), "(UID BODY.PEEK[])"),
+        16,
+        MAX_MESSAGE as usize + (1 << 20),
+    )
     .await?;
-    Ok(fetched
+    let body = fetched
         .iter()
         .find(|f| f.uid == Some(uid))
-        .and_then(|f| f.body().map(<[u8]>::to_vec)))
+        .and_then(|f| f.body());
+    if body.is_some_and(|b| b.len() > MAX_MESSAGE as usize) {
+        bail!(Said("the message is too big to download".into()));
+    }
+    Ok(body.map(<[u8]>::to_vec))
 }
 
 /// Which flag a key changes.
@@ -492,21 +618,30 @@ pub async fn move_to(session: &mut Session, caps: Caps, uids: &[u32], to: &str) 
             timed(TIMEOUT, "MOVE", session.uid_mv(&set, to)).await?;
         } else {
             timed(TIMEOUT, "COPY", session.uid_copy(&set, to)).await?;
-            expunge(session, caps, &set).await?;
+            expunge(session, caps, &set, &set_uids(&set)).await?;
         }
     }
     Ok(())
 }
 
 /// Deletes messages for good.
-pub async fn delete(session: &mut Session, caps: Caps, uids: &[u32]) -> Result<()> {
+/// Deletes for good; `false` if some stay marked deleted on the server
+/// (without UIDPLUS, while another program's deletes are pending there).
+pub async fn delete(session: &mut Session, caps: Caps, uids: &[u32]) -> Result<bool> {
+    let ours: std::collections::HashSet<u32> = uids.iter().copied().collect();
+    let mut all = true;
     for set in uid_sets(uids) {
-        expunge(session, caps, &set).await?;
+        all &= expunge(session, caps, &set, &ours).await?;
     }
-    Ok(())
+    Ok(all)
 }
 
-async fn expunge(session: &mut Session, caps: Caps, set: &str) -> Result<()> {
+async fn expunge(
+    session: &mut Session,
+    caps: Caps,
+    set: &str,
+    ours: &std::collections::HashSet<u32>,
+) -> Result<bool> {
     timed(TIMEOUT, "STORE", async {
         session
             .uid_store(set, "+FLAGS.SILENT (\\Deleted)")
@@ -526,17 +661,18 @@ async fn expunge(session: &mut Session, caps: Caps, set: &str) -> Result<()> {
         .await?;
     } else {
         // A plain EXPUNGE removes every message marked deleted, also ones
-        // another program only marked: it's sent only if all are ours.
-        let ours: std::collections::HashSet<u32> = set_uids(set);
+        // another program only marked: it's sent only if all are ours
+        // (every delete tuimail still has pending in the folder).
         let marked = search(session, "DELETED").await?;
-        if marked.iter().all(|uid| ours.contains(uid)) {
-            timed(TIMEOUT, "EXPUNGE", async {
-                session.expunge().await?.try_collect::<Vec<_>>().await
-            })
-            .await?;
+        if !marked.iter().all(|uid| ours.contains(uid)) {
+            return Ok(false);
         }
+        timed(TIMEOUT, "EXPUNGE", async {
+            session.expunge().await?.try_collect::<Vec<_>>().await
+        })
+        .await?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The UIDs in a set written by [`uid_sets`].
@@ -625,6 +761,91 @@ pub async fn idle(session: Session, limit: Duration) -> Result<(Session, bool)> 
 mod tests {
     use super::*;
 
+    /// A one-connection IMAP server on 127.0.0.1 that answers each
+    /// command after LOGIN with `answer(tag, command)`.
+    async fn scripted(answer: impl Fn(&str, &str) -> Vec<u8> + Send + 'static) -> (Session, Caps) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            write.write_all(b"* OK ready\r\n").await.unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let (tag, command) = line.split_once(' ').unwrap_or((&line, ""));
+                let reply = if command.starts_with("LOGIN") {
+                    format!("{tag} OK done\r\n").into_bytes()
+                } else if command.starts_with("CAPABILITY") {
+                    format!("* CAPABILITY IMAP4rev1\r\n{tag} OK done\r\n").into_bytes()
+                } else {
+                    answer(tag, command)
+                };
+                if write.write_all(&reply).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let endpoint = Endpoint {
+            host: "127.0.0.1".into(),
+            port,
+            security: Security::None,
+            tls: net::tls_config(None).unwrap(),
+        };
+        connect(&endpoint, "me", "pw", Auth::Password)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_message_bigger_than_the_cap_is_refused_whatever_size_the_server_gives() {
+        let (mut session, _) = scripted(|tag, command| {
+            if command.contains("BODY.PEEK") {
+                let big = MAX_MESSAGE as usize + (2 << 20);
+                let mut out = format!("* 1 FETCH (UID 1 BODY[] {{{big}}}\r\n").into_bytes();
+                out.resize(out.len() + big, b'a');
+                out.extend(format!(")\r\n{tag} OK done\r\n").as_bytes());
+                out
+            } else {
+                // No RFC822.SIZE: the size can't be checked beforehand.
+                format!("* 1 FETCH (UID 1)\r\n{tag} OK done\r\n").into_bytes()
+            }
+        })
+        .await;
+        assert!(body(&mut session, 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn headers_keep_only_what_was_asked_for() {
+        let (mut session, _) = scripted(|tag, _| {
+            let mut out = String::new();
+            for uid in [1, 2, 99] {
+                out.push_str(&format!("* {uid} FETCH (UID {uid} FLAGS ())\r\n"));
+            }
+            out.push_str(&format!("{tag} OK done\r\n"));
+            out.into_bytes()
+        })
+        .await;
+        let got: Vec<u32> = headers(&mut session, &[1, 2])
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.uid)
+            .collect();
+        assert_eq!(got, [1, 2]);
+        // Many more answers than asked for: the connection is given up.
+        let (mut session, _) = scripted(|tag, _| {
+            let mut out = String::new();
+            for uid in 1..=100 {
+                out.push_str(&format!("* {uid} FETCH (UID {uid} FLAGS ())\r\n"));
+            }
+            out.push_str(&format!("{tag} OK done\r\n"));
+            out.into_bytes()
+        })
+        .await;
+        assert!(headers(&mut session, &[1]).await.is_err());
+    }
+
     #[test]
     fn uids_are_written_as_ranges() {
         assert_eq!(uid_sets(&[5, 1, 2, 3, 7, 9, 10, 2]), ["1:3,5,7,9:10"]);
@@ -637,10 +858,13 @@ mod tests {
 
     #[test]
     fn folder_roles_come_from_attributes_then_names() {
-        assert_eq!(role_of("INBOX", "INBOX", &[]), Some(Role::Inbox));
-        assert_eq!(role_of("Inbox", "Inbox", &[]), Some(Role::Inbox));
+        let role = |raw: &str, shown: &str, attributes: &[NameAttribute]| {
+            role_of(raw, shown, Some("/"), attributes).map(|(role, _)| role)
+        };
+        assert_eq!(role("INBOX", "INBOX", &[]), Some(Role::Inbox));
+        assert_eq!(role("Inbox", "Inbox", &[]), Some(Role::Inbox));
         assert_eq!(
-            role_of(
+            role(
                 "[Gmail]/Sent Mail",
                 "[Gmail]/Sent Mail",
                 &[NameAttribute::Sent]
@@ -648,11 +872,11 @@ mod tests {
             Some(Role::Sent)
         );
         assert_eq!(
-            role_of("INBOX.Trash", "INBOX.Trash", &[]),
+            role_of("INBOX.Trash", "INBOX.Trash", Some("."), &[]).map(|r| r.0),
             Some(Role::Trash)
         );
-        assert_eq!(role_of("Entw&APw-rfe", "Entwürfe", &[]), Some(Role::Drafts));
-        assert_eq!(role_of("Projects", "Projects", &[]), None);
+        assert_eq!(role("Entw&APw-rfe", "Entwürfe", &[]), Some(Role::Drafts));
+        assert_eq!(role("Projects", "Projects", &[]), None);
         let account = Account {
             trash_folder: "Bin2".into(),
             ..Account::default()
@@ -667,15 +891,57 @@ mod tests {
             total: 0,
         };
         let mut folders = vec![folder("Trash", Some(Role::Trash)), folder("Bin2", None)];
-        apply_overrides(&mut folders, &account);
+        let mut said = vec![Some(RoleFrom::Name), None];
+        apply_overrides(&mut folders, &mut said, &account);
         assert_eq!(folders[0].role, None);
         assert_eq!(folders[1].role, Some(Role::Trash));
         let mut twice = vec![
             folder("Junk", Some(Role::Junk)),
             folder("Spam", Some(Role::Junk)),
         ];
-        dedupe_roles(&mut twice);
+        dedupe_roles(&mut twice, &[Some(RoleFrom::Name), Some(RoleFrom::Name)]);
         assert_eq!((twice[0].role, twice[1].role), (Some(Role::Junk), None));
+    }
+
+    #[test]
+    fn other_peoples_folders_take_no_role() {
+        let role = |name: &str| role_of(name, name, Some("/"), &[]).map(|r| r.0);
+        for name in [
+            "shared/bob@example.org/Archive",
+            "shared/bob@example.org/Sent",
+            "Other Users/bob/Trash",
+            "Public/Drafts",
+            "Projects/Sent",
+        ] {
+            assert_eq!(role(name), None, "{name}");
+        }
+        // Even marked, a shared folder isn't the account's.
+        let marked = role_of(
+            "Shared Folders/team/Sent",
+            "Shared Folders/team/Sent",
+            Some("/"),
+            &[NameAttribute::Sent],
+        );
+        assert_eq!(marked, None);
+        // The server's mark wins over a name guessed earlier in the list.
+        let folder = |name: &str, role| Folder {
+            name: name.into(),
+            shown: name.into(),
+            delimiter: Some("/".into()),
+            role,
+            selectable: true,
+            unread: 0,
+            total: 0,
+        };
+        let mut folders = vec![
+            folder("Sent", Some(Role::Sent)),
+            folder("Sent Items", Some(Role::Sent)),
+        ];
+        dedupe_roles(
+            &mut folders,
+            &[Some(RoleFrom::Name), Some(RoleFrom::Attribute)],
+        );
+        assert_eq!((folders[0].role, folders[1].role), (None, Some(Role::Sent)));
     }
 
     #[test]
