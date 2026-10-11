@@ -96,9 +96,9 @@ pub enum AppEvent {
         previews: Vec<(String, u32, String)>,
     },
     /// The setup form's login check.
-    Checked {
-        result: Result<(), String>,
-    },
+    Checked { result: Result<(), String> },
+    /// The terminal closed, or tuimail was asked to stop (Unix signals).
+    #[cfg_attr(not(unix), allow(dead_code))]
     Quit,
 }
 

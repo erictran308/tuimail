@@ -4,6 +4,7 @@
 //! folder tuimail was started from can't run. And saving attachments, each
 //! marked as downloaded from the internet.
 
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -284,9 +285,14 @@ fn yours_alone(dir: &Path) -> Result<()> {
 /// folder, gives the editor its file.
 pub fn private_temp_dir() -> Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("tuimail-{}", random_name()?));
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    let builder = {
+        let mut builder = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder
         .create(&dir)
         .with_context(|| format!("cannot create {}", config::shown(&dir)))?;
