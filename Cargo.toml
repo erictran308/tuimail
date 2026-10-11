@@ -1,0 +1,73 @@
+[package]
+name = "tuimail"
+version = "0.1.0"
+edition = "2024"
+description = "Email in your terminal: a vim-style IMAP, POP3 and SMTP client"
+license = "MIT"
+repository = "https://github.com/erictran308/tuimail"
+readme = "README.md"
+rust-version = "1.90"
+keywords = ["email", "imap", "tui", "terminal", "vim"]
+categories = ["command-line-utilities", "email"]
+include = ["src/**/*.rs", "themes/*.toml", "README.md", "LICENSE", "SECURITY.md", "Cargo.toml", "Cargo.lock"]
+
+[[bin]]
+name = "tuimail"
+path = "src/main.rs"
+
+# `cargo binstall tuimail` takes the binary from the GitHub release, built by
+# .github/workflows/release.yml; without one for the computer, it builds from
+# source. QuickInstall's binaries, which aren't built here, are never used.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/tuimail-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "tuimail{ binary-ext }"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/tuimail-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/tuimail-{ target }.zip"
+pkg-fmt = "zip"
+
+[dependencies]
+anyhow = "1.0.104"
+arboard = { version = "3.6.1", default-features = false }
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
+base64 = "0.22"
+chrono = "0.4.45"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+dirs = "7.0.0"
+dotenvy = "0.15.7"
+futures = "0.3.34"
+html2text = "0.17"
+keyring-core = "1.0"
+mail-builder = { version = "1.0", default-features = false }
+mail-parser = "0.11"
+open = { version = "5.4.4", features = ["shellexecute-on-windows"] }
+ratatui = "0.30.2"
+ratatui-textarea = "0.9.3"
+ring = "0.17.14"
+rusqlite = { version = "0.40", features = ["bundled"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7.1"
+serde = { version = "1.0.229", features = ["derive"] }
+textwrap = "0.16.4"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+toml = "1.1.6"
+unicode-width = "0.2.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = "1.1"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }

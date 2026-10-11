@@ -1,0 +1,21 @@
+# Rosé Pine: https://rosepinetheme.com/palette
+
+name = "Rosé Pine"
+
+[palette]
+bg = "#191724"
+bg_alt = "#1f1d2e"
+surface = "#26233a"
+overlay = "#524f67"
+comment = "#6e6a86"
+subtext = "#908caa"
+fg = "#e0def4"
+red = "#eb6f92"       # love
+orange = "#ebbcba"    # rose
+yellow = "#f6c177"    # gold
+green = "#31748f"     # pine
+cyan = "#9ccfd8"      # foam
+blue = "#9ccfd8"      # foam
+purple = "#c4a7e7"    # iris
+pink = "#ebbcba"      # rose
+accent = "#c4a7e7"    # iris

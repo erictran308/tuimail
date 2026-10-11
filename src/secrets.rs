@@ -1,0 +1,326 @@
+//! Passwords: kept in the system's keychain, asked for each start, or
+//! printed by a command of yours. Never written to a file by tuimail, never
+//! on a command line, never in a message or log.
+
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex;
+
+use crate::account::{Account, Auth, PasswordFrom};
+use crate::text;
+
+/// The keychain's name for tuimail's entries.
+const SERVICE: &str = "tuimail";
+/// How long a password command may take without a terminal (with one, at
+/// start, it may wait for you to unlock something).
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(300);
+/// A command's output past this is refused, not read.
+const MAX_OUTPUT: u64 = 64 * 1024;
+
+/// A password or token. Its `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(…)")
+    }
+}
+
+/// Picks the system's keychain as where entries go. Returns whether there
+/// is one: without (Linux with no Secret Service), passwords are asked for.
+pub fn init_keychain() -> bool {
+    #[cfg(target_os = "macos")]
+    let store = apple_native_keyring_store::keychain::Store::new()
+        .map(|s| s as Arc<keyring_core::CredentialStore>);
+    #[cfg(windows)]
+    let store =
+        windows_native_keyring_store::Store::new().map(|s| s as Arc<keyring_core::CredentialStore>);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let store = zbus_secret_service_keyring_store::Store::new()
+        .map(|s| s as Arc<keyring_core::CredentialStore>);
+    match store {
+        Ok(store) => {
+            keyring_core::set_default_store(store);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn entry(id: &str) -> Result<keyring_core::Entry> {
+    keyring_core::Entry::new(SERVICE, id).map_err(|e| anyhow!("the keychain: {e}"))
+}
+
+/// The account's password from the keychain, or `None` if none is kept.
+pub async fn keychain_get(id: &str) -> Result<Option<Secret>> {
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || match entry(&id)?.get_password() {
+        Ok(p) => Ok(Some(Secret(p))),
+        Err(keyring_core::Error::NoEntry) => Ok(None),
+        Err(e) => Err(anyhow!("cannot read the keychain: {e}")),
+    })
+    .await?
+}
+
+pub async fn keychain_set(id: &str, secret: &Secret) -> Result<()> {
+    let (id, secret) = (id.to_string(), secret.clone());
+    tokio::task::spawn_blocking(move || {
+        entry(&id)?
+            .set_password(secret.expose())
+            .map_err(|e| anyhow!("cannot save the password in the keychain: {e}"))
+    })
+    .await?
+}
+
+pub async fn keychain_delete(id: &str) -> Result<()> {
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || match entry(&id)?.delete_credential() {
+        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+        Err(e) => Err(anyhow!("cannot remove the password from the keychain: {e}")),
+    })
+    .await?
+}
+
+/// Runs `argv` (a full path and its arguments, no shell) and returns the
+/// first line it prints. With `interactive`, it shares the terminal (before
+/// tuimail takes it over), so a program can ask to be unlocked; otherwise it
+/// gets no input and its errors are thrown away.
+pub async fn run_command(argv: &[String], interactive: bool) -> Result<Secret> {
+    let program = argv.first().context("password_command is empty")?;
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(&argv[1..])
+        .stdout(Stdio::piped())
+        .kill_on_drop(true);
+    if interactive {
+        command.stdin(Stdio::inherit()).stderr(Stdio::inherit());
+    } else {
+        command.stdin(Stdio::null()).stderr(Stdio::null());
+    }
+    let shown = text::one_line(program, 80);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("cannot run {shown}"))?;
+    let mut stdout = child.stdout.take().context("no output")?;
+    let timeout = if interactive {
+        INTERACTIVE_TIMEOUT
+    } else {
+        COMMAND_TIMEOUT
+    };
+    let run = async {
+        let mut out = Vec::new();
+        (&mut stdout)
+            .take(MAX_OUTPUT + 1)
+            .read_to_end(&mut out)
+            .await?;
+        let status = child.wait().await?;
+        anyhow::Ok((out, status))
+    };
+    let (out, status) = tokio::time::timeout(timeout, run)
+        .await
+        .map_err(|_| anyhow!("{shown} took too long"))??;
+    if !status.success() {
+        bail!("{shown} failed ({status})");
+    }
+    if out.len() as u64 > MAX_OUTPUT {
+        bail!("{shown} printed too much to be a password");
+    }
+    let text =
+        String::from_utf8(out).map_err(|_| anyhow!("{shown} printed something that isn't text"))?;
+    let line = text.lines().next().unwrap_or("").trim_end_matches('\r');
+    if line.is_empty() {
+        bail!("{shown} printed no password");
+    }
+    Ok(Secret(line.to_string()))
+}
+
+/// An account's password, shared by its connections: found once, asked
+/// for again when the server refuses it.
+#[derive(Clone)]
+pub struct Credentials {
+    account: Arc<Account>,
+    id: String,
+    secret: Arc<Mutex<Option<Secret>>>,
+    /// The keychain can be used.
+    keychain: bool,
+    /// The server refused the password the keychain gave: it isn't read
+    /// from there again until a new one is typed, so a wrong password isn't
+    /// tried again and again (which can lock the account).
+    keychain_refused: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// No password is known: tuimail must ask.
+#[derive(Debug)]
+pub struct NeedPassword;
+
+impl std::fmt::Display for NeedPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the password is needed")
+    }
+}
+
+impl std::error::Error for NeedPassword {}
+
+impl Credentials {
+    pub fn new(account: Arc<Account>, keychain: bool) -> Self {
+        let id = account.id();
+        Self {
+            account,
+            id,
+            secret: Arc::new(Mutex::new(None)),
+            keychain,
+            keychain_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether the password comes from a command, run for each login.
+    fn uses_command(&self) -> bool {
+        self.account.password == PasswordFrom::Command || self.account.auth == Auth::Oauth2
+    }
+
+    /// Whether the keychain keeps this account's password.
+    pub fn uses_keychain(&self) -> bool {
+        self.keychain && self.account.password == PasswordFrom::Keychain && !self.uses_command()
+    }
+
+    /// The password to log in with: kept in memory, else from the
+    /// keychain, else the command's; `NeedPassword` if it must be asked.
+    pub async fn get(&self) -> Result<Secret> {
+        if self.uses_command() {
+            // A token may be short-lived: the command is asked each time.
+            return run_command(&self.account.password_command, false).await;
+        }
+        let mut kept = self.secret.lock().await;
+        if let Some(secret) = kept.as_ref() {
+            return Ok(secret.clone());
+        }
+        let refused = self
+            .keychain_refused
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if self.uses_keychain()
+            && !refused
+            && let Some(secret) = keychain_get(&self.id).await?
+        {
+            *kept = Some(secret.clone());
+            return Ok(secret);
+        }
+        Err(anyhow!(NeedPassword))
+    }
+
+    /// Uses `secret` from now on (typed in tuimail).
+    pub async fn set(&self, secret: Secret) {
+        *self.secret.lock().await = Some(secret);
+        self.keychain_refused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The server refused the password: it's forgotten, and not read from
+    /// the keychain again, so tuimail asks.
+    pub async fn refused(&self) {
+        *self.secret.lock().await = None;
+        self.keychain_refused
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Keeps the password in the keychain, once the server took it.
+    pub async fn remember(&self) -> Result<()> {
+        if !self.uses_keychain() {
+            return Ok(());
+        }
+        let Some(secret) = self.secret.lock().await.clone() else {
+            return Ok(());
+        };
+        if keychain_get(&self.id).await.ok().flatten().as_ref() == Some(&secret) {
+            return Ok(());
+        }
+        keychain_set(&self.id, &secret).await
+    }
+
+    pub fn account(&self) -> &Account {
+        &self.account
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_secret_never_shows_in_debug_output() {
+        let secret = Secret::new("hunter2");
+        assert!(!format!("{secret:?}").contains("hunter2"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_gives_its_first_line_and_must_succeed() {
+        let sh = |script: &str| vec!["/bin/sh".to_string(), "-c".into(), script.into()];
+        let secret = run_command(&sh("printf 'pa ss\\nmore\\n'"), false)
+            .await
+            .unwrap();
+        assert_eq!(secret.expose(), "pa ss");
+        assert!(run_command(&sh("exit 3"), false).await.is_err());
+        assert!(
+            run_command(&sh("printf ''"), false).await.is_err(),
+            "nothing printed"
+        );
+        assert!(
+            run_command(&sh("head -c 100000 /dev/zero"), false)
+                .await
+                .is_err(),
+            "too much"
+        );
+        assert!(
+            run_command(&["/nonexistent/x".into()], false)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_accounts_run_their_command_for_each_login() {
+        let account = Account {
+            email: "me@example.org".into(),
+            auth: Auth::Oauth2,
+            password_command: vec!["/bin/echo".into(), "token-1".into()],
+            ..Account::default()
+        };
+        let creds = Credentials::new(Arc::new(account), false);
+        assert_eq!(creds.get().await.unwrap().expose(), "token-1");
+        let ask = Account {
+            email: "me@example.org".into(),
+            password: PasswordFrom::Ask,
+            ..Account::default()
+        };
+        let creds = Credentials::new(Arc::new(ask), false);
+        assert!(
+            creds
+                .get()
+                .await
+                .unwrap_err()
+                .downcast_ref::<NeedPassword>()
+                .is_some()
+        );
+        creds.set(Secret::new("typed")).await;
+        assert_eq!(creds.get().await.unwrap().expose(), "typed");
+        creds.refused().await;
+        assert!(creds.get().await.is_err());
+    }
+}

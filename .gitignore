@@ -1,0 +1,13 @@
+/target
+
+# Your data: accounts, the mail cache, settings (when TM_DATA_DIR points here).
+.env
+.tuimail/
+
+# Local AI tool folders: never committed or published.
+/.agents/
+/.claude/
+/skills-lock.json
+
+# macOS folder settings.
+.DS_Store

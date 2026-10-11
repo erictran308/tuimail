@@ -1,0 +1,21 @@
+# Catppuccin Latte: https://catppuccin.com/palette
+
+name = "Catppuccin Latte"
+
+[palette]
+bg = "#eff1f5"
+bg_alt = "#e6e9ef"
+surface = "#ccd0da"
+overlay = "#9ca0b0"
+comment = "#8c8fa1"
+subtext = "#6c6f85"
+fg = "#4c4f69"
+red = "#d20f39"
+orange = "#fe640b"
+yellow = "#df8e1d"
+green = "#40a02b"
+cyan = "#179299"
+blue = "#1e66f5"
+purple = "#8839ef"
+pink = "#ea76cb"
+accent = "#7287fd"

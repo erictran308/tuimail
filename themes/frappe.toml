@@ -1,0 +1,21 @@
+# Catppuccin Frappé: https://catppuccin.com/palette
+
+name = "Catppuccin Frappé"
+
+[palette]
+bg = "#303446"
+bg_alt = "#292c3c"
+surface = "#414559"
+overlay = "#737994"
+comment = "#838ba7"
+subtext = "#a5adce"
+fg = "#c6d0f5"
+red = "#e78284"
+orange = "#ef9f76"
+yellow = "#e5c890"
+green = "#a6d189"
+cyan = "#81c8be"
+blue = "#8caaee"
+purple = "#ca9ee6"
+pink = "#f4b8e4"
+accent = "#babbf1"

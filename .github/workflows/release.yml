@@ -1,0 +1,206 @@
+# Builds tuimail for every platform. Pushing a version tag (v0.2.0) attaches
+# the binaries, their SHA-256 sums and a signed provenance attestation to a
+# GitHub release; running it by hand only builds them, as artifacts of the
+# run.
+#
+# There's no key to build in: a release binary is exactly what `cargo
+# install tuimail` builds. Actions are pinned to commits, since
+# they make the release files, nothing is cached between runs, and only the
+# release job can write to the repository.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Format, lints and tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    name: ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04, so the binaries need glibc 2.35 at most and run on
+          # Debian 12, RHEL 9 and other distributions a few years old.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            run: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            run: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            run: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            run: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            run: true
+          # Built on ARM64 Windows itself: ring's assembly for it needs
+          # clang, which the step below makes sure of.
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            run: true
+    env:
+      EXE: ${{ startsWith(matrix.os, 'windows') && '.exe' || '' }}
+      # Windows binaries carry the C runtime, so nobody needs the Visual C++
+      # redistributable.
+      RUSTFLAGS: ${{ startsWith(matrix.os, 'windows') && '-C target-feature=+crt-static' || '' }}
+    steps:
+      # Without the token left in .git/config, build scripts can't push.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Make sure clang is there (ring on ARM64 Windows)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        # The image's own LLVM (it lists one) when it's there; otherwise one
+        # exact version of Chocolatey's llvm package, whose script checks the
+        # official installer's SHA-256, never whatever version is newest.
+        # clang compiles ring's C and assembly into the released binary, so
+        # its version goes in the log.
+        run: |
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            if (-not (Test-Path "$llvm\clang.exe")) {
+              choco install llvm --version=22.1.8 -y --no-progress
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            $llvm | Out-File -FilePath $env:GITHUB_PATH -Append
+            $env:PATH = "$llvm;$env:PATH"
+          }
+          clang --version
+
+      # The tests run where the binary can: the same build, checked.
+      - name: Test
+        if: matrix.run
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Binaries built for another architecture can't run here; the native
+      # ones show the build works.
+      - name: Check the binary runs
+        if: matrix.run
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release/tuimail$EXE
+          "$bin" --version
+          # Captured first: with pipefail, grep -q closing the pipe early
+          # would count as a failure of the binary.
+          help=$("$bin" --help)
+          grep -q "IMAP and POP3" <<< "$help"
+
+      - name: Show the newest glibc it needs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          objdump -T target/${{ matrix.target }}/release/tuimail \
+            | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+
+      # Asset names have no version, so the README can link to
+      # releases/latest/download/<name>.
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/tuimail$EXE" README.md LICENSE SECURITY.md dist/
+          cd dist
+          if [ "${{ runner.os }}" = Windows ]; then
+            7z a ../tuimail-${{ matrix.target }}.zip tuimail.exe README.md LICENSE SECURITY.md
+          else
+            tar czf ../tuimail-${{ matrix.target }}.tar.gz tuimail README.md LICENSE SECURITY.md
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tuimail-${{ matrix.target }}
+          path: tuimail-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # For the signed provenance attestation.
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Made before the attestation, so the sums are attested too.
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum tuimail-* > SHA256SUMS
+
+      # Lets anyone check a download was built here, from this commit:
+      # gh attestation verify <file> --repo erictran308/tuimail
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: |
+            dist/tuimail-*
+            dist/SHA256SUMS
+
+      # The notes are the tag's message (git tag -a vX.Y.Z -F notes.md), and
+      # GitHub adds a link to the full list of changes after them. A tag
+      # without a message just gets the link.
+      - name: Release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+            --jq '.object.type + " " + .object.sha')
+          touch notes.md
+          if [ "${ref%% *}" = tag ]; then
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/${ref#* }" --jq .message > notes.md
+          fi
+          # `git tag -a vX.Y.Z -m vX.Y.Z` has only the version for a message.
+          if [ "$(tr -d '[:space:]' < notes.md)" = "$GITHUB_REF_NAME" ]; then
+            : > notes.md
+          fi
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "$GITHUB_REF_NAME"
+          --notes-file notes.md
+          --generate-notes

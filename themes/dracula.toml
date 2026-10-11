@@ -1,0 +1,21 @@
+# Dracula: https://draculatheme.com/spec
+
+name = "Dracula"
+
+[palette]
+bg = "#282a36"
+bg_alt = "#21222c"
+surface = "#44475a"
+overlay = "#6272a4"
+comment = "#6272a4"
+subtext = "#c4c9d7"   # between fg and comment: Dracula has no such shade
+fg = "#f8f8f2"
+red = "#ff5555"
+orange = "#ffb86c"
+yellow = "#f1fa8c"
+green = "#50fa7b"
+cyan = "#8be9fd"
+blue = "#bd93f9"      # Dracula has no blue: its terminal colors use purple instead
+purple = "#bd93f9"
+pink = "#ff79c6"
+accent = "#bd93f9"

@@ -1,0 +1,25 @@
+# Catppuccin Mocha, tuimail's default theme: https://catppuccin.com/palette
+#
+# The same sixteen-color palettes as tuigram, tuimeta and tuitube. The
+# settings tab (`O`) picks one of the built-in ones; settings.toml keeps it.
+
+name = "Catppuccin Mocha"
+
+# What tuimail paints with each. Colors are "#rrggbb".
+[palette]
+bg = "#1e1e2e"       # the background
+bg_alt = "#181825"   # popups, the search box, the composer's fields
+surface = "#313244"  # the selected row
+overlay = "#6c7086"  # borders of what doesn't have the keys
+comment = "#7f849c"  # key hints, read mail, placeholders
+subtext = "#a6adc8"  # senders of read mail, dates, headers' names
+fg = "#cdd6f4"       # subjects and text
+red = "#f38ba8"      # errors
+orange = "#fab387"   # flagged mail
+yellow = "#f9e2af"   # warnings
+green = "#a6e3a1"    # what worked
+cyan = "#94e2d5"     # quoted text in a message
+blue = "#89b4fa"     # links
+purple = "#cba6f7"   # quoted text, one level deeper
+pink = "#f5c2e7"     # (unused)
+accent = "#b4befe"   # what has the keys: the cursor, unread mail, popups
