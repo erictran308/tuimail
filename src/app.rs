@@ -702,7 +702,7 @@ impl App {
 
     /// After a frame: a message laid out for another width is laid out
     /// again for this one.
-    fn after_draw(&mut self) {
+    pub(crate) fn after_draw(&mut self) {
         let width = self.reader_width.get();
         if let Some(reader) = &self.reader
             && reader.raw.is_some()
@@ -4228,7 +4228,7 @@ pub mod tests {
             }
         );
         assert_eq!(subjects(&app)[0], "Lunch tomorrow?");
-        assert_eq!(app.items.len(), 7);
+        assert_eq!(app.items.len(), 18);
     }
 
     #[tokio::test]
@@ -4257,8 +4257,9 @@ pub mod tests {
         let mut app = app();
         with_mail(&mut app);
         app.focus = Focus::List;
+        let before = app.items.len();
         app.on_key(key(KeyCode::Char('d')));
-        assert_eq!(app.items.len(), 6);
+        assert_eq!(app.items.len(), before - 1);
         assert!(!subjects(&app).contains(&"Lunch tomorrow?".to_string()));
         let trash = Place::Folder {
             account: 0,
@@ -4278,11 +4279,12 @@ pub mod tests {
         let mut app = app();
         with_mail(&mut app);
         app.focus = Focus::List;
+        let before = app.items.len();
         app.on_key(key(KeyCode::Char(' ')));
         app.on_key(key(KeyCode::Char(' ')));
         assert_eq!(app.marked.len(), 2);
         app.on_key(key(KeyCode::Char('e')));
-        assert_eq!(app.items.len(), 5);
+        assert_eq!(app.items.len(), before - 2);
         assert!(app.marked.is_empty());
         app.open_place(Place::Folder {
             account: 0,
@@ -4306,6 +4308,7 @@ pub mod tests {
     async fn search_finds_by_sender_and_esc_ends_it() {
         let mut app = app();
         with_mail(&mut app);
+        let before = app.items.len();
         app.on_key(key(KeyCode::Char('/')));
         for c in "bob q3".chars() {
             app.on_key(key(KeyCode::Char(c)));
@@ -4315,7 +4318,7 @@ pub mod tests {
         assert_eq!(subjects(&app), ["Quarterly numbers"]);
         app.on_key(key(KeyCode::Esc));
         assert_eq!(app.search, None);
-        assert_eq!(app.items.len(), 7);
+        assert_eq!(app.items.len(), before);
     }
 
     #[tokio::test]
@@ -4628,13 +4631,14 @@ pub mod tests {
     async fn pasted_keys_are_not_run_as_commands() {
         let mut app = app();
         with_mail(&mut app);
+        let before = app.items.len();
         let keys: Vec<Event> = "dddd"
             .chars()
             .chain("xyz".chars())
             .map(|c| Event::Key(key(KeyCode::Char(c))))
             .collect();
         app.on_terminal_events(keys);
-        assert_eq!(app.items.len(), 7, "nothing deleted");
+        assert_eq!(app.items.len(), before, "nothing deleted");
     }
 
     #[tokio::test]

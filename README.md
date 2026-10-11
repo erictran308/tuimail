@@ -14,30 +14,11 @@ Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from
 
 **[Get started](#get-started)** · **[Keys](#keys)** · **[Accounts](#accounts)** · **[Settings](#settings)** · **[Privacy](#privacy-and-security)**
 
+<img src="docs/hero.png" alt="tuimail: a sidebar with All inboxes and two accounts' folders, beside the work inbox's messages with stars, replies and attachments marked, and Alice's message 'Lunch tomorrow?' open in the reader: its sender, the attached menu, an underlined link and quotes colored by depth">
+
+<sub>The demo's made-up mail: <code>tuimail --demo</code></sub>
+
 </div>
-
-```
-╭ ✉ tuimail ───────────────╮╭ Inbox · work ─────────── 1 unread · 7 messages ╮╭────────────────────────────────────────────────╮
-│ ≡ All inboxes          2 ┃│▌    + Alice Ri… Lunch tomorrow?         09:49  ││ Lunch tomorrow?                                ┃
-│ @ work                   ┃│ ●     GitHub    [tuimail] Release …     08:14  ││                                                ┃
-│   ↓ Inbox              1 ┃│   ★   Bob Stone Quarterly numbers   Sat 07:14  ││ From  Alice Rivera <alice@example.com>         ┃
-│   ✎ Drafts             1 ┃│   ↩   Priya Na… Re: Trip to Tokyo   Thu 10:14  ││ To    Sam Taylor <me@example.org>              ┃
-│   ↑ Sent                 ┃│       Terminal… 10 TUI apps worth …     5 Oct  ││ Date  Sun 11 Oct 2026 09:49                    ┃
-│   ▣ Archive              ┃│       Maya Chen Design review notes    29 Sep  ││ Files + menu.pdf (9 B)                         ┃
-│   ⊘ Junk                 ┃│     + Leo Park  Photos from the hi…     1 Sep  ││ ────────────────────────────────────────────── ┃
-│   ✗ Trash                ┃│                                                ││ Hi Sam,                                        ┃
-│   ▸ Projects             ┃│                                                ││                                                ┃
-│     ▸ Website            ┃│                                                ││ Are we still on for noon? The new ramen place  ┃
-│ @ home                   ┃│                                                ││ opened on 5th,                                 ┃
-│   ↓ Inbox              1 ┃│                                                ││ their menu is attached, and here:              ┃
-│   ✎ Drafts               ┃│                                                ││ https://ramen.example.com/menu                 ┃
-│   ↑ Sent                 ┃│                                                ││                                                │
-│   ▣ Archive              ││                                                ││ > Should we invite Bob?                        │
-╰──────────────────────────╯╰────────────────────────────────────────────────╯╰────────────────────────────────────────────────╯
- Enter open · c write · r reply · a all · f forward · d delete · e archive · s star · / search · ? help                    demo
-```
-
-<div align="center"><sub>The demo's made-up mail: <code>tuimail --demo</code></sub></div>
 
 ---
 

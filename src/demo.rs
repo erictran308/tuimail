@@ -57,14 +57,15 @@ fn html(from: &str, to: &str, subject: &str, ago: i64, body: &str) -> String {
     )
 }
 
-/// A message with files attached (their bytes made up).
+/// A message with files attached: their names, types and sizes (their
+/// bytes made up).
 fn with_files(
     from: &str,
     to: &str,
     subject: &str,
     ago: i64,
     body: &str,
-    files: &[(&str, &str)],
+    files: &[(&str, &str, usize)],
 ) -> String {
     let head = message(from, to, subject, ago, "");
     let head = head.replace(
@@ -75,11 +76,19 @@ fn with_files(
         "{head}--demo\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n",
         body.replace('\n', "\r\n")
     );
-    for (name, mime) in files {
+    for (name, mime, size) in files {
+        // `size` zero bytes, in base64's lines of 76.
+        let encoded = "AAAA".repeat(size / 3);
+        let lines: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|l| std::str::from_utf8(l).unwrap_or_default())
+            .collect();
         out.push_str(&format!(
             "--demo\r\nContent-Type: {mime}; name=\"{name}\"\r\n\
              Content-Disposition: attachment; filename=\"{name}\"\r\n\
-             Content-Transfer-Encoding: base64\r\n\r\nZGVtbyBmaWxl\r\n"
+             Content-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+            lines.join("\r\n")
         ));
     }
     out.push_str("--demo--\r\n");
@@ -127,10 +136,13 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 me,
                 "Lunch tomorrow?",
                 25 * 60,
-                "Hi Sam,\n\nAre we still on for noon? The new ramen place opened on 5th,\n\
-                 their menu is attached, and here: https://ramen.example.com/menu\n\n\
-                 > Should we invite Bob?\n\nSure, ask him.\n\nAlice",
-                &[("menu.pdf", "application/pdf")],
+                "Hi Sam,\n\nAre we still on for noon? The new ramen place on 5th Street \
+                 opened last week, and the menu looks great: it's attached, and here:\n\
+                 https://ramen.example.com/menu\n\n\
+                 They don't take bookings, so I'd get there ten minutes early.\n\n\
+                 > Should we invite Bob?\n>\n>> Lunch tomorrow? I found a new place.\n\n\
+                 Sure, ask him. I'll tell him it's a numbers-free lunch.\n\nAlice",
+                &[("menu.pdf", "application/pdf", 184_320)],
             ),
             unread,
         ),
@@ -209,11 +221,140 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 "Photos from the hike",
                 40 * DAY,
                 "Two of the best ones. The sunrise was worth the 5 am start.",
-                &[("sunrise.jpg", "image/jpeg"), ("summit.jpg", "image/jpeg")],
+                &[
+                    ("sunrise.jpg", "image/jpeg", 1_258_291),
+                    ("summit.jpg", "image/jpeg", 1_048_576),
+                ],
             ),
             read,
         ),
     ];
+    let answered = Flags {
+        answered: true,
+        ..read
+    };
+    let starred = Flags {
+        flagged: true,
+        ..read
+    };
+    // Older mail, so the inbox looks lived in.
+    let older: Vec<(String, Flags)> = vec![
+        (
+            message(
+                "Kai Müller <kai@example.de>",
+                me,
+                "Re: Faster search (#42)",
+                13 * DAY,
+                "Merged, thanks! Search over 50k messages went from 900 ms to 40 ms.\n\nKai",
+            ),
+            answered,
+        ),
+        (
+            message(
+                "Nora Ali <nora@example.com>",
+                me,
+                "Book club: chapter 7",
+                15 * DAY,
+                "We meet Thursday at 7. Bring your favorite line from chapter 7.\n\nNora",
+            ),
+            read,
+        ),
+        (
+            with_files(
+                "Skyway Air <no-reply@skyway.example>",
+                me,
+                "Your flight to Tokyo is booked",
+                17 * DAY,
+                "Booking SKY4K2. Friday 14 November, 10:40, seat 23A.\nYour itinerary is attached.",
+                &[("itinerary.pdf", "application/pdf", 98_304)],
+            ),
+            starred,
+        ),
+        (
+            message(
+                "Tom Becker <tom@example.org>",
+                me,
+                "Coffee next week?",
+                20 * DAY,
+                "Free Tuesday or Wednesday morning? The usual place.\n\nTom",
+            ),
+            answered,
+        ),
+        (
+            with_files(
+                "Calendar <calendar@example.org>",
+                me,
+                "Invitation: Sprint planning, Mon 10:00",
+                22 * DAY,
+                "Maya Chen invites you to Sprint planning, Monday 10:00 to 11:00.",
+                &[("invite.ics", "text/calendar", 2_048)],
+            ),
+            read,
+        ),
+        (
+            with_files(
+                "Hana Sato <hana@example.jp>",
+                me,
+                "Slides from the offsite",
+                25 * DAY,
+                "Here are the slides, and the notes from the afternoon.\n\nHana",
+                &[("offsite.pdf", "application/pdf", 1_572_864)],
+            ),
+            read,
+        ),
+        (
+            with_files(
+                "Cloudbox Billing <billing@cloudbox.example>",
+                me,
+                "Your invoice for September",
+                29 * DAY,
+                "Your invoice for September is attached: 12.00 USD, paid by card.",
+                &[("invoice-2026-09.pdf", "application/pdf", 65_536)],
+            ),
+            read,
+        ),
+        (
+            message(
+                "Omar Haddad <omar@example.com>",
+                me,
+                "Welcome to the team!",
+                33 * DAY,
+                "Welcome aboard, Sam! Your desk is by the window. Lunch is on us Friday.\n\nOmar",
+            ),
+            starred,
+        ),
+        (
+            message(
+                "Rust Digest <news@rust-digest.example>",
+                me,
+                "This month in Rust: async closures",
+                36 * DAY,
+                "Async closures are stable, and cargo builds got faster again.",
+            ),
+            read,
+        ),
+        (
+            message(
+                "Ivy Brooks <ivy@example.com>",
+                me,
+                "Re: Your conference talk",
+                45 * DAY,
+                "The talk is in! Room B, Saturday at 2. Slides due a week before.\n\nIvy",
+            ),
+            answered,
+        ),
+        (
+            message(
+                "Jonas Weber <jonas@example.de>",
+                me,
+                "Moving the standup to 9:30",
+                52 * DAY,
+                "From Monday the standup is at 9:30, same room.\n\nJonas",
+            ),
+            read,
+        ),
+    ];
+    let inbox: Vec<(String, Flags)> = inbox.into_iter().chain(older).collect();
     for (raw, flags) in inbox {
         let _ = store.add_local(&work, "INBOX", raw.as_bytes(), flags, None);
     }
@@ -363,4 +504,103 @@ pub async fn run() -> Result<()> {
     let _ = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{Focus, Place};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
+
+    fn hex(color: Color) -> String {
+        match color {
+            Color::Rgb(r, g, b) => format!("\"#{r:02x}{g:02x}{b:02x}\""),
+            Color::White => "\"#ffffff\"".into(),
+            Color::Black => "\"#000000\"".into(),
+            _ => "null".into(),
+        }
+    }
+
+    fn quoted(text: &str) -> String {
+        let mut out = String::from("\"");
+        for c in text.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// One frame of the demo for `tools/hero.py`: every cell's character,
+    /// colors and style. The work inbox, with Alice's message beside the
+    /// list.
+    #[tokio::test]
+    #[ignore = "writes target/hero/screen.json for tools/hero.py"]
+    async fn export_hero_screen() {
+        let (cols, rows) = (140u16, 30u16);
+        let (cell_width, cell_height) = (16, 34);
+        let accounts = accounts();
+        let mut store = Store::in_memory();
+        fill(&mut store, &accounts);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(store, Settings::default(), accounts, false, None, tx, true);
+        app.test_rx = Some(rx);
+        // As Ghostty shows it, whatever terminal runs the test.
+        app.icons = crate::icons::NERD;
+        app.open_place(Place::Folder {
+            account: 0,
+            folder: "INBOX".into(),
+        });
+        app.focus = Focus::List;
+        app.selected = 0;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        // Laid out again for the width the reader got, as the event loop
+        // does after drawing.
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        crate::app::tests::wait_for_layout(&mut app).await;
+        app.after_draw();
+        crate::app::tests::wait_for_layout(&mut app).await;
+        app.focus = Focus::List;
+        app.status = None;
+        // The status bar's corner says "demo" in the demo: not in a picture
+        // of the app.
+        app.demo = false;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let mut cells = Vec::new();
+        for y in 0..rows {
+            for x in 0..cols {
+                let cell = &buffer[(x, y)];
+                cells.push(format!(
+                    "[{},{},{},{},{},{}]",
+                    quoted(cell.symbol()),
+                    hex(cell.fg),
+                    hex(cell.bg),
+                    cell.modifier.contains(Modifier::BOLD),
+                    cell.modifier.contains(Modifier::ITALIC),
+                    cell.modifier.contains(Modifier::UNDERLINED),
+                ));
+            }
+        }
+        let screen = format!(
+            "{{\"cols\":{cols},\"rows\":{rows},\"cell\":[{cell_width},{cell_height}],\
+             \"bg\":{},\"fg\":{},\"cells\":[{}]}}",
+            hex(app.colors.bg),
+            hex(app.colors.text),
+            cells.join(",")
+        );
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/hero");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("screen.json"), screen).unwrap();
+        eprintln!("wrote {}", dir.join("screen.json").display());
+    }
 }
