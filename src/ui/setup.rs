@@ -19,7 +19,19 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(setup) = app.setup.as_mut() else {
         return;
     };
-    let rect = centered(area, 76, (ROWS.len() as u16) + 10);
+    let intro = if first {
+        "Welcome! Type your address and password: the servers fill in."
+    } else {
+        "Your address and password: the servers fill in."
+    };
+    // The intro wraps to the room inside the border and its margin, and
+    // the form grows by the rows it takes.
+    let text_width = usize::from(76.min(area.width).saturating_sub(4)).max(10);
+    let intro: Vec<String> = textwrap::wrap(intro, text_width)
+        .into_iter()
+        .map(|l| l.into_owned())
+        .collect();
+    let rect = centered(area, 76, (ROWS.len() + 9 + intro.len()) as u16);
     frame.render_widget(Clear, rect);
     let hint = if setup.checking {
         " Logging in to check… ".to_string()
@@ -39,11 +51,6 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = inner.width.saturating_sub(2);
     let x = inner.x + 1;
     let mut y = inner.y;
-    let intro = if first {
-        "Welcome to tuimail. Your address and password first: the servers fill in."
-    } else {
-        "Your address and password: the servers fill in."
-    };
     let line = |frame: &mut Frame, y: u16, spans: Vec<Span<'static>>| {
         if y < inner.y + inner.height {
             frame.render_widget(
@@ -57,12 +64,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             );
         }
     };
-    line(
-        frame,
-        y,
-        vec![Span::styled(intro, Style::new().fg(c.subtext))],
-    );
-    y += 2;
+    for part in intro {
+        line(
+            frame,
+            y,
+            vec![Span::styled(part, Style::new().fg(c.subtext))],
+        );
+        y += 1;
+    }
+    y += 1;
     for (i, row) in ROWS.iter().enumerate() {
         if y >= inner.y + inner.height {
             break;
@@ -182,9 +192,46 @@ fn security(s: Security) -> &'static str {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    use crate::app::App;
     use crate::app::tests::app;
+    use crate::settings::Settings;
     use crate::setup::Setup;
+    use crate::store::Store;
     use crate::ui::tests::screen;
+
+    #[tokio::test]
+    async fn the_first_start_welcome_wraps_instead_of_being_cut() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            Store::in_memory(),
+            Settings::default(),
+            Vec::new(),
+            false,
+            None,
+            tx,
+            true,
+        );
+        assert!(app.setup.is_some(), "no account yet: the form is up");
+        for width in [120, 76, 60, 40] {
+            let shown = screen(&mut app, width, 34);
+            // The intro's lines, joined back into its sentence.
+            let intro: Vec<String> = shown
+                .lines()
+                .skip_while(|l| !l.contains("Welcome!"))
+                .take_while(|l| !l.contains("Email address"))
+                .map(|l| {
+                    l.trim_matches(|c: char| c == '│' || c.is_whitespace())
+                        .to_string()
+                })
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert_eq!(
+                intro.join(" "),
+                "Welcome! Type your address and password: the servers fill in.",
+                "{width}: {shown}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn the_form_fills_in_the_servers_for_an_address() {
@@ -196,6 +243,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let shown = screen(&mut app, 100, 30);
         assert!(shown.contains("Add an account"), "{shown}");
+
         assert!(shown.contains("imap.fastmail.com"), "{shown}");
         assert!(shown.contains("smtp.fastmail.com"));
         assert!(shown.contains("app password"));
