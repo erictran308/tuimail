@@ -710,7 +710,7 @@ const MAX_LINKS: usize = 1000;
 
 /// Where the first URL in `text` starts and ends. One pass, so a long line
 /// costs no more than its length.
-fn find_url(text: &str) -> Option<(usize, usize)> {
+pub fn find_url(text: &str) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {

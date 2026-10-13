@@ -1,4 +1,5 @@
 mod account;
+mod agent;
 mod app;
 mod compose;
 mod composer;
@@ -9,6 +10,7 @@ mod imap;
 #[cfg(test)]
 mod live;
 mod mail;
+mod mcp;
 mod net;
 mod notify;
 mod pop3;
@@ -61,6 +63,18 @@ async fn run() -> Result<()> {
         None => {}
         Some("--check") => check = true,
         Some("--demo") => return demo::run().await,
+        // An agent's: stdout is the agent's, for MCP only.
+        Some("mcp") => {
+            let demo = match args.next().as_deref() {
+                None => false,
+                Some("--demo") => true,
+                Some(other) => bail!(
+                    "unknown argument {:?}; see tuimail --help",
+                    text::clean(other)
+                ),
+            };
+            return mcp::run(config::Config::load()?.data_dir, demo).await;
+        }
         Some("-h" | "--help") => return print(&help()?),
         Some("-V" | "--version") => {
             return print(&format!("tuimail {}\n", env!("CARGO_PKG_VERSION")));
@@ -113,6 +127,7 @@ async fn run() -> Result<()> {
         Some(config.data_dir.clone()),
         tx,
     );
+    app.agent_socket = Some(agent::socket(&config.data_dir, false));
     let mut notes = warnings;
     if !unknown_settings.is_empty() {
         notes.push(format!(
@@ -220,11 +235,20 @@ Email in your terminal: IMAP and POP3 to read, SMTP to send, with arrow
 keys or vim keys.
 
 Usage: tuimail [-h | --help] [-V | --version] [--check] [--demo]
+       tuimail mcp [--demo]
 
 Inside the app, ? lists the keys and q quits. The first start asks for
 an account: your address and password, the servers filled in for the
 usual providers. --check says what tuimail found; --demo shows made-up
 mail, connecting nowhere.
+
+tuimail mcp is for AI agents (Claude Code, Claude Desktop, Cursor, ...):
+an MCP server that reads and sorts your mail through the tuimail you
+have open, once AI agents is on in its settings. Agents can mark, star,
+tag, move and move to Trash; each change shows, can be undone with z,
+and asks you first unless you turn that off. Nothing is deleted or sent.
+tuimail mcp --demo reaches tuimail --demo instead, to try it on made-up
+mail.
 
 Passwords are kept in the system's keychain (or asked for each start,
 or printed by a command of yours: see the README). Accounts, settings

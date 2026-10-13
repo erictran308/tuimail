@@ -475,6 +475,26 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let (title, text, hint) = match confirm {
+        Confirm::Agent { id } => {
+            let Some(ask) = app.agent_asks.iter().find(|a| a.id == *id) else {
+                return;
+            };
+            // Who asks is what it calls itself: said as such.
+            let mut text = format!(
+                "{} (an AI agent, as it calls itself) wants to {}:",
+                fit(&ask.who, 40),
+                ask.what
+            );
+            for line in &ask.which {
+                text.push_str(&format!("\n  {}", fit(line, 70)));
+            }
+            text.push_str("\nYou can undo it later with z.");
+            (
+                " An AI agent asks ",
+                text,
+                " `y` let it · any other key says no ",
+            )
+        }
         Confirm::DeleteForever { uids, .. } => (
             " Delete for good? ",
             format!(
@@ -794,6 +814,20 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         HelpMenu::NOTIFICATIONS,
         check(settings.notifications != Notifications::Off),
         "Notifications (through the terminal)",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" AI agents"));
+    add(
+        &mut lines,
+        HelpMenu::AGENTS,
+        check(settings.agents),
+        "Let AI agents read and sort your mail (tuimail mcp)",
+    );
+    add(
+        &mut lines,
+        HelpMenu::CONFIRM_AGENTS,
+        check(settings.confirm_agents),
+        "Ask before each change an agent makes",
     );
     lines.push(Line::default());
     lines.push(heading(" Theme"));

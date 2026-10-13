@@ -3,7 +3,7 @@
 //! mutates it. The cache (`Store`) is written only from here.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::account::{self, Account, PasswordFrom, Protocol};
+use crate::agent::{self, Call};
 use crate::compose::{self, Draft};
 use crate::composer::{self, Composer, Kind};
 use crate::icons::Icons;
@@ -57,6 +58,12 @@ const HELP_PAGE: isize = 5;
 const FOLDERS_EVERY: u32 = 4;
 
 pub enum AppEvent {
+    /// An AI agent's request (`agent.rs`), answered on `reply`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Agent {
+        request: crate::agent::Request,
+        reply: tokio::sync::oneshot::Sender<crate::agent::Answer>,
+    },
     Worker {
         account: String,
         event: worker::Event,
@@ -298,6 +305,68 @@ pub struct Group {
     pub uidvalidity: u32,
 }
 
+/// An agent's change waiting for the user's `y`.
+pub struct AgentAsk {
+    pub id: u64,
+    /// The agent, as it calls itself.
+    pub who: String,
+    /// What it would do: "move 3 messages to Trash".
+    pub what: String,
+    /// The messages: sender and subject, a line each (a few).
+    pub which: Vec<String>,
+    call: Call,
+    reply: tokio::sync::oneshot::Sender<agent::Answer>,
+    at: Instant,
+}
+
+/// An agent's read waiting for its message to download.
+struct AgentRead {
+    key: (usize, String, u32),
+    max: usize,
+    reply: tokio::sync::oneshot::Sender<agent::Answer>,
+    at: Instant,
+}
+
+/// An agent's change, checked: what it does to which messages.
+struct Plan {
+    action: Action,
+    groups: Vec<Group>,
+    /// Moves: where each group goes.
+    targets: Vec<String>,
+    /// What it does: "move 3 messages to Trash".
+    what: String,
+    /// How many it moves to Trash.
+    trash: usize,
+}
+
+enum Action {
+    Seen(bool),
+    Flagged(bool),
+    Tag(String, bool),
+    Move,
+    Undo(Box<Change>),
+}
+
+impl Plan {
+    fn new(action: Action, groups: Vec<Group>, what: String) -> Self {
+        Self {
+            action,
+            groups,
+            targets: Vec::new(),
+            what,
+            trash: 0,
+        }
+    }
+
+    /// How many messages it changes.
+    fn count(&self) -> usize {
+        match &self.action {
+            Action::Undo(change) => change.messages.len(),
+            _ => self.groups.iter().map(|g| g.uids.len()).sum(),
+        }
+    }
+}
+
 pub struct Picker {
     pub kind: PickerKind,
     pub title: String,
@@ -310,6 +379,10 @@ pub struct Picker {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Confirm {
+    /// An AI agent's change ([`App::agent_asks`], by id).
+    Agent {
+        id: u64,
+    },
     /// Delete for good (from Trash, or with no Trash).
     DeleteForever {
         account: usize,
@@ -370,7 +443,9 @@ impl HelpMenu {
     pub const CONFIRM_DELETE: usize = 3;
     pub const CONFIRM_SEND: usize = 4;
     pub const NOTIFICATIONS: usize = 5;
-    pub const THEMES: usize = 6;
+    pub const AGENTS: usize = 6;
+    pub const CONFIRM_AGENTS: usize = 7;
+    pub const THEMES: usize = 8;
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
     pub fn new(tab: HelpTab) -> Self {
@@ -451,6 +526,17 @@ pub struct App {
     tagging: Vec<Group>,
     /// The change being made, kept once the key that makes it is done.
     change: Option<Change>,
+    /// Where agents reach this tuimail (`None`: they don't).
+    pub agent_socket: Option<PathBuf>,
+    /// Listening for AI agents (the setting on).
+    agents: Option<agent::Listener>,
+    /// Agents' changes waiting for the user's `y`, oldest first.
+    pub agent_asks: VecDeque<AgentAsk>,
+    next_ask: u64,
+    agent_reads: Vec<AgentRead>,
+    /// Agents' changes in the last hour: when, how many messages, how
+    /// many to Trash (the hourly limits).
+    agent_spent: VecDeque<(Instant, usize, usize)>,
     pub picker: Option<Picker>,
     pub confirm: Option<Confirm>,
     confirm_at: Instant,
@@ -485,6 +571,36 @@ pub struct App {
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// A date for agents: RFC 3339, in local time.
+fn agent_date(timestamp: i64) -> Option<String> {
+    use chrono::TimeZone;
+    (timestamp > 0)
+        .then(|| chrono::Local.timestamp_opt(timestamp, 0).single())
+        .flatten()
+        .map(|d| d.to_rfc3339())
+}
+
+/// A message for an agent: `header` with who it's from and to, its
+/// subject, attachments and text, links shown by their site only. Lays out
+/// HTML: only on a big-stack thread (`mail::in_background`).
+fn agent_text(raw: &[u8], max: usize, mut out: serde_json::Value) -> agent::Answer {
+    let parsed = mail::parse(raw).ok_or("This message couldn't be read")?;
+    let text = agent::hide_links(&mail::plain_text(&parsed));
+    let cut = text.chars().count() > max;
+    let addresses = |list: &[Addr]| list.iter().map(Addr::display).collect::<Vec<_>>();
+    out["from"] = serde_json::json!(addresses(&parsed.from));
+    out["to"] = serde_json::json!(addresses(&parsed.to));
+    out["cc"] = serde_json::json!(addresses(&parsed.cc));
+    out["reply_to"] = serde_json::json!(addresses(&parsed.reply_to));
+    out["subject"] = serde_json::json!(parsed.summary.subject);
+    out["attachments"] = (parsed.attachments.iter())
+        .map(|a| serde_json::json!({ "name": a.name, "size": mail::size(a.size) }))
+        .collect();
+    out["text"] = serde_json::json!(text::first_chars(&text, max));
+    out["cut"] = serde_json::json!(cut);
+    Ok(out)
 }
 
 impl App {
@@ -572,6 +688,12 @@ impl App {
             prompt: None,
             tagging: Vec::new(),
             change: None,
+            agent_socket: None,
+            agents: None,
+            agent_asks: VecDeque::new(),
+            next_ask: 0,
+            agent_reads: Vec::new(),
+            agent_spent: VecDeque::new(),
             picker: None,
             confirm: None,
             confirm_at: Instant::now(),
@@ -679,6 +801,7 @@ impl App {
         #[cfg(unix)]
         quit_on_hangup(self.tx.clone())?;
         notify::send(notify::SAVE_TITLE);
+        self.listen_for_agents();
         for i in 0..self.accounts.len() {
             self.redo_deletes(i);
             self.check(i, true);
@@ -764,6 +887,7 @@ impl App {
     }
 
     fn on_tick(&mut self) {
+        self.ask_agents();
         if let Some(status) = &self.status {
             let keep = if status.error { ERROR_FOR } else { STATUS_FOR };
             if status.at.elapsed() >= keep {
@@ -901,6 +1025,7 @@ impl App {
 
     fn on_event(&mut self, event: AppEvent) {
         match event {
+            AppEvent::Agent { request, reply } => self.on_agent(request, reply),
             AppEvent::Worker { account, event } => {
                 if let Some(i) = self.account_index(&account) {
                     self.on_worker(i, event);
@@ -1084,6 +1209,9 @@ impl App {
                 match result {
                     Ok(Some(raw)) => {
                         let _ = self.store.save_body(&id, &folder, uid, &raw);
+                        for read in self.agent_reads_for(&key) {
+                            self.agent_render(read.key, raw.clone(), read.max, read.reply);
+                        }
                         let raw = Arc::new(raw);
                         self.make_previews(i, vec![(folder.clone(), uid, raw.clone())]);
                         if self.reader.as_ref().is_some_and(|r| r.key() == key) {
@@ -1100,11 +1228,19 @@ impl App {
                         }
                     }
                     Ok(None) => {
+                        for read in self.agent_reads_for(&key) {
+                            let _ = read
+                                .reply
+                                .send(Err("This message is gone from the server".into()));
+                        }
                         if let Some(reader) = self.reader.as_mut().filter(|r| r.key() == key) {
                             reader.error = Some("This message is gone from the server".into());
                         }
                     }
                     Err(e) => {
+                        for read in self.agent_reads_for(&key) {
+                            let _ = read.reply.send(Err(e.clone()));
+                        }
                         if let Some(reader) = self.reader.as_mut().filter(|r| r.key() == key) {
                             reader.error = Some(e);
                         }
@@ -1931,12 +2067,24 @@ impl App {
             },
             _ => return,
         };
+        self.change_flag(&targets, flag, on);
+        if flag == FlagKind::Seen
+            && let Some(reader) = self.reader.as_mut()
+        {
+            // Marked unread by hand: the reader doesn't mark it read again.
+            reader.marked_read = true;
+        }
+        self.marked.clear();
+    }
+
+    /// Sets a flag as a change that can be undone (read or star).
+    fn change_flag(&mut self, keys: &[(usize, String, u32)], flag: FlagKind, on: bool) {
         let what = match flag {
             FlagKind::Seen => What::Seen(on),
             FlagKind::Flagged => What::Flagged(on),
             FlagKind::Answered => return,
         };
-        let changed = targets
+        let changed = keys
             .iter()
             .filter_map(|key| {
                 let mut c = self.changed(key)?;
@@ -1948,14 +2096,7 @@ impl App {
             })
             .collect();
         self.note_change(what, changed);
-        self.set_flag(&targets, flag, on);
-        if flag == FlagKind::Seen
-            && let Some(reader) = self.reader.as_mut()
-        {
-            // Marked unread by hand: the reader doesn't mark it read again.
-            reader.marked_read = true;
-        }
-        self.marked.clear();
+        self.set_flag(keys, flag, on);
     }
 
     /// `t`: picks a tag to put on the messages or take off, or a new one.
@@ -2030,6 +2171,20 @@ impl App {
     /// Puts `tag` on messages (`on`) or takes it off, here and on the
     /// server, as a change that can be undone.
     fn tag(&mut self, groups: Vec<Group>, tag: &str, on: bool) {
+        let count = self.change_tag(groups, tag, on);
+        if count > 0 {
+            self.info(if on {
+                format!("{} tagged {tag}", plural(count, "message"))
+            } else {
+                format!("{tag} taken off {}", plural(count, "message"))
+            });
+        }
+        self.marked.clear();
+    }
+
+    /// Puts `tag` on messages or takes it off as a change that can be
+    /// undone; how many.
+    fn change_tag(&mut self, groups: Vec<Group>, tag: &str, on: bool) -> usize {
         let changed = groups
             .iter()
             .filter(|g| {
@@ -2043,15 +2198,7 @@ impl App {
             })
             .collect();
         self.note_change(What::Tag(tag.to_string(), on), changed);
-        let count = self.apply_tag(groups, tag, on);
-        if count > 0 {
-            self.info(if on {
-                format!("{} tagged {tag}", plural(count, "message"))
-            } else {
-                format!("{tag} taken off {}", plural(count, "message"))
-            });
-        }
-        self.marked.clear();
+        self.apply_tag(groups, tag, on)
     }
 
     /// Puts `tag` on messages or takes it off, here and on the server; how
@@ -2118,7 +2265,7 @@ impl App {
         match self.change.as_mut() {
             Some(change) if change.what == what => change.messages.extend(messages),
             _ => {
-                self.keep_change();
+                let _ = self.keep_change();
                 self.change = Some(Change {
                     id: 0,
                     at: now(),
@@ -2132,10 +2279,9 @@ impl App {
     }
 
     /// Keeps the change being made, if any.
-    fn keep_change(&mut self) {
-        if let Some(change) = self.change.take() {
-            let _ = self.store.add_change(&change, now());
-        }
+    fn keep_change(&mut self) -> Option<i64> {
+        let change = self.change.take()?;
+        self.store.add_change(&change, now()).ok()
     }
 
     /// What a change did, as the status line says it.
@@ -2163,7 +2309,7 @@ impl App {
 
     /// `z`: undoes the newest change not undone yet.
     fn undo_last(&mut self) {
-        self.keep_change();
+        let _ = self.keep_change();
         let last = self
             .store
             .changes(50)
@@ -2178,7 +2324,7 @@ impl App {
 
     /// `Z`: picks a change to undo, newest first.
     fn pick_change(&mut self) {
-        self.keep_change();
+        let _ = self.keep_change();
         let changes = self.store.changes(100).unwrap_or_default();
         if changes.is_empty() {
             return self.info("No changes yet");
@@ -2351,6 +2497,691 @@ impl App {
         if self.shows(account, to) {
             self.reload();
         }
+    }
+
+    // AI agents (`agent.rs`): what they ask, answered here.
+
+    /// Listens for agents while the setting is on, or stops.
+    fn listen_for_agents(&mut self) {
+        let wanted = self.settings.agents && self.agent_socket.is_some();
+        if wanted && self.agents.is_none() {
+            let Some(socket) = self.agent_socket.clone() else {
+                return;
+            };
+            match agent::listen(&socket, self.tx.clone()) {
+                Ok(listener) => self.agents = Some(listener),
+                Err(e) => self.error(format!("AI agents: {e:#}")),
+            }
+        } else if !wanted && self.agents.is_some() {
+            self.agents = None;
+            for ask in std::mem::take(&mut self.agent_asks) {
+                let _ = ask.reply.send(Err("The user turned AI agents off".into()));
+            }
+            if matches!(self.confirm, Some(Confirm::Agent { .. })) {
+                self.confirm = None;
+            }
+        }
+    }
+
+    fn on_agent(
+        &mut self,
+        request: agent::Request,
+        reply: tokio::sync::oneshot::Sender<agent::Answer>,
+    ) {
+        let who = agent::shown_client(&request.client);
+        let call = request.call;
+        if call.changes() {
+            self.agent_spent
+                .retain(|(at, ..)| at.elapsed() < Duration::from_secs(3600));
+            match self.agent_plan(&call) {
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+                Ok(plan) if self.settings.confirm_agents => {
+                    self.next_ask += 1;
+                    let which = self.plan_lines(&plan);
+                    self.notifier.add(notify::Note {
+                        account: String::new(),
+                        from: who.clone(),
+                        subject: format!("asks to {}: answer in tuimail", plan.what),
+                    });
+                    self.agent_asks.push_back(AgentAsk {
+                        id: self.next_ask,
+                        who,
+                        what: plan.what,
+                        which,
+                        call,
+                        reply,
+                        at: Instant::now(),
+                    });
+                    self.ask_agents();
+                }
+                Ok(plan) => {
+                    let answer = self.agent_apply(&who, plan);
+                    if let Ok(done) = &answer {
+                        self.notifier.add(notify::Note {
+                            account: String::new(),
+                            from: who,
+                            subject: done["done"].as_str().unwrap_or_default().to_string(),
+                        });
+                    }
+                    let _ = reply.send(answer);
+                }
+            }
+            return;
+        }
+        let answer = match call {
+            Call::ListAccounts => Ok(self.agent_accounts()),
+            Call::ListFolders(args) => self.agent_folders(&args.account),
+            Call::SearchMessages(args) => self.agent_search(&args),
+            Call::ListChanges(args) => Ok(self.agent_changes(args.limit)),
+            Call::ReadMessage(args) => return self.agent_read(args, reply),
+            _ => Err("That isn't something tuimail does".into()),
+        };
+        let _ = reply.send(answer);
+    }
+
+    /// Answers what nobody waits for any more, or the user didn't answer
+    /// in time, and asks about the next change when nothing else is open.
+    fn ask_agents(&mut self) {
+        let mut i = 0;
+        while i < self.agent_asks.len() {
+            let ask = &self.agent_asks[i];
+            if ask.reply.is_closed() || ask.at.elapsed() >= agent::ASK_FOR {
+                let ask = self.agent_asks.remove(i).expect("it's there");
+                let _ = ask.reply.send(Err("The user didn't answer in time".into()));
+                if self.confirm == Some(Confirm::Agent { id: ask.id }) {
+                    self.confirm = None;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        for read in std::mem::take(&mut self.agent_reads) {
+            if read.at.elapsed() < Duration::from_secs(60) && !read.reply.is_closed() {
+                self.agent_reads.push(read);
+            } else {
+                let _ = read.reply.send(Err(
+                    "The message didn't download in time: tuimail may be offline".into(),
+                ));
+            }
+        }
+        let free = self.confirm.is_none()
+            && self.composer.is_none()
+            && self.setup.is_none()
+            && self.prompt.is_none()
+            && self.picker.is_none()
+            && self.help.is_none();
+        if free && let Some(ask) = self.agent_asks.front() {
+            let id = ask.id;
+            self.confirm(Confirm::Agent { id });
+        }
+    }
+
+    /// The user's answer to an agent's change: made if `yes` (checked
+    /// again: mail may have changed while it waited).
+    fn agent_answer(&mut self, id: u64, yes: bool) {
+        let Some(n) = self.agent_asks.iter().position(|a| a.id == id) else {
+            return;
+        };
+        let ask = self.agent_asks.remove(n).expect("it's there");
+        let answer = if yes {
+            self.agent_spent
+                .retain(|(at, ..)| at.elapsed() < Duration::from_secs(3600));
+            self.agent_plan(&ask.call)
+                .and_then(|plan| self.agent_apply(&ask.who, plan))
+        } else {
+            self.info(format!("{} wasn't let {}", ask.who, ask.what));
+            Err(
+                "The user said no. Don't do it another way, or ask again unless they want it."
+                    .into(),
+            )
+        };
+        let _ = ask.reply.send(answer);
+    }
+
+    /// An agent's change, checked against the rules: which messages (ids
+    /// still meaning them), where to, never deleting, within the limits.
+    fn agent_plan(&self, call: &Call) -> Result<Plan, String> {
+        let n = |groups: &[Group]| plural(groups.iter().map(|g| g.uids.len()).sum(), "message");
+        let mut plan = match call {
+            Call::MarkRead(args) => {
+                let groups = self.agent_groups(&args.ids)?;
+                let what = format!(
+                    "mark {} {}",
+                    n(&groups),
+                    if args.read { "read" } else { "unread" }
+                );
+                Plan::new(Action::Seen(args.read), groups, what)
+            }
+            Call::Star(args) => {
+                let groups = self.agent_groups(&args.ids)?;
+                let what = if args.starred {
+                    format!("star {}", n(&groups))
+                } else {
+                    format!("take the star off {}", n(&groups))
+                };
+                Plan::new(Action::Flagged(args.starred), groups, what)
+            }
+            Call::SetTag(args) => {
+                let tag = tags::normalize(&args.tag).ok_or_else(|| {
+                    format!(
+                        "A tag is one word of letters, digits, - _ or . (at most {} characters)",
+                        tags::MAX_TAG
+                    )
+                })?;
+                let groups = self.agent_groups(&args.ids)?;
+                let what = if args.on {
+                    format!("tag {} {tag}", n(&groups))
+                } else {
+                    format!("take {tag} off {}", n(&groups))
+                };
+                Plan::new(Action::Tag(tag, args.on), groups, what)
+            }
+            Call::MoveMessages(args) => {
+                let groups = self.agent_groups(&args.ids)?;
+                let mut targets = Vec::new();
+                for g in &groups {
+                    let to = self.agent_folder(g.account, &args.folder)?;
+                    match self.role_of(g.account, &to) {
+                        Some(Role::Trash) => return Err("Use move_to_trash for Trash".into()),
+                        Some(Role::Junk) => return Err("Use mark_spam for Junk".into()),
+                        _ if to == g.folder => {
+                            return Err(format!(
+                                "They're in {} already",
+                                self.folder_name(g.account, &to)
+                            ));
+                        }
+                        _ => targets.push(to),
+                    }
+                }
+                let to = self.folder_name(groups[0].account, &targets[0]);
+                let what = format!("move {} to {to}", n(&groups));
+                Plan {
+                    targets,
+                    ..Plan::new(Action::Move, groups, what)
+                }
+            }
+            Call::MarkSpam(args) => {
+                let groups = self.agent_groups(&args.ids)?;
+                let mut targets = Vec::new();
+                for g in &groups {
+                    let account = &self.accounts[g.account];
+                    let junk = account.folder_for(Role::Junk).map(|f| f.name.clone());
+                    let Some(junk) = junk else {
+                        return Err(format!(
+                            "{} has no Junk folder",
+                            account.account.shown_name()
+                        ));
+                    };
+                    if args.spam && g.folder == junk {
+                        return Err("They're in Junk already".into());
+                    }
+                    if !args.spam && g.folder != junk {
+                        return Err("Only mail in Junk can be marked not spam".into());
+                    }
+                    targets.push(if args.spam { junk } else { account.inbox() });
+                }
+                let what = if args.spam {
+                    format!("mark {} as spam (to Junk)", n(&groups))
+                } else {
+                    format!("mark {} as not spam (back to the inbox)", n(&groups))
+                };
+                Plan {
+                    targets,
+                    ..Plan::new(Action::Move, groups, what)
+                }
+            }
+            Call::MoveToTrash(args) => {
+                let groups = self.agent_groups(&args.ids)?;
+                let mut targets = Vec::new();
+                for g in &groups {
+                    let account = &self.accounts[g.account];
+                    // Without a Trash, `d` deletes for good: never for agents.
+                    let Some(trash) = account.folder_for(Role::Trash).map(|f| f.name.clone())
+                    else {
+                        return Err(format!(
+                            "{} has no Trash folder, so nothing can be moved there",
+                            account.account.shown_name()
+                        ));
+                    };
+                    // From Trash, `d` deletes for good: only the user does.
+                    if g.folder == trash {
+                        return Err(format!(
+                            "{} in Trash already: only the user deletes mail for good",
+                            plural(g.uids.len(), "message")
+                        ));
+                    }
+                    targets.push(trash);
+                }
+                let what = format!("move {} to Trash", n(&groups));
+                let trash = groups.iter().map(|g| g.uids.len()).sum();
+                Plan {
+                    targets,
+                    trash,
+                    ..Plan::new(Action::Move, groups, what)
+                }
+            }
+            Call::UndoChange(args) => {
+                let change = self
+                    .store
+                    .change(args.change)
+                    .ok()
+                    .flatten()
+                    .ok_or("No change has that id (they're kept 30 days)")?;
+                if change.undone {
+                    return Err("That change was undone already".into());
+                }
+                if change.who.is_empty() {
+                    return Err("That change is the user's: only they undo it".into());
+                }
+                let what = format!("undo this: {}", self.describe(&change));
+                Plan::new(Action::Undo(Box::new(change)), Vec::new(), what)
+            }
+            _ => return Err("That doesn't change mail".into()),
+        };
+        // Moves to Trash by way of another tool count as Trash too.
+        if plan.trash == 0 && matches!(plan.action, Action::Move) {
+            plan.trash = (plan.groups.iter().zip(&plan.targets))
+                .filter(|(g, to)| self.role_of(g.account, to) == Some(Role::Trash))
+                .map(|(g, _)| g.uids.len())
+                .sum();
+        }
+        let (spent, trashed) = self
+            .agent_spent
+            .iter()
+            .fold((0, 0), |(a, b), (_, n, t)| (a + n, b + t));
+        if spent + plan.count() > agent::CHANGES_PER_HOUR {
+            return Err(format!(
+                "Agents have changed {spent} messages in the last hour, and {} is the most: \
+                 wait, or ask the user to do it",
+                agent::CHANGES_PER_HOUR
+            ));
+        }
+        if trashed + plan.trash > agent::TRASH_PER_HOUR {
+            return Err(format!(
+                "Agents have moved {trashed} messages to Trash in the last hour, and {} is \
+                 the most: wait, or ask the user to do it",
+                agent::TRASH_PER_HOUR
+            ));
+        }
+        Ok(plan)
+    }
+
+    /// The messages agents' ids name, each still the message it was.
+    fn agent_groups(&self, ids: &[String]) -> Result<Vec<Group>, String> {
+        if ids.is_empty() {
+            return Err("No message ids were given".into());
+        }
+        if ids.len() > agent::MAX_IDS {
+            return Err(format!("At most {} messages a call", agent::MAX_IDS));
+        }
+        let mut keys: Vec<(usize, String, u32)> = Vec::new();
+        for (n, id) in ids.iter().enumerate() {
+            let key = self.agent_key(id).ok_or_else(|| {
+                format!(
+                    "Id {} isn't a message tuimail has now (it moved, or its folder changed): \
+                     search again",
+                    n + 1
+                )
+            })?;
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        Ok(Self::grouped(&keys)
+            .into_iter()
+            .map(|(account, folder, uids)| Group {
+                uidvalidity: self.uidvalidity(account, &folder),
+                account,
+                folder,
+                uids,
+            })
+            .collect())
+    }
+
+    /// The message an agent's id names, if it's still that one here.
+    fn agent_key(&self, id: &str) -> Option<(usize, String, u32)> {
+        let (account, folder, uidvalidity, uid) = agent::unhandle(id)?;
+        let i = self.account_index(&account)?;
+        self.accounts[i].folders.iter().find(|f| f.name == folder)?;
+        if self.uidvalidity(i, &folder) != uidvalidity {
+            return None;
+        }
+        self.store.message(&account, &folder, uid).ok()??;
+        Some((i, folder, uid))
+    }
+
+    /// An agent's id for a message.
+    fn agent_id(&self, i: usize, folder: &str, uid: u32) -> String {
+        agent::handle(
+            &self.accounts[i].id,
+            folder,
+            self.uidvalidity(i, folder),
+            uid,
+        )
+    }
+
+    /// The account an agent names, by its name or address.
+    fn agent_account(&self, name: &str) -> Result<usize, String> {
+        let name = name.trim();
+        self.accounts
+            .iter()
+            .position(|a| {
+                a.id.eq_ignore_ascii_case(name) || a.account.shown_name().eq_ignore_ascii_case(name)
+            })
+            .ok_or_else(|| format!("There's no account {name:?}: see list_accounts"))
+    }
+
+    /// A folder of account `i` an agent names: by its role, server name or
+    /// name.
+    fn agent_folder(&self, i: usize, name: &str) -> Result<String, String> {
+        let account = &self.accounts[i];
+        let name = name.trim();
+        let role = match name.to_lowercase().as_str() {
+            "inbox" => Some(Role::Inbox),
+            "archive" => Some(Role::Archive),
+            "sent" => Some(Role::Sent),
+            "drafts" => Some(Role::Drafts),
+            "junk" | "spam" => Some(Role::Junk),
+            "trash" => Some(Role::Trash),
+            _ => None,
+        };
+        let by_role = role.and_then(|role| {
+            account.folder_for(role).or_else(|| {
+                // Gmail archives to All Mail.
+                (role == Role::Archive)
+                    .then(|| account.folder_for(Role::All))
+                    .flatten()
+            })
+        });
+        by_role
+            .or_else(|| account.folders.iter().find(|f| f.name == name))
+            .or_else(|| (account.folders.iter()).find(|f| f.shown.eq_ignore_ascii_case(name)))
+            .filter(|f| f.selectable)
+            .map(|f| f.name.clone())
+            .ok_or_else(|| {
+                format!(
+                    "{} has no folder {name:?}: see list_folders",
+                    account.account.shown_name()
+                )
+            })
+    }
+
+    /// The messages a change is for, as the question shows them: who
+    /// from and the subject, a few.
+    fn plan_lines(&self, plan: &Plan) -> Vec<String> {
+        let keys: Vec<(usize, String, u32)> = plan
+            .groups
+            .iter()
+            .flat_map(|g| g.uids.iter().map(|u| (g.account, g.folder.clone(), *u)))
+            .collect();
+        let mut lines: Vec<String> = keys
+            .iter()
+            .take(5)
+            .filter_map(|(i, folder, uid)| {
+                let m = self
+                    .store
+                    .message(&self.accounts[*i].id, folder, *uid)
+                    .ok()??;
+                let subject = if m.summary.subject.is_empty() {
+                    "(no subject)".to_string()
+                } else {
+                    m.summary.subject
+                };
+                Some(format!(
+                    "{} · {subject} · {}",
+                    m.summary.from.short(),
+                    self.folder_name(*i, folder)
+                ))
+            })
+            .collect();
+        if keys.len() > 5 {
+            lines.push(format!("and {} more", keys.len() - 5));
+        }
+        lines
+    }
+
+    /// Makes an agent's change, as the user's keys would: kept as a change
+    /// that's the agent's, which `z` undoes.
+    fn agent_apply(&mut self, who: &str, plan: Plan) -> agent::Answer {
+        let _ = self.keep_change();
+        let count = plan.count();
+        let trash = plan.trash;
+        match plan.action {
+            Action::Undo(change) => {
+                let what = self.describe(&change);
+                self.undo(*change);
+                self.agent_spent.push_back((Instant::now(), count, 0));
+                self.info(format!("{who} undid this: {what}"));
+                return Ok(serde_json::json!({ "done": format!("undid this: {what}") }));
+            }
+            Action::Seen(on) | Action::Flagged(on) => {
+                let flag = if matches!(plan.action, Action::Seen(_)) {
+                    FlagKind::Seen
+                } else {
+                    FlagKind::Flagged
+                };
+                let keys: Vec<_> = (plan.groups.iter())
+                    .flat_map(|g| g.uids.iter().map(|u| (g.account, g.folder.clone(), *u)))
+                    .collect();
+                self.change_flag(&keys, flag, on);
+            }
+            Action::Tag(tag, on) => {
+                self.change_tag(plan.groups, &tag, on);
+            }
+            Action::Move => {
+                for (g, to) in plan.groups.iter().zip(&plan.targets) {
+                    self.move_messages(g.account, &g.folder, &g.uids, to);
+                }
+            }
+        }
+        if let Some(change) = self.change.as_mut() {
+            change.who = who.to_string();
+        }
+        let id = self.keep_change();
+        self.agent_spent.push_back((Instant::now(), count, trash));
+        let done = id
+            .and_then(|id| self.store.change(id).ok().flatten())
+            .map(|c| self.describe(&c))
+            .unwrap_or(plan.what);
+        self.info(format!("{who}: {done} · z undoes"));
+        Ok(serde_json::json!({ "done": done, "change": id }))
+    }
+
+    fn agent_accounts(&self) -> serde_json::Value {
+        let accounts: Vec<serde_json::Value> = (self.accounts.iter())
+            .map(|a| {
+                serde_json::json!({
+                    "account": a.account.shown_name(),
+                    "address": a.id,
+                    "kind": if a.is_pop() { "pop3" } else { "imap" },
+                    "online": a.state == State::Online,
+                })
+            })
+            .collect();
+        serde_json::json!(accounts)
+    }
+
+    fn agent_folders(&self, account: &str) -> agent::Answer {
+        let i = self.agent_account(account)?;
+        let folders: Vec<serde_json::Value> = (self.accounts[i].folders.iter())
+            .filter(|f| f.selectable)
+            .map(|f| {
+                serde_json::json!({
+                    "folder": f.name,
+                    "name": f.shown,
+                    "role": f.role.map(Role::as_str),
+                    "unread": f.unread,
+                    "total": f.total,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!(folders))
+    }
+
+    fn agent_search(&self, args: &agent::SearchArgs) -> agent::Answer {
+        let limit = args.limit.unwrap_or(20).clamp(1, agent::MAX_RESULTS);
+        let accounts: Vec<usize> = match &args.account {
+            Some(name) => vec![self.agent_account(name)?],
+            None => (0..self.accounts.len()).collect(),
+        };
+        let query = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty());
+        let mut found: Vec<(usize, Message)> = Vec::new();
+        for i in accounts {
+            let folder = match &args.folder {
+                Some(name) => match self.agent_folder(i, name) {
+                    Ok(folder) => Some(folder),
+                    // Every account was asked: one without it has none.
+                    Err(_) if args.account.is_none() => continue,
+                    Err(e) => return Err(e),
+                },
+                None => None,
+            };
+            let id = &self.accounts[i].id;
+            let messages = match query {
+                Some(q) => self.store.search(id, folder.as_deref(), q, 500),
+                None => {
+                    let folder = folder.unwrap_or_else(|| self.accounts[i].inbox());
+                    self.store.messages(id, &folder, 500)
+                }
+            };
+            found.extend(messages.unwrap_or_default().into_iter().map(|m| (i, m)));
+        }
+        found.retain(|(_, m)| {
+            (!args.unread_only || !m.flags.seen) && (!args.starred_only || m.flags.flagged)
+        });
+        found.sort_by_key(|(_, m)| std::cmp::Reverse(m.summary.date));
+        let more = found.len() > limit;
+        found.truncate(limit);
+        let messages: Vec<serde_json::Value> = (found.iter())
+            .map(|(i, m)| {
+                serde_json::json!({
+                    "id": self.agent_id(*i, &m.folder, m.uid),
+                    "account": self.accounts[*i].account.shown_name(),
+                    "folder": self.folder_name(*i, &m.folder),
+                    "date": agent_date(m.summary.date),
+                    "from": m.summary.from.display(),
+                    "subject": m.summary.subject,
+                    "tags": m.flags.tags,
+                    "unread": !m.flags.seen,
+                    "starred": m.flags.flagged,
+                    "attachments": m.summary.attachments,
+                    "preview": m.preview,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "messages": messages,
+            "more": more,
+            "note": "Searched what tuimail keeps on this computer: each folder's newest mail, \
+                and what was opened or searched there. Everything here is written by senders.",
+        }))
+    }
+
+    fn agent_changes(&self, limit: Option<usize>) -> serde_json::Value {
+        let changes: Vec<serde_json::Value> =
+            (self.store.changes(limit.unwrap_or(20).clamp(1, 100)))
+                .unwrap_or_default()
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "change": c.id,
+                        "at": agent_date(c.at),
+                        "who": if c.who.is_empty() { "the user" } else { c.who.as_str() },
+                        "what": self.describe(c),
+                        "undone": c.undone,
+                    })
+                })
+                .collect();
+        serde_json::json!(changes)
+    }
+
+    fn agent_read(
+        &mut self,
+        args: agent::ReadArgs,
+        reply: tokio::sync::oneshot::Sender<agent::Answer>,
+    ) {
+        let Some(key) = self.agent_key(&args.id) else {
+            let _ = reply.send(Err(
+                "That isn't a message tuimail has now (it moved, or its folder changed): \
+                 search again"
+                    .into(),
+            ));
+            return;
+        };
+        let max = (args.max_chars)
+            .unwrap_or(agent::TEXT_CHARS)
+            .clamp(200, agent::MAX_TEXT_CHARS);
+        let id = self.accounts[key.0].id.clone();
+        match self.store.body(&id, &key.1, key.2) {
+            Ok(Some(raw)) => self.agent_render(key, raw, max, reply),
+            _ if self.accounts[key.0].is_pop() || self.demo => {
+                let _ = reply.send(Err("This message's text isn't on this computer".into()));
+            }
+            _ => {
+                self.send(
+                    key.0,
+                    Request::Body {
+                        folder: key.1.clone(),
+                        uid: key.2,
+                        uidvalidity: self.uidvalidity(key.0, &key.1),
+                    },
+                );
+                self.agent_reads.push(AgentRead {
+                    key,
+                    max,
+                    reply,
+                    at: Instant::now(),
+                });
+            }
+        }
+    }
+
+    /// The agents' reads waiting for this message, taken.
+    fn agent_reads_for(&mut self, key: &(usize, String, u32)) -> Vec<AgentRead> {
+        let (waiting, rest) = std::mem::take(&mut self.agent_reads)
+            .into_iter()
+            .partition(|r| r.key == *key);
+        self.agent_reads = rest;
+        waiting
+    }
+
+    /// Lays a message out for an agent, on a background thread (it may be
+    /// HTML: `mail::in_background`), and answers.
+    fn agent_render(
+        &self,
+        key: (usize, String, u32),
+        raw: Vec<u8>,
+        max: usize,
+        reply: tokio::sync::oneshot::Sender<agent::Answer>,
+    ) {
+        let (i, folder, uid) = key;
+        let message = self
+            .store
+            .message(&self.accounts[i].id, &folder, uid)
+            .ok()
+            .flatten();
+        let header = serde_json::json!({
+            "id": self.agent_id(i, &folder, uid),
+            "account": self.accounts[i].account.shown_name(),
+            "folder": self.folder_name(i, &folder),
+            "date": message.as_ref().map(|m| agent_date(m.summary.date)),
+            "tags": message.as_ref().map(|m| m.flags.tags.clone()),
+            "unread": message.as_ref().map(|m| !m.flags.seen),
+            "starred": message.as_ref().map(|m| m.flags.flagged),
+        });
+        mail::in_background(
+            move || agent_text(&raw, max, header),
+            move |done| {
+                let _ =
+                    reply.send(done.unwrap_or_else(|| Err("This message couldn't be read".into())));
+            },
+        );
     }
 
     /// Takes messages off the list (moved or deleted), keeping the cursor
@@ -3290,7 +4121,7 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) {
         self.handle_key(key);
         // What the key changed is one change, to undo at once.
-        self.keep_change();
+        let _ = self.keep_change();
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -3867,6 +4698,8 @@ impl App {
         let yes = key.code == KeyCode::Char('y') && !early;
         let no = key.code == KeyCode::Char('n') && !early;
         match confirm {
+            // Any key but `y` says no.
+            Confirm::Agent { id } => self.agent_answer(id, yes),
             Confirm::DeleteForever {
                 account,
                 folder,
@@ -4027,6 +4860,13 @@ impl App {
             }
             HelpMenu::CONFIRM_SEND => {
                 self.save_setting("confirm_send", flip(self.settings.confirm_send))
+            }
+            HelpMenu::AGENTS => {
+                self.save_setting("agents", flip(self.settings.agents));
+                self.listen_for_agents();
+            }
+            HelpMenu::CONFIRM_AGENTS => {
+                self.save_setting("confirm_agents", flip(self.settings.confirm_agents))
             }
             HelpMenu::NOTIFICATIONS => {
                 let on = self.settings.notifications != Notifications::Off;
@@ -5577,5 +6417,302 @@ pub mod tests {
         app.on_key(key(KeyCode::Char('Z')));
         let items = &app.picker.as_ref().unwrap().items;
         assert!(items[1].ends_with("(undone)"), "{items:?}");
+    }
+    /// Asks the app as an agent would.
+    fn agent_call(app: &mut App, call: Call) -> tokio::sync::oneshot::Receiver<agent::Answer> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let request = agent::Request {
+            client: "Claude Code".into(),
+            call,
+        };
+        app.on_agent(request, reply);
+        answer
+    }
+
+    /// What the app answered at once.
+    fn agent_now(app: &mut App, call: Call) -> agent::Answer {
+        agent_call(app, call).try_recv().expect("answered at once")
+    }
+
+    /// The ids of what an agent's search finds.
+    fn agent_ids(app: &mut App, args: agent::SearchArgs) -> Vec<String> {
+        let found = agent_now(app, Call::SearchMessages(args)).unwrap();
+        (found["messages"].as_array().unwrap().iter())
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn first_id(app: &mut App) -> String {
+        agent_ids(app, agent::SearchArgs::default()).remove(0)
+    }
+
+    #[tokio::test]
+    async fn agents_read_the_cache_and_a_message_with_links_shown_by_site() {
+        let mut app = app();
+        with_mail(&mut app);
+        let accounts = agent_now(&mut app, Call::ListAccounts).unwrap();
+        assert_eq!(accounts[0]["address"], app.accounts[0].id.as_str());
+        let name = accounts[0]["account"].as_str().unwrap().to_string();
+        let folders = agent_now(
+            &mut app,
+            Call::ListFolders(agent::FolderArgs { account: name }),
+        )
+        .unwrap();
+        assert!(
+            folders
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["role"] == "trash")
+        );
+        let found = agent_now(
+            &mut app,
+            Call::SearchMessages(agent::SearchArgs {
+                unread_only: true,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let messages = found["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["subject"], "Lunch tomorrow?");
+        let tagged = agent_ids(
+            &mut app,
+            agent::SearchArgs {
+                query: Some("tag:work".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(tagged.len(), 1);
+        let id = messages[0]["id"].as_str().unwrap().to_string();
+        let answer = agent_call(
+            &mut app,
+            Call::ReadMessage(agent::ReadArgs {
+                id,
+                max_chars: None,
+            }),
+        );
+        let read = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let text = read["text"].as_str().unwrap();
+        assert!(text.contains("[link: ramen.example.com]"), "{text}");
+        assert!(!text.contains("https://"), "{text}");
+        assert_eq!(read["attachments"][0]["name"], "menu.pdf");
+        assert!(!app.items[0].message.flags.seen, "not marked read");
+    }
+
+    #[tokio::test]
+    async fn an_agents_change_waits_for_y_and_z_undoes_it() {
+        let mut app = app();
+        with_mail(&mut app);
+        let id = first_id(&mut app);
+        let mut answer = agent_call(
+            &mut app,
+            Call::MoveToTrash(agent::IdsArgs { ids: vec![id] }),
+        );
+        assert!(answer.try_recv().is_err(), "it waits");
+        assert!(matches!(app.confirm, Some(Confirm::Agent { .. })));
+        let shown = crate::ui::tests::screen(&mut app, 160, 30);
+        for said in [
+            "An AI agent asks",
+            "Claude Code",
+            "wants to move 1",
+            "Lunch tomorrow? · Inbox",
+        ] {
+            assert!(shown.contains(said), "{said}: {shown}");
+        }
+        app.confirm_at = Instant::now() - CONFIRM_GRACE;
+        app.on_key(key(KeyCode::Char('y')));
+        let done = answer.try_recv().unwrap().unwrap();
+        assert_eq!(done["done"], "1 message moved to Trash");
+        assert!(!subjects(&app).contains(&"Lunch tomorrow?".to_string()));
+        let change = app.store.changes(1).unwrap().remove(0);
+        assert_eq!(change.who, "Claude Code");
+        assert_eq!(done["change"], change.id);
+        let status = app.status.as_ref().unwrap();
+        assert_eq!(
+            status.text,
+            "Claude Code: 1 message moved to Trash · z undoes"
+        );
+        app.on_key(key(KeyCode::Char('z')));
+        assert!(subjects(&app).contains(&"Lunch tomorrow?".to_string()));
+    }
+
+    #[tokio::test]
+    async fn no_means_no() {
+        let mut app = app();
+        with_mail(&mut app);
+        let id = first_id(&mut app);
+        let mut answer = agent_call(
+            &mut app,
+            Call::Star(agent::StarArgs {
+                ids: vec![id],
+                starred: true,
+            }),
+        );
+        app.confirm_at = Instant::now() - CONFIRM_GRACE;
+        app.on_key(key(KeyCode::Char('n')));
+        let refused = answer.try_recv().unwrap().unwrap_err();
+        assert!(refused.contains("said no"), "{refused}");
+        assert!(!app.items[0].message.flags.flagged);
+        assert!(app.confirm.is_none());
+        // A key pressed as the question comes up says no too.
+        let id = first_id(&mut app);
+        let mut answer = agent_call(
+            &mut app,
+            Call::Star(agent::StarArgs {
+                ids: vec![id],
+                starred: true,
+            }),
+        );
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(answer.try_recv().unwrap().is_err(), "too soon to be a yes");
+        assert!(!app.items[0].message.flags.flagged);
+    }
+
+    #[tokio::test]
+    async fn without_asking_a_change_is_made_at_once_and_said() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.settings.confirm_agents = false;
+        let id = first_id(&mut app);
+        let done = agent_now(
+            &mut app,
+            Call::SetTag(agent::TagArgs {
+                ids: vec![id],
+                tag: "Receipts".into(),
+                on: true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(done["done"], "1 message tagged receipts");
+        assert_eq!(app.items[0].message.flags.tags, ["receipts"]);
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "Claude Code: 1 message tagged receipts · z undoes"
+        );
+        assert!(app.confirm.is_none());
+    }
+
+    #[tokio::test]
+    async fn agents_never_delete_and_keep_to_the_rules() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.settings.confirm_agents = false;
+        let refused = |answer: agent::Answer, says: &str| {
+            let error = answer.expect_err(says);
+            assert!(error.contains(says), "{says}: {error}");
+        };
+        let id = first_id(&mut app);
+        agent_now(
+            &mut app,
+            Call::MoveToTrash(agent::IdsArgs { ids: vec![id] }),
+        )
+        .unwrap();
+        // From Trash, a move to Trash is a delete for good: never.
+        let in_trash = agent_ids(
+            &mut app,
+            agent::SearchArgs {
+                folder: Some("trash".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!in_trash.is_empty());
+        refused(
+            agent_now(
+                &mut app,
+                Call::MoveToTrash(agent::IdsArgs {
+                    ids: in_trash.clone(),
+                }),
+            ),
+            "only the user deletes mail for good",
+        );
+        let id = first_id(&mut app);
+        refused(
+            agent_now(
+                &mut app,
+                Call::MoveMessages(agent::MoveArgs {
+                    ids: vec![id.clone()],
+                    folder: "Trash".into(),
+                }),
+            ),
+            "Use move_to_trash",
+        );
+        refused(
+            agent_now(
+                &mut app,
+                Call::MoveToTrash(agent::IdsArgs {
+                    ids: vec![id.clone(); 51],
+                }),
+            ),
+            "At most 50",
+        );
+        refused(
+            agent_now(
+                &mut app,
+                Call::Star(agent::StarArgs {
+                    ids: vec!["bm9wZQ".into()],
+                    starred: true,
+                }),
+            ),
+            "isn't a message tuimail has",
+        );
+        // The user's own changes are theirs to undo.
+        app.focus = Focus::List;
+        app.on_key(key(KeyCode::Char('s')));
+        let mine = app.store.changes(1).unwrap().remove(0).id;
+        refused(
+            agent_now(&mut app, Call::UndoChange(agent::UndoArgs { change: mine })),
+            "the user's",
+        );
+        // An hour's worth of changes is the most.
+        app.agent_spent
+            .push_back((Instant::now(), agent::CHANGES_PER_HOUR, 0));
+        refused(
+            agent_now(
+                &mut app,
+                Call::Star(agent::StarArgs {
+                    ids: vec![id],
+                    starred: true,
+                }),
+            ),
+            "in the last hour",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_agent_reaches_tuimail_through_its_socket_while_the_setting_is_on() {
+        let mut app = app();
+        with_mail(&mut app);
+        let dir = std::env::temp_dir().join(format!("tm-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = agent::socket(&dir, false);
+        app.agent_socket = Some(socket.clone());
+        app.settings.agents = true;
+        app.listen_for_agents();
+        assert!(app.agents.is_some());
+        let request = agent::Request {
+            client: "Claude Code".into(),
+            call: Call::ListAccounts,
+        };
+        let asked = {
+            let (socket, request) = (socket.clone(), request.clone());
+            tokio::spawn(async move { agent::ask(&socket, &request).await })
+        };
+        app.wait_until(|_| asked.is_finished()).await;
+        let accounts = asked.await.unwrap().unwrap();
+        assert_eq!(accounts[0]["address"], app.accounts[0].id.as_str());
+        app.settings.agents = false;
+        app.listen_for_agents();
+        assert!(!socket.exists(), "the socket goes");
+        assert_eq!(
+            agent::ask(&socket, &request).await.unwrap_err(),
+            agent::NOT_LISTENING
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

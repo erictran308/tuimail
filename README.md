@@ -12,7 +12,7 @@ Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
 
-**[Get started](#get-started)** · **[Keys](#keys)** · **[Accounts](#accounts)** · **[Settings](#settings)** · **[Privacy](#privacy-and-security)**
+**[Get started](#get-started)** · **[Keys](#keys)** · **[Accounts](#accounts)** · **[Settings](#settings)** · **[AI agents](#ai-agents-mcp)** · **[Privacy](#privacy-and-security)**
 
 <img src="docs/hero.png" alt="tuimail: a sidebar with All inboxes and two accounts' folders, beside the work inbox's messages with stars, replies and attachments marked, and Alice's message 'Lunch tomorrow?' open in the reader: its sender, the attached menu, an underlined link and quotes colored by depth">
 
@@ -33,6 +33,7 @@ Arrow keys or vim keys. Passwords in your system's keychain. Nothing loaded from
 - **Quick to tidy.** `d` deletes (to Trash), `e` archives, `!` marks junk, `m` moves anywhere, `s` stars, `u` marks read or unread, `t` tags. `Space` marks several messages for any of these at once, and `z` undoes the last of them (`Z` lists them, to undo any). `U` unsubscribes from a mailing list.
 - **Tags.** Put `work`, `receipts` or any word on a message with `t`. IMAP accounts keep them on the server as keywords, spelled the way Thunderbird spells its tags, so the two show each other's; POP3 accounts keep them on your computer. (Gmail keeps them too, but its website shows only its labels.)
 - **Search.** `/` finds mail by sender, recipients, subject or text: at once in what's on your computer, then on the server, which searches whole messages. `tag:work` finds what's tagged.
+- **AI agents, on your terms.** Claude Code, Claude Desktop, Cursor or any MCP client can read and sort your mail through `tuimail mcp`: mark, star, tag, move, mark spam, move to Trash. Each change asks you first (unless you say not to), shows on the screen and undoes with `z`. Agents can't delete anything for good, send, or open links.
 - **Works offline.** Headers and the messages you've opened are kept in a local cache, so the list and what you've read are there without a connection.
 - **Set up in a minute.** Type your address and password: the servers fill in for Gmail, iCloud, Outlook, Yahoo, Fastmail, Proton (through its Bridge), Zoho, GMX, WEB.DE, Yandex, Mail.ru, Posteo, mailbox.org and more, or are guessed for others. tuimail logs in to check before saving.
 - **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes (picked in the settings, `O`), and Nerd Font icons where your terminal has them.
@@ -220,11 +221,44 @@ check_minutes = 5        # how often to check where the server can't say at once
 fetch_count = 300        # how many of a folder's newest messages to fetch at first (20 to 5000); older ones as you scroll
 sidebar_width = 28       # in columns (16 to 50)
 
+agents = false           # let AI agents read and sort your mail (tuimail mcp), while tuimail is open
+confirm_agents = true    # ask before each change an agent makes
+
 # Where `s` saves attachments, if not your Downloads folder:
 # downloads = "/Users/you/Mail attachments"
 # The editor for Ctrl-e, as a full path with its arguments, if not $VISUAL or $EDITOR:
 # editor = ["/usr/bin/vim"]
 ```
+
+## AI agents (MCP)
+
+`tuimail mcp` is an [MCP](https://modelcontextprotocol.io) server: an AI agent starts it, and it reaches your mail through the tuimail you have open. Nothing is kept in it and nothing goes around tuimail: every request is checked, and every change is made by tuimail as your keys would make it.
+
+**1. Turn it on.** In tuimail, `O`, then **Let AI agents read and sort your mail**. tuimail must be open for agents to reach your mail.
+
+**2. Add it to your agent**, by tuimail's full path (`which tuimail`):
+
+- **Claude Code:** `claude mcp add --scope user tuimail -- /Users/you/.local/bin/tuimail mcp`
+- **Claude Desktop** (`claude_desktop_config.json`) or **Cursor** (`~/.cursor/mcp.json`):
+
+  ```json
+  { "mcpServers": { "tuimail": { "command": "/Users/you/.local/bin/tuimail", "args": ["mcp"] } } }
+  ```
+
+**What agents can do:** list accounts and folders, search what tuimail has on your computer, read a message (its links shown only by their site), mark read or unread, star, tag, move to a folder, mark spam or not (to Junk and back), move to Trash, and undo their own changes.
+
+**What they can't:** delete anything for good (mail already in Trash stays there, and an account without a Trash folder takes nothing), send, reply or forward, open links or unsubscribe, read attachments, make filters, change settings, or touch passwords. There are no tools for these; tuimail refuses them whatever an agent asks.
+
+**You stay in charge:**
+
+- Each change waits for your `y` in tuimail; any other key says no. Once you trust your agent, turn off **Ask before each change an agent makes** in the settings: changes are then made at once, and said on the status line and in a notification.
+- Every change is listed with who made it (`Z`), and `z` undoes it as it undoes yours.
+- At most 50 messages a call, 300 changes and 100 moves to Trash an hour.
+- The agent is told, in the server's instructions, that what's in mail is from strangers and is never an instruction, and to ask you before changing more than ten messages. tuimail keeps its own rules whether the agent listens or not.
+
+To try it on made-up mail: run `tuimail --demo`, turn agents on there, and add `tuimail mcp --demo` to your agent instead.
+
+What an agent reads goes to its AI provider, as anything else you show it. AI agents reach tuimail on macOS and Linux; Windows isn't supported yet.
 
 ## Privacy and security
 

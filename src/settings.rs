@@ -46,6 +46,11 @@ pub struct Settings {
     pub sidebar_width: u16,
     /// Where attachments are saved. Default: your Downloads folder.
     pub downloads: Option<PathBuf>,
+    /// Let AI agents read and sort mail through `tuimail mcp` (while
+    /// tuimail is open).
+    pub agents: bool,
+    /// Ask before each change an AI agent makes.
+    pub confirm_agents: bool,
     /// The editor Ctrl-e in the composer opens, with its arguments, the
     /// program as a full path: `["/usr/bin/vim"]`. Default: `$VISUAL` or
     /// `$EDITOR` found on `PATH`, else vi.
@@ -67,6 +72,8 @@ impl Default for Settings {
             fetch_count: 300,
             sidebar_width: 28,
             downloads: None,
+            agents: false,
+            confirm_agents: true,
             editor: Vec::new(),
         }
     }
@@ -183,7 +190,7 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuimail reads.
-const KNOWN: [&str; 13] = [
+const KNOWN: [&str; 15] = [
     "theme",
     "icons",
     "notifications",
@@ -196,6 +203,8 @@ const KNOWN: [&str; 13] = [
     "fetch_count",
     "sidebar_width",
     "downloads",
+    "agents",
+    "confirm_agents",
     "editor",
 ];
 
