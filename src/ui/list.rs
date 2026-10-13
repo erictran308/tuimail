@@ -326,6 +326,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_row_with_a_wide_emoji_keeps_its_dates_in_line() {
+        let mut app = app();
+        with_mail(&mut app);
+        let id = app.accounts[0].id.clone();
+        let raw = "From: Google <no-reply@accounts.google.example>\r\nTo: me@example.org\r\n\
+            Subject: \u{26A0}\u{FE0F} Your Gmail storage is almost full, act now\r\n\
+            Date: Mon, 1 Jan 2035 00:00:00 +0000\r\nMessage-ID: <w@x>\r\n\r\nhi\r\n";
+        app.store
+            .add_local(
+                &id,
+                "INBOX",
+                raw.as_bytes(),
+                crate::store::Flags::default(),
+                None,
+            )
+            .unwrap();
+        app.reload();
+        for width in [100, 120, 160] {
+            // Every row's date ends in the same column, two before the
+            // list's border: the emoji's row isn't a column longer.
+            let buffer = drawn(&mut app, width, 30);
+            let right = (29..width)
+                .find(|&x| buffer[(x, 1)].symbol() == "│")
+                .expect("the list's border");
+            let shown = screen(&mut app, width, 30);
+            for y in 1..8 {
+                let (last, gap) = (
+                    buffer[(right - 3, y)].symbol(),
+                    buffer[(right - 2, y)].symbol(),
+                );
+                assert!(last != " " && gap == " ", "row {y} at {width}:\n{shown}");
+            }
+            assert!(shown.contains("Your Gmail"), "{shown}");
+        }
+    }
+
+    #[tokio::test]
     async fn tags_follow_the_subject_in_their_color() {
         let mut app = app();
         with_mail(&mut app);

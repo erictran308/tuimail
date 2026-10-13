@@ -3510,6 +3510,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "unicode-segmentation",
  "unicode-width",
  "windows-native-keyring-store",
  "zbus-secret-service-keyring-store",

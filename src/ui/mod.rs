@@ -15,6 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, PickerKind, Place, PromptKind, plural};
@@ -137,15 +138,18 @@ pub fn fit(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
+    // By what shows as one character, measured as ratatui draws it: "⚠️"
+    // (a sign and a variation selector) is two columns, not its
+    // characters' one.
     let mut out = String::new();
     let mut used = 0;
-    for ch in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in text.graphemes(true) {
+        let w = grapheme.width();
         if used + w > width - 1 {
             break;
         }
         used += w;
-        out.push(ch);
+        out.push_str(grapheme);
     }
     out.push('…');
     out
@@ -176,15 +180,16 @@ pub fn fit_end(text: &str, width: usize) -> String {
     }
     let mut kept = Vec::new();
     let mut used = 0;
-    for ch in text.chars().rev() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in text.graphemes(true).rev() {
+        let w = grapheme.width();
         if used + w > width - 1 {
             break;
         }
         used += w;
-        kept.push(ch);
+        kept.push(grapheme);
     }
-    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+    kept.reverse();
+    format!("…{}", kept.concat())
 }
 
 /// `text` cut or padded to exactly `width` columns.
@@ -881,6 +886,23 @@ pub mod tests {
         assert_eq!(fit("abc", 0), "");
         assert_eq!(pad("ab", 4), "ab  ");
         assert_eq!(pad("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn an_emoji_drawn_wide_is_cut_as_wide() {
+        // A sign made an emoji by a variation selector: two columns, as
+        // ratatui and the terminal draw it, though each of its characters
+        // counts less.
+        let warning = "\u{26A0}\u{FE0F} Your Gmail storage is almost full";
+        for width in 1..20 {
+            assert!(fit(warning, width).width() <= width, "{width}");
+            assert!(fit_end(warning, width).width() <= width, "{width}");
+            assert!(fit_middle(warning, width).width() <= width, "{width}");
+            assert_eq!(pad(warning, width).width(), width, "{width}");
+        }
+        assert_eq!(fit(warning, 6), "\u{26A0}\u{FE0F} Yo…");
+        assert_eq!(fit("👨‍👩‍👧 family", 4), "👨‍👩‍👧 …");
+        assert_eq!(fit_end("full \u{26A0}\u{FE0F}", 4), "… \u{26A0}\u{FE0F}");
     }
 
     #[test]
