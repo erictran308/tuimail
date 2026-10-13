@@ -120,7 +120,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `H` | Reading: HTML or plain text |
 | `U` | Unsubscribe from a mailing list |
 | `R` | Check for mail now |
-| `+` / `x` / `P` | Add an account / remove it (on its row) / type its password |
+| `+` / `x` / `P` | Add an account / remove it (on its row) / type its password, or sign in |
 | `?` / `O` | Every key / the settings and themes |
 | `q` | Quit |
 
@@ -176,9 +176,31 @@ password_command = ["/opt/homebrew/bin/pass", "show", "mail/work"]
 
 The program is given by its full path and run without a shell; tuimail uses the first line it prints. It runs once at start with your terminal, so it can ask you to unlock something.
 
-### OAuth2 (Outlook.com, Microsoft 365, Gmail without app passwords)
+### Signing in with Microsoft or Google (OAuth2)
 
-Outlook.com takes only OAuth2. tuimail logs in with XOAUTH2 using an access token printed by a command, run again for each connection so a short-lived token stays fresh. [oama](https://github.com/pdobsan/oama) and the `mutt_oauth2.py` script both do this:
+Outlook.com takes only OAuth2, Microsoft 365 is moving to it, and Gmail takes it as well as app passwords. tuimail signs in itself: add the account with `+` and leave the password empty, and `Ctrl-s` opens your browser on Microsoft's or Google's sign-in page. Once you've signed in there, the browser comes back to tuimail (on this computer only), and tuimail keeps the sign-in in your keychain: a token that lasts, never your password. If the sign-in is taken back (your password changed, the app was removed from your account), tuimail says so, and `P` on the account's row signs in again.
+
+**An app to sign in as.** Microsoft and Google sign people in only for apps registered with them. Until tuimail has registrations of its own, register one for yourself (free, about ten minutes) and name it in `accounts.toml`:
+
+- **Microsoft** (Outlook.com, Hotmail, Microsoft 365): at [entra.microsoft.com](https://entra.microsoft.com), **App registrations** → **New registration**. Name it, pick **Accounts in any organizational directory and personal Microsoft accounts**, and as the redirect URI choose **Public client/native (mobile & desktop)** with `http://localhost`. Copy its **Application (client) ID**.
+- **Google** (Gmail): at [console.cloud.google.com](https://console.cloud.google.com), make a project and turn on the **Gmail API**. In **Google Auth Platform**, set up the consent screen (External), add the scope `https://mail.google.com/`, and either add yourself as a test user (then you sign in again every 7 days) or publish the app. Then **Clients** → **Create client** → **Desktop app**, and copy its client ID and secret (a desktop app's "secret" isn't one: Google says so).
+
+```toml
+[[account]]
+email = "me@outlook.com"
+host = "outlook.office365.com"
+smtp_host = "smtp-mail.outlook.com"
+smtp_port = 587
+smtp_security = "starttls"
+auth = "oauth2"
+oauth_client_id = "your Application (client) ID"
+# Google only:
+# oauth_client_secret = "the client's secret"
+```
+
+Start tuimail, and `P` on the account's row signs in. `tuimail --check` says which accounts sign in.
+
+**Or with a program of yours.** tuimail also logs in with an access token printed by a command, run again for each connection so a short-lived token stays fresh. [oama](https://github.com/pdobsan/oama) and the `mutt_oauth2.py` script both do this:
 
 ```toml
 auth = "oauth2"
@@ -265,6 +287,7 @@ What an agent reads goes to its AI provider, as anything else you show it. AI ag
 ## Privacy and security
 
 - **Nothing fetched to read.** HTML is turned into text on your computer; pictures are shown by their description, never downloaded, so senders can't tell when you read their mail.
+- **Signing in keeps no password.** With Microsoft or Google, you sign in on their page in your browser; tuimail keeps only the sign-in's token, in your keychain, and gets short-lived ones with it as needed. The browser comes back to tuimail on this computer only, and a sign-in is good only to the tuimail that asked for it (PKCE).
 - **Passwords stay out of files.** They're in your system's keychain (macOS Keychain, Windows Credential Manager, the Secret Service on Linux), asked for at each start, or printed by your own command. Never in `accounts.toml`, never on a command line.
 - **TLS, checked.** Connections use TLS (or STARTTLS, which must succeed before anything is sent) and your system's trusted certificates. An unencrypted connection is allowed only to a server on your own computer, at its loopback address; on Linux, only if that server runs as you or the system. On a computer shared with other accounts, prefer STARTTLS with `certificate` (as for Proton Mail Bridge): there, any account could answer on a free port.
 - **Nothing about your computer in what you send.** Messages go out with a random Message-ID and a UTC date, and tuimail greets SMTP servers as `[127.0.0.1]`, so your computer's name never ends up in mail headers.

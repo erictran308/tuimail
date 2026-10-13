@@ -40,8 +40,10 @@ pub enum Auth {
     /// A password (or an app password).
     #[default]
     Password,
-    /// An OAuth2 access token (XOAUTH2), from `password_command`, which is
-    /// run again for each connection, so a short-lived token stays fresh.
+    /// An OAuth2 access token (XOAUTH2): from signing in with Microsoft or
+    /// Google in the browser (`oauth.rs`), or from `password_command`,
+    /// which is run again for each connection, so a short-lived token
+    /// stays fresh.
     Oauth2,
 }
 
@@ -81,6 +83,13 @@ pub struct Account {
     /// `["/opt/homebrew/bin/pass", "show", "mail/work"]`. The program as a
     /// full path; no shell runs it.
     pub password_command: Vec<String>,
+    /// OAuth2 signing in here: the app registered with Microsoft or Google
+    /// to sign in as, if not tuimail's (`oauth.rs`), and Google's secret
+    /// for it (which, for a desktop app, isn't one).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub oauth_client_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub oauth_client_secret: String,
     /// The SMTP server mail is sent through.
     pub smtp_host: String,
     pub smtp_port: Option<u16>,
@@ -120,6 +129,8 @@ impl Default for Account {
             auth: Auth::Password,
             password: PasswordFrom::Keychain,
             password_command: Vec::new(),
+            oauth_client_id: String::new(),
+            oauth_client_secret: String::new(),
             smtp_host: String::new(),
             smtp_port: None,
             smtp_security: Security::Tls,
@@ -242,7 +253,26 @@ impl Account {
         {
             return Some("its username has control characters".into());
         }
-        let needs_command = self.password == PasswordFrom::Command || self.auth == Auth::Oauth2;
+        if crate::oauth::built_in(self) {
+            match crate::oauth::provider_for(self) {
+                None => {
+                    return Some(
+                        "OAuth2 signs in here with Microsoft or Google only: for other servers \
+                         set password_command"
+                            .into(),
+                    );
+                }
+                Some(provider) if crate::oauth::client_for(self).is_none() => {
+                    return Some(format!(
+                        "signing in with {} needs oauth_client_id (see OAuth2 in tuimail's README)",
+                        provider.name()
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let needs_command = self.password == PasswordFrom::Command
+            || (self.auth == Auth::Oauth2 && !crate::oauth::built_in(self));
         if needs_command {
             match self.password_command.first() {
                 None => return Some("it needs a password_command".into()),
@@ -371,7 +401,14 @@ fn unknown_keys(text: &str) -> Vec<String> {
     for account in accounts.into_iter().flatten().filter_map(|a| a.as_table()) {
         // Options that are None aren't serialized, so they're added here.
         for key in account.keys() {
-            let optional = ["port", "smtp_port", "save_sent", "certificate"];
+            let optional = [
+                "port",
+                "smtp_port",
+                "save_sent",
+                "certificate",
+                "oauth_client_id",
+                "oauth_client_secret",
+            ];
             if !known.contains(key) && !optional.contains(&key.as_str()) {
                 unknown.push(format!(
                     "accounts.toml: tuimail doesn't know {}",
@@ -645,6 +682,39 @@ mod tests {
         assert_eq!(a.username(), "a@b.c");
         a.username = "alice".into();
         assert_eq!((a.username(), a.smtp_username()), ("alice", "alice"));
+    }
+
+    #[test]
+    fn signing_in_needs_microsoft_or_google_and_an_app_to_sign_in_as() {
+        let outlook = guess("me@outlook.com", Protocol::Imap).0;
+        assert_eq!(outlook.auth, Auth::Oauth2);
+        let own = Account {
+            oauth_client_id: "my-app".into(),
+            ..outlook.clone()
+        };
+        assert_eq!(own.problem(), None);
+        if crate::oauth::MICROSOFT_CLIENT_ID.is_empty() {
+            assert!(outlook.problem().unwrap().contains("oauth_client_id"));
+        }
+        let elsewhere = Account {
+            host: "imap.example.org".into(),
+            ..own.clone()
+        };
+        assert!(elsewhere.problem().unwrap().contains("password_command"));
+        // With a command, it's the command's token, as before.
+        let command = Account {
+            password_command: vec!["/usr/bin/oama".into(), "access".into()],
+            ..elsewhere
+        };
+        assert_eq!(command.problem(), None);
+        // The app's keys are written only when set.
+        let text = toml::to_string(&outlook).unwrap();
+        assert!(!text.contains("oauth_client"), "{text}");
+        assert!(
+            toml::to_string(&own)
+                .unwrap()
+                .contains("oauth_client_id = \"my-app\"")
+        );
     }
 
     #[test]

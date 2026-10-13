@@ -1,6 +1,8 @@
 //! Passwords: kept in the system's keychain, asked for each start, or
-//! printed by a command of yours. Never written to a file by tuimail, never
-//! on a command line, never in a message or log.
+//! printed by a command of yours; for accounts that sign in with Microsoft
+//! or Google here (`oauth.rs`), the refresh token instead, in the keychain,
+//! and access tokens got with it, in memory. Never written to a file by
+//! tuimail, never on a command line, never in a message or log.
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -11,6 +13,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 
 use crate::account::{Account, Auth, PasswordFrom};
+use crate::oauth::{self, Tokens};
 use crate::text;
 
 /// The keychain's name for tuimail's entries.
@@ -168,6 +171,9 @@ pub struct Credentials {
     /// from there again until a new one is typed, so a wrong password isn't
     /// tried again and again (which can lock the account).
     keychain_refused: Arc<std::sync::atomic::AtomicBool>,
+    /// Signing in here: the tokens got, the access token renewed with the
+    /// refresh token when it runs out.
+    tokens: Arc<Mutex<Option<Tokens>>>,
 }
 
 /// No password is known: tuimail must ask.
@@ -191,12 +197,20 @@ impl Credentials {
             secret: Arc::new(Mutex::new(None)),
             keychain,
             keychain_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tokens: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Whether the password comes from a command, run for each login.
     fn uses_command(&self) -> bool {
-        self.account.password == PasswordFrom::Command || self.account.auth == Auth::Oauth2
+        self.account.password == PasswordFrom::Command
+            || (self.account.auth == Auth::Oauth2 && !self.signs_in())
+    }
+
+    /// Whether the account signs in with Microsoft or Google here: its
+    /// "password" is a token got with the refresh token.
+    pub fn signs_in(&self) -> bool {
+        oauth::built_in(&self.account)
     }
 
     /// Whether the keychain keeps this account's password.
@@ -207,6 +221,9 @@ impl Credentials {
     /// The password to log in with: kept in memory, else from the
     /// keychain, else the command's; `NeedPassword` if it must be asked.
     pub async fn get(&self) -> Result<Secret> {
+        if self.signs_in() {
+            return self.access_token().await;
+        }
         if self.uses_command() {
             // After a refusal, no login until the user asks again (R):
             // trying the same refused password at every check can lock the
@@ -237,6 +254,59 @@ impl Credentials {
         Err(anyhow!(NeedPassword))
     }
 
+    /// An access token: the one in memory while it lasts, else a new one
+    /// for the refresh token (in memory, else the keychain's).
+    /// `NeedPassword` if there's none, or the provider took it back: the
+    /// user signs in again.
+    async fn access_token(&self) -> Result<Secret> {
+        if self
+            .keychain_refused
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!(NeedPassword));
+        }
+        // Held while refreshing: the account's connections wait for one
+        // refresh rather than each making its own.
+        let mut kept = self.tokens.lock().await;
+        if let Some(tokens) = kept.as_ref().filter(|t| t.fresh()) {
+            return Ok(tokens.access.clone());
+        }
+        let refresh = match kept.as_ref().and_then(|t| t.refresh.clone()) {
+            Some(refresh) => refresh,
+            None if self.uses_keychain() => keychain_get(&self.id)
+                .await?
+                .ok_or_else(|| anyhow!(NeedPassword))?,
+            None => return Err(anyhow!(NeedPassword)),
+        };
+        let client = oauth::client_for(&self.account)
+            .ok_or_else(|| anyhow!("this account can't sign in: see OAuth2 in tuimail's README"))?;
+        match oauth::refresh(&client, &refresh).await {
+            Ok(mut tokens) => {
+                // Not every refresh brings a new refresh token.
+                if tokens.refresh.is_none() {
+                    tokens.refresh = Some(refresh);
+                }
+                let access = tokens.access.clone();
+                *kept = Some(tokens);
+                Ok(access)
+            }
+            Err(e) if e.downcast_ref::<oauth::SignInAgain>().is_some() => {
+                *kept = None;
+                self.keychain_refused
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow!(NeedPassword))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Uses the tokens of a sign-in from now on.
+    pub async fn set_tokens(&self, tokens: Tokens) {
+        *self.tokens.lock().await = Some(tokens);
+        self.keychain_refused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Uses `secret` from now on (typed in tuimail).
     pub async fn set(&self, secret: Secret) {
         *self.secret.lock().await = Some(secret);
@@ -247,7 +317,7 @@ impl Credentials {
     /// The user asks to try again (R): a password command is run again
     /// after a refusal.
     pub fn retry(&self) {
-        if self.uses_command() {
+        if self.uses_command() || self.signs_in() {
             self.keychain_refused
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }
@@ -258,16 +328,27 @@ impl Credentials {
     /// again until the user asks (R).
     pub async fn refused(&self) {
         *self.secret.lock().await = None;
+        *self.tokens.lock().await = None;
         self.keychain_refused
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Keeps the password in the keychain, once the server took it.
+    /// Signing in here, the refresh token is what's kept.
     pub async fn remember(&self) -> Result<()> {
         if !self.uses_keychain() {
             return Ok(());
         }
-        let Some(secret) = self.secret.lock().await.clone() else {
+        let kept = if self.signs_in() {
+            self.tokens
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|t| t.refresh.clone())
+        } else {
+            self.secret.lock().await.clone()
+        };
+        let Some(secret) = kept else {
             return Ok(());
         };
         if keychain_get(&self.id).await.ok().flatten().as_ref() == Some(&secret) {
@@ -315,6 +396,34 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn signing_in_gives_its_access_token_until_the_server_refuses_it() {
+        let account = Account {
+            email: "me@outlook.com".into(),
+            host: "outlook.office365.com".into(),
+            auth: Auth::Oauth2,
+            oauth_client_id: "my-app".into(),
+            ..Account::default()
+        };
+        let creds = Credentials::new(Arc::new(account), false);
+        assert!(creds.signs_in());
+        let need = |r: Result<Secret>| r.unwrap_err().downcast_ref::<NeedPassword>().is_some();
+        assert!(need(creds.get().await), "not signed in yet");
+        creds
+            .set_tokens(Tokens {
+                access: Secret::new("at"),
+                refresh: Some(Secret::new("rt")),
+                renew_at: std::time::Instant::now() + Duration::from_secs(600),
+            })
+            .await;
+        assert_eq!(creds.get().await.unwrap().expose(), "at");
+        // Refused: forgotten, and the user signs in again.
+        creds.refused().await;
+        assert!(need(creds.get().await));
+        creds.retry();
+        assert!(need(creds.get().await), "nothing to refresh with");
     }
 
     #[cfg(unix)]

@@ -103,7 +103,17 @@ pub enum AppEvent {
         previews: Vec<(String, u32, String)>,
     },
     /// The setup form's login check.
-    Checked { result: Result<(), String> },
+    Checked {
+        result: Result<Option<crate::oauth::Tokens>, String>,
+    },
+    /// A sign-in with Microsoft or Google waits for the browser: open it
+    /// on `url`.
+    SignInOpened { url: String },
+    /// A sign-in finished, for the account with this id.
+    SignedIn {
+        account: String,
+        result: Result<crate::oauth::Tokens, String>,
+    },
     /// The terminal closed, or tuimail was asked to stop (Unix signals).
     #[cfg_attr(not(unix), allow(dead_code))]
     Quit,
@@ -541,6 +551,8 @@ pub struct App {
     pub agent_socket: Option<PathBuf>,
     /// Listening for AI agents (the setting on).
     agents: Option<agent::Listener>,
+    /// A sign-in waits for the browser.
+    signing_in: bool,
     /// Agents' changes waiting for the user's `y`, oldest first.
     pub agent_asks: VecDeque<AgentAsk>,
     next_ask: u64,
@@ -701,6 +713,7 @@ impl App {
             change: None,
             agent_socket: None,
             agents: None,
+            signing_in: false,
             agent_asks: VecDeque::new(),
             next_ask: 0,
             agent_reads: Vec::new(),
@@ -1137,6 +1150,8 @@ impl App {
                 }
             }
             AppEvent::Checked { result } => self.on_checked(result),
+            AppEvent::SignInOpened { url } => self.open_sign_in(&url),
+            AppEvent::SignedIn { account, result } => self.on_signed_in(&account, result),
             AppEvent::Quit => self.quit = true,
         }
     }
@@ -1148,9 +1163,14 @@ impl App {
                 let name = self.account_name(i);
                 if let State::NeedPassword { refused } = &state {
                     let refused = *refused;
+                    let signs_in = crate::oauth::built_in(&self.accounts[i].account);
                     let from_command = self.accounts[i].account.password == PasswordFrom::Command
                         || self.accounts[i].account.auth == account::Auth::Oauth2;
-                    if from_command {
+                    if signs_in {
+                        self.error(format!(
+                            "{name} needs you to sign in: P on its row opens your browser"
+                        ));
+                    } else if from_command {
                         self.error(format!(
                             "{name}: the server refused password_command's password; R tries again"
                         ));
@@ -2526,6 +2546,65 @@ impl App {
         self.take_off_list(&keys);
         if self.shows(account, to) {
             self.reload();
+        }
+    }
+
+    // Signing in with Microsoft or Google (`oauth.rs`).
+
+    /// Signs account `i` in again, in the browser.
+    fn sign_in(&mut self, i: usize) {
+        if self.signing_in {
+            return self.info("A sign-in is waiting in your browser");
+        }
+        let account = self.accounts[i].account.clone();
+        let Some(client) = crate::oauth::client_for(&account) else {
+            return self.error(format!(
+                "{} can't sign in: see OAuth2 in tuimail's README",
+                self.account_name(i)
+            ));
+        };
+        self.signing_in = true;
+        let (tx, id) = (self.tx.clone(), self.accounts[i].id.clone());
+        tokio::spawn(async move {
+            let result = sign_in(client, &account.email, &tx).await;
+            let _ = tx.send(AppEvent::SignedIn {
+                account: id,
+                result: result.map_err(|e| text::one_line(&format!("{e:#}"), 300)),
+            });
+        });
+    }
+
+    /// The browser opens on the provider's sign-in page; the link is
+    /// copied too, for when it doesn't.
+    fn open_sign_in(&mut self, url: &str) {
+        self.signing_in = true;
+        if self.demo {
+            return;
+        }
+        let opened = tools::open_externally(url).is_ok();
+        self.copy_quietly(url);
+        self.info(if opened {
+            "Sign in in your browser (the link is copied, if it didn't open)"
+        } else {
+            "Paste the copied link in your browser to sign in"
+        });
+    }
+
+    fn on_signed_in(&mut self, id: &str, result: Result<crate::oauth::Tokens, String>) {
+        self.signing_in = false;
+        let Some(i) = self.account_index(id) else {
+            return;
+        };
+        match result {
+            Ok(tokens) => {
+                if let Some(worker) = &self.accounts[i].worker {
+                    futures::executor::block_on(worker.creds.set_tokens(tokens));
+                }
+                self.accounts[i].state = State::Connecting;
+                self.check(i, true);
+                self.info(format!("{}: signed in", self.account_name(i)));
+            }
+            Err(e) => self.error(format!("{}: {e}", self.account_name(i))),
         }
     }
 
@@ -4449,7 +4528,11 @@ impl App {
                 if let Some(Row::Account(i) | Row::Folder(i, _, _)) =
                     rows.get(self.sidebar_selected)
                 {
-                    self.prompt = Some(Prompt::new(PromptKind::Password(*i), ""));
+                    if crate::oauth::built_in(&self.accounts[*i].account) {
+                        self.sign_in(*i);
+                    } else {
+                        self.prompt = Some(Prompt::new(PromptKind::Password(*i), ""));
+                    }
                 }
             }
             KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
@@ -4699,6 +4782,15 @@ impl App {
     /// Copies `text` to the clipboard, or through the terminal (OSC 52)
     /// where there's no clipboard to reach (over SSH).
     fn copy(&mut self, text: &str) {
+        if self.copy_quietly(text) {
+            self.info("Copied");
+        } else {
+            self.error("Couldn't copy it");
+        }
+    }
+
+    /// Copies `text`; whether it was.
+    fn copy_quietly(&mut self, text: &str) -> bool {
         if self.clipboard.is_none() {
             self.clipboard = arboard::Clipboard::new().ok();
         }
@@ -4706,11 +4798,7 @@ impl App {
             .clipboard
             .as_mut()
             .is_some_and(|c| c.set_text(text.to_string()).is_ok());
-        if copied || copy_through_terminal(text).is_ok() {
-            self.info("Copied");
-        } else {
-            self.error("Couldn't copy it");
-        }
+        copied || copy_through_terminal(text).is_ok()
     }
 
     fn confirm(&mut self, confirm: Confirm) {
@@ -4972,7 +5060,7 @@ impl App {
             return;
         }
         if skip || self.demo {
-            let _ = self.tx.send(AppEvent::Checked { result: Ok(()) });
+            let _ = self.tx.send(AppEvent::Checked { result: Ok(None) });
             setup.checking = true;
             return;
         }
@@ -4980,24 +5068,41 @@ impl App {
         setup.error = None;
         let password = setup.password();
         let tx = self.tx.clone();
+        // Signing in: the browser first, then the login with its token.
+        let client = crate::oauth::built_in(&account)
+            .then(|| crate::oauth::client_for(&account))
+            .flatten();
         tokio::spawn(async move {
-            let result = check_login(&account, &password).await;
+            let result = async {
+                let Some(client) = client else {
+                    check_login(&account, &password).await?;
+                    return Ok(None);
+                };
+                let tokens = sign_in(client, &account.email, &tx).await?;
+                check_login(&account, tokens.access.expose()).await?;
+                Ok(Some(tokens))
+            }
+            .await;
             let _ = tx.send(AppEvent::Checked {
-                result: result.map_err(|e| text::one_line(&format!("{e:#}"), 300)),
+                result: result.map_err(|e: anyhow::Error| text::one_line(&format!("{e:#}"), 300)),
             });
         });
     }
 
-    fn on_checked(&mut self, result: Result<(), String>) {
+    fn on_checked(&mut self, result: Result<Option<crate::oauth::Tokens>, String>) {
         let keychain = self.keychain;
         let Some(setup) = self.setup.as_mut() else {
             return;
         };
         setup.checking = false;
-        if let Err(e) = result {
-            setup.error = Some(format!("{e} · Ctrl-f saves it anyway"));
-            return;
-        }
+        self.signing_in = false;
+        let tokens = match result {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                setup.error = Some(format!("{e} · Ctrl-f saves it anyway"));
+                return;
+            }
+        };
         let Ok(account) = setup.account(keychain) else {
             return;
         };
@@ -5008,9 +5113,17 @@ impl App {
             setup.error = Some(format!("{e:#}"));
             return;
         }
-        if account.password == PasswordFrom::Keychain && !self.demo {
+        // The login worked: what it took is kept (the refresh token, when
+        // signing in).
+        let kept = match &tokens {
+            Some(tokens) => tokens.refresh.clone(),
+            None => Some(Secret::new(password.clone())),
+        };
+        if account.password == PasswordFrom::Keychain
+            && !self.demo
+            && let Some(secret) = kept
+        {
             let id = account.id();
-            let secret = Secret::new(password.clone());
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 if let Err(e) = crate::secrets::keychain_set(&id, &secret).await {
@@ -5022,7 +5135,11 @@ impl App {
         }
         self.setup = None;
         let name = account.shown_name();
-        let i = self.add_account(account, Some(Secret::new(password)));
+        let password = tokens.is_none().then(|| Secret::new(password));
+        let i = self.add_account(account, password);
+        if let (Some(tokens), Some(worker)) = (tokens, &self.accounts[i].worker) {
+            futures::executor::block_on(worker.creds.set_tokens(tokens));
+        }
         let inbox = self.accounts[i].inbox();
         self.open_place(Place::Folder {
             account: i,
@@ -5033,6 +5150,20 @@ impl App {
         self.focus = Focus::List;
         self.info(format!("Added {name}"));
     }
+}
+
+/// Signs in with the browser: the link goes to the app to open, and the
+/// tokens come back once the browser does.
+async fn sign_in(
+    client: crate::oauth::Client,
+    email: &str,
+    tx: &UnboundedSender<AppEvent>,
+) -> Result<crate::oauth::Tokens> {
+    let sign_in = crate::oauth::SignIn::start(client, email).await?;
+    let _ = tx.send(AppEvent::SignInOpened {
+        url: sign_in.url.clone(),
+    });
+    sign_in.finish().await
 }
 
 /// Logs in to an account's servers, receiving and sending, to check them.
@@ -6750,5 +6881,46 @@ pub mod tests {
             agent::NOT_LISTENING
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    async fn p_signs_an_account_in_and_a_finished_sign_in_logs_in() {
+        let mut app = app();
+        with_mail(&mut app);
+        let mut account = (*app.accounts[0].account).clone();
+        account.host = "outlook.office365.com".into();
+        account.auth = account::Auth::Oauth2;
+        account.oauth_client_id = String::new();
+        app.accounts[0].account = Arc::new(account.clone());
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = 1;
+        app.on_key(key(KeyCode::Char('P')));
+        if crate::oauth::MICROSOFT_CLIENT_ID.is_empty() {
+            let status = app.status.as_ref().unwrap();
+            assert!(
+                status.error && status.text.contains("can't sign in"),
+                "{}",
+                status.text
+            );
+        }
+        assert!(app.prompt.is_none(), "no password to type");
+        // With an app to sign in as, the browser's sign-in starts.
+        account.oauth_client_id = "my-app".into();
+        app.accounts[0].account = Arc::new(account);
+        app.on_key(key(KeyCode::Char('P')));
+        assert!(app.signing_in);
+        app.wait_until(|_| true).await;
+        let id = app.accounts[0].id.clone();
+        app.on_signed_in(
+            &id,
+            Ok(crate::oauth::Tokens {
+                access: Secret::new("at"),
+                refresh: Some(Secret::new("rt")),
+                renew_at: Instant::now() + Duration::from_secs(600),
+            }),
+        );
+        assert!(!app.signing_in);
+        assert_eq!(app.status.as_ref().unwrap().text, "work: signed in");
+        app.on_signed_in(&id, Err("the sign-in was refused: no".into()));
+        assert!(app.status.as_ref().unwrap().error);
     }
 }

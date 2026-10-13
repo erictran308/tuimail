@@ -5,8 +5,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_textarea::{CursorMove, TextArea};
 
-use crate::account::{self, Account, PasswordFrom, Protocol, Security};
-use crate::text;
+use crate::account::{self, Account, Auth, PasswordFrom, Protocol, Security};
+use crate::{oauth, text};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
@@ -169,7 +169,15 @@ impl Setup {
         self.smtp_host = input(&guess.smtp_host);
         self.smtp_port = input(&guess.smtp_port().to_string());
         self.smtp_security = guess.smtp_security;
-        self.note = note.to_string();
+        self.note = match oauth::client_for(&guess).map(|c| c.provider) {
+            Some(oauth::Provider::Microsoft) => {
+                "Signs in with Microsoft in your browser: leave the password empty".into()
+            }
+            Some(oauth::Provider::Google) => {
+                "An app password, or leave it empty to sign in with Google in your browser".into()
+            }
+            None => note.to_string(),
+        };
     }
 
     fn toggle(&mut self, row: Row, by: isize) {
@@ -286,9 +294,6 @@ impl Setup {
         if !account::valid_address(&email) {
             return Err("Type your email address".into());
         }
-        if self.password().is_empty() {
-            return Err("Type your password (or app password)".into());
-        }
         let port = |input: &TextArea, what: &str| -> Result<Option<u16>, String> {
             let text = value(input);
             if text.is_empty() {
@@ -304,7 +309,7 @@ impl Setup {
         let name = value(&self.name);
         // No `name`: the sidebar shows the address, which tells two
         // accounts at one provider apart.
-        let account = Account {
+        let mut account = Account {
             email: email.clone(),
             display_name: name,
             protocol: self.protocol,
@@ -323,10 +328,28 @@ impl Setup {
             smtp_security: self.smtp_security,
             ..Account::default()
         };
-        if account.auth == account::Auth::Oauth2 {
-            return Err(
-                "This provider needs OAuth2: add it to accounts.toml (see tuimail's README)".into(),
-            );
+        // Microsoft and Google sign in in the browser when no password is
+        // typed and there's an app to sign in as (Outlook.com takes
+        // nothing else); others need a password.
+        let typed = !self.password().is_empty();
+        let can_sign_in = oauth::client_for(&account).is_some();
+        account.auth = if !typed && (can_sign_in || account.auth == Auth::Oauth2) {
+            Auth::Oauth2
+        } else {
+            Auth::Password
+        };
+        if account.auth == Auth::Password && !typed {
+            return Err("Type your password (or app password)".into());
+        }
+        if account.auth == Auth::Oauth2 && oauth::client_for(&account).is_none() {
+            return Err(match oauth::provider_for(&account) {
+                Some(p) => format!(
+                    "Signing in with {} needs an app registered with it: see OAuth2 in \
+                     tuimail's README",
+                    p.name()
+                ),
+                None => "This provider needs OAuth2: see OAuth2 in tuimail's README".into(),
+            });
         }
         if let Some(problem) = account.problem() {
             return Err(format!("The account can't be used: {problem}"));
@@ -357,7 +380,10 @@ mod tests {
         assert_eq!(value(&setup.host), "imap.gmail.com");
         assert_eq!(value(&setup.smtp_port), "465");
         assert!(setup.note.contains("app password"));
-        assert!(setup.account(true).unwrap_err().contains("password"));
+        // No app registered for signing in: an app password it is.
+        if oauth::GOOGLE_CLIENT_ID.is_empty() {
+            assert!(setup.account(true).unwrap_err().contains("password"));
+        }
         typed(&mut setup, "abcd efgh");
         assert_eq!(
             setup.on_key(key(KeyCode::Enter)),
@@ -379,6 +405,26 @@ mod tests {
         setup.row = ROWS.iter().position(|r| *r == Row::Port).unwrap();
         typed(&mut setup, "x");
         assert_eq!(value(&setup.port), "995");
+    }
+
+    #[test]
+    fn outlook_signs_in_in_the_browser_or_says_what_it_needs() {
+        let mut setup = Setup::default();
+        typed(&mut setup, "me@outlook.com");
+        setup.on_key(key(KeyCode::Tab));
+        assert_eq!(value(&setup.host), "outlook.office365.com");
+        match setup.account(true) {
+            Ok(account) => {
+                assert!(!oauth::MICROSOFT_CLIENT_ID.is_empty());
+                assert_eq!(account.auth, Auth::Oauth2);
+                assert!(oauth::built_in(&account));
+                assert!(setup.note.contains("Signs in with Microsoft"));
+            }
+            Err(e) => {
+                assert!(oauth::MICROSOFT_CLIENT_ID.is_empty());
+                assert!(e.contains("registered with it"), "{e}");
+            }
+        }
     }
 
     #[test]

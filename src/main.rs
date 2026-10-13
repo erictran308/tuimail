@@ -13,6 +13,7 @@ mod mail;
 mod mcp;
 mod net;
 mod notify;
+mod oauth;
 mod pop3;
 mod secrets;
 mod settings;
@@ -102,7 +103,9 @@ async fn run() -> Result<()> {
     // be unlocked (gpg, a password manager) can ask.
     let mut passwords = HashMap::new();
     for account in &accounts {
-        if account.password == PasswordFrom::Command || account.auth == Auth::Oauth2 {
+        let command = account.password == PasswordFrom::Command
+            || (account.auth == Auth::Oauth2 && !oauth::built_in(account));
+        if command {
             match secrets::run_command(&account.password_command, true).await {
                 Ok(secret) if account.auth != Auth::Oauth2 => {
                     passwords.insert(account.id(), secret);
@@ -186,7 +189,16 @@ fn print_check(
             account::Protocol::Imap => "IMAP",
             account::Protocol::Pop3 => "POP3",
         };
+        let signs_in = oauth::provider_for(a)
+            .filter(|_| oauth::built_in(a))
+            .map(|p| match a.password {
+                PasswordFrom::Keychain => {
+                    format!("signs in with {} (kept in the keychain)", p.name())
+                }
+                _ => format!("signs in with {} (each start)", p.name()),
+            });
         let password = match (a.auth, a.password) {
+            _ if signs_in.is_some() => signs_in.as_deref().unwrap_or_default(),
             (Auth::Oauth2, _) => "OAuth2 token from password_command",
             (_, PasswordFrom::Keychain) => "keychain",
             (_, PasswordFrom::Ask) => "asked",
