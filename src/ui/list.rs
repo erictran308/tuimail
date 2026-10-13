@@ -210,8 +210,12 @@ fn row(
     };
     let folder_width = folder.width().min(text_width);
     let folder = fit(&folder, folder_width);
-    let subject = fit(&subject, text_width.saturating_sub(folder.width()));
-    let mut spare = text_width.saturating_sub(folder.width() + subject.width());
+    // Tags after the subject, in at most a third of its room.
+    let tags: String = m.flags.tags.iter().map(|t| format!(" #{t}")).collect();
+    let room = text_width.saturating_sub(folder.width());
+    let tags = fit(&tags, tags.width().min(room / 3));
+    let subject = fit(&subject, room.saturating_sub(tags.width()));
+    let mut spare = room.saturating_sub(subject.width() + tags.width());
     let preview = if spare > 4 && !m.preview.is_empty() {
         let p = fit(&format!(" · {}", m.preview), spare);
         spare -= p.width();
@@ -233,6 +237,7 @@ fn row(
         Span::raw(" "),
         Span::styled(folder, Style::new().fg(c.dim)),
         Span::styled(subject, subject_style),
+        Span::styled(tags, Style::new().fg(c.tag)),
         Span::styled(preview, Style::new().fg(c.dim)),
         Span::raw(" ".repeat(spare)),
         Span::styled(
@@ -279,5 +284,23 @@ mod tests {
             "unread"
         );
         assert!(shown.contains("2 unread"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn tags_follow_the_subject_in_their_color() {
+        let mut app = app();
+        with_mail(&mut app);
+        let shown = screen(&mut app, 160, 30);
+        let y = shown
+            .lines()
+            .position(|l| l.contains("Quarterly numbers #work"))
+            .expect(&shown);
+        let line = shown.lines().nth(y).unwrap();
+        let x = line[..line.find("#work").unwrap()].chars().count() as u16;
+        let buffer = drawn(&mut app, 160, 30);
+        assert_eq!(buffer[(x, y as u16)].fg, app.colors.tag);
+        // A narrow list keeps the subject, and cuts the tags.
+        let narrow = screen(&mut app, 70, 30);
+        assert!(narrow.contains("Quarterly"), "{narrow}");
     }
 }

@@ -260,6 +260,7 @@ fn hints(app: &App) -> &'static str {
             PromptKind::Search => "`Enter` search · `Esc` cancel · `Ctrl-u` clear",
             PromptKind::Password(_) => "`Enter` log in · `Esc` later",
             PromptKind::Attach => "`Enter` attach · `Esc` cancel",
+            PromptKind::Tag => "`Enter` tag · `Esc` cancel",
         };
     }
     if app.picker.is_some() || app.help.is_some() || app.confirm.is_some() {
@@ -276,13 +277,13 @@ fn hints(app: &App) -> &'static str {
             "`Enter` open · `j k` move · `Tab` messages · `c` write · `+` add account · `?` help"
         }
         Focus::List if !app.marked.is_empty() => {
-            "`Space` mark · `d` delete · `e` archive · `m` move · `u` read/unread · `s` star · `Esc` unmark"
+            "`Space` mark · `d` delete · `e` archive · `m` move · `t` tag · `u` read/unread · `s` star · `Esc` unmark"
         }
         Focus::List if app.search.is_some() => {
             "`Enter` open · `Esc` end search · `/` search again · `r` reply · `d` delete · `?` help"
         }
         Focus::List => {
-            "`Enter` open · `c` write · `r` reply · `a` all · `f` forward · `d` delete · `e` archive · `s` star · `/` search · `?` help"
+            "`Enter` open · `c` write · `r` reply · `a` all · `f` forward · `d` delete · `e` archive · `s` star · `t` tag · `/` search · `?` help"
         }
         Focus::Reader => {
             "`j k` scroll · `J K` next/previous · `r` reply · `a` all · `f` forward · `o` links · `A` files · `H` html/text · `Esc` back"
@@ -334,6 +335,7 @@ fn prompt(frame: &mut Frame, app: &mut App, area: Rect) {
                 .unwrap_or_default()
         ),
         Some(PromptKind::Attach) => " Attach a file: its full path, or drop it here ".into(),
+        Some(PromptKind::Tag) => " New tag: one word, like work or receipts ".into(),
         None => return,
     };
     let width = area.width.min(80);
@@ -374,6 +376,7 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::MoveTo { .. } => " `Enter` move here · `Esc` cancel ",
         PickerKind::Links => " `Enter` open · `y` copy · `Esc` close ",
         PickerKind::Attachments => " `Enter` open · `s` save to Downloads · `Esc` close ",
+        PickerKind::Tag { .. } => " `Enter` put on or take off · `Esc` cancel ",
     };
     // Links in columns: the site (from the whole URL, never from what the
     // link says), what it says, then the URL.
@@ -594,7 +597,7 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const HELP: [(&str, &str); 29] = [
+const HELP: [(&str, &str); 30] = [
     ("←↓↑→  h j k l", "move; Enter or → opens"),
     ("Tab", "folders → messages → message"),
     ("gg  G  Ctrl-u Ctrl-d", "first, last, half a page"),
@@ -603,6 +606,7 @@ const HELP: [(&str, &str); 29] = [
     ("d", "delete: to Trash; in Trash, for good"),
     ("e  /  !", "archive  /  junk"),
     ("m", "move to a folder"),
+    ("t", "tag: put a tag on or take it off; tag:work searches"),
     ("s  /  u", "star  /  read or unread"),
     (
         "Space  /  *",

@@ -61,6 +61,8 @@ pub struct Colors {
     pub quote_deeper: Color,
     /// Links in a message.
     pub link: Color,
+    /// Tags on messages.
+    pub tag: Color,
 }
 
 fn hex(s: &str) -> Option<Color> {
@@ -104,6 +106,7 @@ impl Colors {
             quote: p("cyan")?,
             quote_deeper: p("purple")?,
             link: p("blue")?,
+            tag: p("pink")?,
         })
     }
 }

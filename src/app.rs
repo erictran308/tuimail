@@ -28,7 +28,7 @@ use crate::setup::{self, Setup};
 use crate::store::{self, Flags, Folder, Known, Message, Role, Store};
 use crate::theme::{self, Colors};
 use crate::worker::{self, Endpoints, Request, State, Worker};
-use crate::{net, text, tools};
+use crate::{net, tags, text, tools};
 
 /// The longest search or path typed or pasted, in characters.
 const MAX_PROMPT: usize = 4096;
@@ -239,6 +239,8 @@ pub enum PromptKind {
     Search,
     Password(usize),
     Attach,
+    /// A new tag for [`App::tagging`].
+    Tag,
 }
 
 pub struct Prompt {
@@ -275,6 +277,23 @@ pub enum PickerKind {
     },
     Links,
     Attachments,
+    /// A tag to put on these messages or take off, or (the last item) a
+    /// new one to type.
+    Tag {
+        groups: Vec<Group>,
+        /// The tags, in the items' order.
+        tags: Vec<String>,
+    },
+}
+
+/// Messages of one account and folder, with the UIDVALIDITY their UIDs
+/// were read under: what a choice made later (a tag) is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub account: usize,
+    pub folder: String,
+    pub uids: Vec<u32>,
+    pub uidvalidity: u32,
 }
 
 pub struct Picker {
@@ -426,6 +445,8 @@ pub struct App {
     pub composer: Option<Composer>,
     pub setup: Option<Setup>,
     pub prompt: Option<Prompt>,
+    /// The messages a new tag being typed is for.
+    tagging: Vec<Group>,
     pub picker: Option<Picker>,
     pub confirm: Option<Confirm>,
     confirm_at: Instant,
@@ -453,6 +474,9 @@ pub struct App {
     /// Tests read the app's own events here.
     #[cfg(test)]
     pub test_rx: Option<UnboundedReceiver<AppEvent>>,
+    /// Tests read what was asked of the workers here, by account.
+    #[cfg(test)]
+    pub test_sent: std::cell::RefCell<Vec<(usize, Request)>>,
 }
 
 pub fn now() -> i64 {
@@ -542,6 +566,7 @@ impl App {
             composer: None,
             setup: None,
             prompt: None,
+            tagging: Vec::new(),
             picker: None,
             confirm: None,
             confirm_at: Instant::now(),
@@ -562,6 +587,8 @@ impl App {
             clipboard: None,
             #[cfg(test)]
             test_rx: None,
+            #[cfg(test)]
+            test_sent: Default::default(),
         };
         for account in accounts {
             let password = passwords.remove(&account.id());
@@ -854,6 +881,8 @@ impl App {
     }
 
     fn send(&self, i: usize, request: Request) {
+        #[cfg(test)]
+        self.test_sent.borrow_mut().push((i, request.clone()));
         if let Some(worker) = &self.accounts[i].worker {
             let _ = worker.tx.send(request);
         }
@@ -1248,8 +1277,8 @@ impl App {
             let flags: Vec<(u32, Flags)> = s
                 .flags
                 .iter()
-                .copied()
                 .filter(|(uid, _)| !self.local_flags.contains_key(&(i, s.folder.clone(), *uid)))
+                .cloned()
                 .collect();
             let _ = self.store.set_flags(&id, &s.folder, &flags);
         }
@@ -1796,42 +1825,49 @@ impl App {
 
     // Changing mail.
 
+    /// Changes messages' flags with `change` here (cache, list and
+    /// reader), where the next check won't undo it for a moment; how many
+    /// were changed. The server is told by the caller.
+    fn change_here(
+        &mut self,
+        account: usize,
+        folder: &str,
+        uids: &[u32],
+        change: impl Fn(&mut Flags),
+    ) -> usize {
+        let id = self.accounts[account].id.clone();
+        let mut changed = Vec::new();
+        for uid in uids {
+            let Ok(Some(message)) = self.store.message(&id, folder, *uid) else {
+                continue;
+            };
+            let mut flags = message.flags;
+            change(&mut flags);
+            let key = (account, folder.to_string(), *uid);
+            self.local_flags.insert(key.clone(), Instant::now());
+            if let Some(item) = self.items.iter_mut().find(|it| it.key() == key) {
+                item.message.flags = flags.clone();
+            }
+            if let Some(reader) = self.reader.as_mut().filter(|r| r.key() == key) {
+                reader.message.flags = flags.clone();
+            }
+            changed.push((*uid, flags));
+        }
+        let _ = self.store.set_flags(&id, folder, &changed);
+        changed.len()
+    }
+
     /// Sets a flag here (cache and list) and on the server.
     fn set_flag(&mut self, keys: &[(usize, String, u32)], flag: FlagKind, on: bool) {
         for (account, folder, uids) in Self::grouped(keys) {
             let id = self.accounts[account].id.clone();
-            let mut changed = Vec::new();
-            for uid in &uids {
-                let Ok(Some(message)) = self.store.message(&id, &folder, *uid) else {
-                    continue;
-                };
-                let mut flags = message.flags;
-                match flag {
-                    FlagKind::Seen => flags.seen = on,
-                    FlagKind::Flagged => flags.flagged = on,
-                    FlagKind::Answered => flags.answered = on,
-                }
-                changed.push((*uid, flags));
-                self.local_flags
-                    .insert((account, folder.clone(), *uid), Instant::now());
-                if let Some(item) = self
-                    .items
-                    .iter_mut()
-                    .find(|it| it.key() == (account, folder.clone(), *uid))
-                {
-                    item.message.flags = flags;
-                }
-                if let Some(reader) = self
-                    .reader
-                    .as_mut()
-                    .filter(|r| r.key() == (account, folder.clone(), *uid))
-                {
-                    reader.message.flags = flags;
-                }
-            }
-            let _ = self.store.set_flags(&id, &folder, &changed);
+            let changed = self.change_here(account, &folder, &uids, |flags| match flag {
+                FlagKind::Seen => flags.seen = on,
+                FlagKind::Flagged => flags.flagged = on,
+                FlagKind::Answered => flags.answered = on,
+            });
             if flag == FlagKind::Seen {
-                let delta = changed.len() as i64;
+                let delta = changed as i64;
                 if let Some(f) = self.accounts[account]
                     .folders
                     .iter_mut()
@@ -1880,6 +1916,115 @@ impl App {
         {
             // Marked unread by hand: the reader doesn't mark it read again.
             reader.marked_read = true;
+        }
+        self.marked.clear();
+    }
+
+    /// `t`: picks a tag to put on the messages or take off, or a new one.
+    fn pick_tag(&mut self) {
+        let targets = self.targets();
+        if targets.is_empty() {
+            return;
+        }
+        let groups: Vec<Group> = Self::grouped(&targets)
+            .into_iter()
+            .map(|(account, folder, uids)| Group {
+                uidvalidity: self.uidvalidity(account, &folder),
+                account,
+                folder,
+                uids,
+            })
+            .collect();
+        let on = self.tags_of(&targets);
+        let mut known = self.store.all_tags().unwrap_or_default();
+        known.extend(on.iter().map(|(tag, _)| tag.clone()));
+        known.sort();
+        known.dedup();
+        if known.is_empty() {
+            self.tagging = groups;
+            self.prompt = Some(Prompt::new(PromptKind::Tag, ""));
+            return;
+        }
+        let mut items: Vec<String> = known
+            .iter()
+            .map(|tag| {
+                let mark = match on.iter().find(|(t, _)| t == tag) {
+                    Some((_, n)) if *n == targets.len() => '✓',
+                    Some(_) => '~',
+                    None => ' ',
+                };
+                format!("{mark} {tag}")
+            })
+            .collect();
+        items.push("+ New tag…".into());
+        self.picker = Some(Picker {
+            kind: PickerKind::Tag {
+                groups,
+                tags: known,
+            },
+            title: format!(" Tag {} ", plural(targets.len(), "message")),
+            items,
+            labels: Vec::new(),
+            selected: 0,
+        });
+    }
+
+    /// The tags on these messages, each with how many have it.
+    fn tags_of(&self, keys: &[(usize, String, u32)]) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for (account, folder, uid) in keys {
+            let Some(a) = self.accounts.get(*account) else {
+                continue;
+            };
+            let Ok(Some(message)) = self.store.message(&a.id, folder, *uid) else {
+                continue;
+            };
+            for tag in message.flags.tags {
+                match counts.iter_mut().find(|(t, _)| *t == tag) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((tag, 1)),
+                }
+            }
+        }
+        counts
+    }
+
+    /// Puts `tag` on messages (`on`) or takes it off, here and on the
+    /// server.
+    fn tag(&mut self, groups: Vec<Group>, tag: &str, on: bool) {
+        let mut count = 0;
+        for g in groups {
+            if g.account >= self.accounts.len()
+                || !self.still_means(g.account, &g.folder, g.uidvalidity)
+            {
+                continue;
+            }
+            count += self.change_here(g.account, &g.folder, &g.uids, |flags| {
+                flags.tags.retain(|t| t != tag);
+                if on {
+                    flags.tags.push(tag.to_string());
+                }
+                tags::tidy(&mut flags.tags);
+            });
+            if !self.accounts[g.account].is_pop() {
+                self.send(
+                    g.account,
+                    Request::Tag {
+                        folder: g.folder,
+                        uids: g.uids,
+                        tag: tag.to_string(),
+                        on,
+                        uidvalidity: g.uidvalidity,
+                    },
+                );
+            }
+        }
+        if count > 0 {
+            self.info(if on {
+                format!("{} tagged {tag}", plural(count, "message"))
+            } else {
+                format!("{tag} taken off {}", plural(count, "message"))
+            });
         }
         self.marked.clear();
     }
@@ -2912,6 +3057,7 @@ impl App {
             KeyCode::Char('e') => self.move_to_role(Role::Archive),
             KeyCode::Char('!') => self.move_to_role(Role::Junk),
             KeyCode::Char('m') => self.pick_folder(),
+            KeyCode::Char('t') => self.pick_tag(),
             KeyCode::Char('s') => self.toggle_flag(FlagKind::Flagged),
             KeyCode::Char('u') => self.toggle_flag(FlagKind::Seen),
             _ => return false,
@@ -3173,6 +3319,17 @@ impl App {
                         }
                     }
                     PromptKind::Attach => self.attach(&text),
+                    PromptKind::Tag => {
+                        let groups = std::mem::take(&mut self.tagging);
+                        match tags::normalize(&text) {
+                            Some(tag) => self.tag(groups, &tag, true),
+                            None if text.trim().is_empty() => {}
+                            None => self.error(format!(
+                                "A tag is a word of letters, digits, - _ or . (at most {} characters)",
+                                tags::MAX_TAG
+                            )),
+                        }
+                    }
                 }
             }
             KeyCode::Char('u') if ctrl => {
@@ -3262,6 +3419,25 @@ impl App {
                             self.info(format!("{} moved to {name}", plural(uids.len(), "message")));
                         }
                     }
+                    (PickerKind::Tag { groups, tags }, KeyCode::Enter) => match tags.get(n) {
+                        Some(tag) => {
+                            let keys: Vec<_> = groups
+                                .iter()
+                                .flat_map(|g| {
+                                    g.uids.iter().map(|u| (g.account, g.folder.clone(), *u))
+                                })
+                                .collect();
+                            let all = self
+                                .tags_of(&keys)
+                                .iter()
+                                .any(|(t, n)| t == tag && *n == keys.len());
+                            self.tag(groups, tag, !all);
+                        }
+                        None => {
+                            self.tagging = groups;
+                            self.prompt = Some(Prompt::new(PromptKind::Tag, ""));
+                        }
+                    },
                     (PickerKind::Links, code) => {
                         let link = self
                             .reader
@@ -4740,5 +4916,162 @@ pub mod tests {
         );
         assert_eq!(unquote("'/tmp/a b.pdf'"), "/tmp/a b.pdf");
         assert_eq!(unquote("/tmp/a\\ b.pdf"), "/tmp/a b.pdf");
+    }
+    /// The selected message as the cache has it.
+    fn stored_selected(app: &App) -> Message {
+        let item = &app.items[app.selected];
+        app.store
+            .message(
+                &app.accounts[item.account].id,
+                &item.message.folder,
+                item.message.uid,
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Opens the tag picker and picks `tag` (`None`: a new one).
+    fn pick_tag(app: &mut App, tag: Option<&str>) {
+        app.on_key(key(KeyCode::Char('t')));
+        let Some(Picker {
+            kind: PickerKind::Tag { tags, .. },
+            items,
+            ..
+        }) = app.picker.as_ref()
+        else {
+            panic!("no tag picker");
+        };
+        assert_eq!(items.len(), tags.len() + 1);
+        let n = match tag {
+            Some(tag) => tags.iter().position(|t| t == tag).expect(tag),
+            None => tags.len(),
+        };
+        app.picker.as_mut().unwrap().selected = n;
+        app.on_key(key(KeyCode::Enter));
+    }
+
+    fn last_sent(app: &App) -> Option<(usize, Request)> {
+        app.test_sent.borrow().last().cloned()
+    }
+
+    #[tokio::test]
+    async fn t_puts_a_tag_on_and_takes_it_off_here_and_on_the_server() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        app.selected = 0;
+        let uid = app.items[0].message.uid;
+        assert!(app.items[0].message.flags.tags.is_empty());
+        pick_tag(&mut app, Some("work"));
+        assert_eq!(app.items[0].message.flags.tags, ["work"]);
+        assert_eq!(stored_selected(&app).flags.tags, ["work"], "kept");
+        assert!(
+            matches!(
+                last_sent(&app),
+                Some((0, Request::Tag { ref folder, ref uids, ref tag, on: true, .. }))
+                    if folder == "INBOX" && uids == &[uid] && tag == "work"
+            ),
+            "{:?}",
+            last_sent(&app)
+        );
+        // On every one picked: it comes off.
+        let picker_mark = |app: &mut App| {
+            app.on_key(key(KeyCode::Char('t')));
+            let picker = app.picker.take().unwrap();
+            let PickerKind::Tag { tags, .. } = &picker.kind else {
+                panic!("no tag picker");
+            };
+            let n = tags.iter().position(|t| t == "work").unwrap();
+            picker.items[n].clone()
+        };
+        assert_eq!(picker_mark(&mut app), "✓ work");
+        pick_tag(&mut app, Some("work"));
+        assert!(app.items[0].message.flags.tags.is_empty());
+        assert!(stored_selected(&app).flags.tags.is_empty());
+        assert!(matches!(
+            last_sent(&app),
+            Some((0, Request::Tag { on: false, .. }))
+        ));
+        assert_eq!(picker_mark(&mut app), "  work");
+    }
+
+    #[tokio::test]
+    async fn a_new_tag_is_typed_and_one_that_cant_be_is_refused() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        app.selected = 0;
+        pick_tag(&mut app, None);
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| p.kind),
+            Some(PromptKind::Tag)
+        ));
+        for c in "To Read".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(stored_selected(&app).flags.tags, ["to-read"]);
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "1 message tagged to-read"
+        );
+        pick_tag(&mut app, None);
+        for c in "a(b".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        let status = app.status.as_ref().unwrap();
+        assert!(
+            status.error && status.text.starts_with("A tag is"),
+            "{}",
+            status.text
+        );
+        assert_eq!(stored_selected(&app).flags.tags, ["to-read"], "unchanged");
+    }
+
+    #[tokio::test]
+    async fn marked_messages_are_tagged_together_and_pop3_tags_stay_here() {
+        let mut app = two_accounts();
+        app.open_place(Place::AllInboxes);
+        app.focus = Focus::List;
+        app.marked = app.items.iter().take(3).map(Item::key).collect();
+        let marked: Vec<_> = app.marked.iter().cloned().collect();
+        assert!(marked.iter().any(|k| k.0 == 1), "a POP3 message among them");
+        app.test_sent.borrow_mut().clear();
+        pick_tag(&mut app, Some("work"));
+        for (account, folder, uid) in &marked {
+            let m = app
+                .store
+                .message(&app.accounts[*account].id, folder, *uid)
+                .unwrap()
+                .unwrap();
+            assert!(
+                m.flags.tags.contains(&"work".to_string()),
+                "{}",
+                m.summary.subject
+            );
+        }
+        assert!(app.marked.is_empty());
+        let sent = app.test_sent.borrow().clone();
+        assert!(
+            sent.iter()
+                .all(|(account, r)| *account == 0 && matches!(r, Request::Tag { .. })),
+            "only the IMAP account's server is told: {sent:?}"
+        );
+        assert!(!sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tag_word_finds_tagged_mail_in_the_cache() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.run_search("tag:work");
+        assert_eq!(subjects(&app), ["Quarterly numbers"]);
+        app.run_search("tag:work numbers");
+        assert_eq!(subjects(&app), ["Quarterly numbers"]);
+        app.run_search("tag:work lunch");
+        assert!(app.items.is_empty());
+        app.run_search("tag:nothing");
+        assert!(app.items.is_empty());
     }
 }

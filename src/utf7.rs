@@ -41,8 +41,7 @@ pub fn decode(name: &str) -> Option<String> {
     Some(out)
 }
 
-/// `name` in modified UTF-7, for a folder tuimail creates.
-#[allow(dead_code)]
+/// `name` in modified UTF-7, for a tag's keyword.
 pub fn encode(name: &str) -> String {
     let mut out = String::new();
     let mut pending: Vec<u16> = Vec::new();

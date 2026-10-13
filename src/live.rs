@@ -214,13 +214,82 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
         _ => None,
     })
     .await;
-    let flags = again
+    let flags = &again
         .flags
         .iter()
         .find(|(u, _)| *u == header.uid)
         .unwrap()
         .1;
     assert!(flags.flagged && !flags.seen, "PEEK didn't mark it read");
+
+    // Tags go on as keywords (one spelled in UTF-7), are read back as
+    // tags, are found by `tag:`, and come off.
+    let sync = |bob: &Worker| {
+        bob.tx
+            .send(Request::Sync {
+                folder: "INBOX".into(),
+                known: Known {
+                    uidvalidity: synced.uidvalidity,
+                    low: synced.low,
+                    high: synced.high,
+                },
+                count: 100,
+            })
+            .unwrap();
+    };
+    let tag = |bob: &Worker, tag: &str, on: bool| {
+        bob.tx
+            .send(Request::Tag {
+                uidvalidity: synced.uidvalidity,
+                folder: "INBOX".into(),
+                uids: vec![header.uid],
+                tag: tag.into(),
+                on,
+            })
+            .unwrap();
+    };
+    tag(&bob, "work", true);
+    tag(&bob, "công_việc", true);
+    sync(&bob);
+    let tagged = next(&mut events, |e| match e {
+        Event::Synced(s) => Some(s),
+        Event::Failed { error, .. } => panic!("{error}"),
+        _ => None,
+    })
+    .await;
+    let tags = |s: &worker::Synced| {
+        s.flags
+            .iter()
+            .find(|(u, _)| *u == header.uid)
+            .unwrap()
+            .1
+            .tags
+            .clone()
+    };
+    assert_eq!(tags(&tagged), ["công_việc", "work"]);
+    bob.tx
+        .send(Request::Search {
+            folder: "INBOX".into(),
+            query: "tag:work".into(),
+        })
+        .unwrap();
+    let found = next(&mut events, |e| match e {
+        Event::Searched { headers, .. } => Some(headers),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        found.iter().map(|h| h.uid).collect::<Vec<_>>(),
+        [header.uid]
+    );
+    tag(&bob, "work", false);
+    sync(&bob);
+    let untagged = next(&mut events, |e| match e {
+        Event::Synced(s) => Some(s),
+        _ => None,
+    })
+    .await;
+    assert_eq!(tags(&untagged), ["công_việc"]);
 
     bob.tx
         .send(Request::Search {
@@ -556,6 +625,6 @@ async fn live_a_change_made_offline_reaches_the_server_once_back() {
     })
     .await
     .expect("a check once back");
-    let flags = again.flags.iter().find(|(u, _)| *u == uid).unwrap().1;
+    let flags = &again.flags.iter().find(|(u, _)| *u == uid).unwrap().1;
     assert!(flags.flagged, "the change made offline reached the server");
 }

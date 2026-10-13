@@ -12,7 +12,7 @@ use crate::account::{Account, Auth, Security};
 use crate::mail;
 use crate::net::{self, Conn, Endpoint};
 use crate::store::{Flags, Folder, Header, Role};
-use crate::{text, utf7};
+use crate::{tags, text, utf7};
 
 pub type Session = async_imap::Session<Conn>;
 
@@ -23,6 +23,8 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub const MAX_MESSAGE: u32 = 60 << 20;
 /// The most flags one check reads back.
 const MAX_FLAGS: usize = 100_000;
+/// The most keywords read for one message, or one folder's PERMANENTFLAGS.
+const MAX_KEYWORDS: usize = 100;
 /// UIDs per command, so no command line gets too long.
 const UIDS_PER_COMMAND: usize = 400;
 
@@ -364,18 +366,45 @@ pub async fn status(session: &mut Session, folder: &str) -> Result<(u32, u32)> {
 }
 
 /// What SELECT says about a folder.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Selected {
     pub uidvalidity: u32,
     pub exists: u32,
+    /// New keywords can be kept on its messages (PERMANENTFLAGS has `\*`,
+    /// or wasn't said: then every flag can be).
+    pub new_keywords: bool,
+    /// The keywords it keeps, as PERMANENTFLAGS lists them.
+    pub keywords: Vec<String>,
+}
+
+impl Selected {
+    /// Whether the folder keeps `keyword` on its messages, rather than
+    /// only until the connection ends.
+    pub fn keeps(&self, keyword: &str) -> bool {
+        self.new_keywords
+            || self
+                .keywords
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(keyword))
+    }
 }
 
 pub async fn select(session: &mut Session, folder: &str) -> Result<Selected> {
     drain(session);
     let mailbox = timed(TIMEOUT, "SELECT", session.select(folder)).await?;
+    let permanent = &mailbox.permanent_flags;
     Ok(Selected {
         uidvalidity: mailbox.uid_validity.unwrap_or(0),
         exists: mailbox.exists,
+        new_keywords: permanent.is_empty() || permanent.contains(&Flag::MayCreate),
+        keywords: permanent
+            .iter()
+            .filter_map(|f| match f {
+                Flag::Custom(k) => Some(k.to_string()),
+                _ => None,
+            })
+            .take(MAX_KEYWORDS)
+            .collect(),
     })
 }
 
@@ -465,15 +494,18 @@ fn deleted(fetch: &Fetch) -> bool {
 
 fn flags_of(fetch: &Fetch) -> Flags {
     let mut flags = Flags::default();
+    let mut keywords = Vec::new();
     for flag in fetch.flags() {
         match flag {
             Flag::Seen => flags.seen = true,
             Flag::Flagged => flags.flagged = true,
             Flag::Answered => flags.answered = true,
             Flag::Draft => flags.draft = true,
+            Flag::Custom(k) if keywords.len() < MAX_KEYWORDS => keywords.push(k),
             _ => {}
         }
     }
+    flags.tags = tags::from_keywords(keywords.iter().map(|k| k.as_ref()));
     flags
 }
 
@@ -595,9 +627,32 @@ impl FlagKind {
 }
 
 pub async fn set_flag(session: &mut Session, uids: &[u32], flag: FlagKind, on: bool) -> Result<()> {
+    store_flags(session, uids, flag.imap(), on).await
+}
+
+/// Puts keywords on messages, or takes them off: the spellings of a tag
+/// ([`tags::keywords`]).
+pub async fn set_keywords(
+    session: &mut Session,
+    uids: &[u32],
+    keywords: &[String],
+    on: bool,
+) -> Result<()> {
+    if keywords.is_empty()
+        || !keywords
+            .iter()
+            .all(|k| tags::is_atom(k) && !k.starts_with('\\'))
+    {
+        bail!(Said("that isn't a tag the server can keep".into()));
+    }
+    store_flags(session, uids, &keywords.join(" "), on).await
+}
+
+/// `+FLAGS` or `-FLAGS` with `list` (flags already checked).
+async fn store_flags(session: &mut Session, uids: &[u32], list: &str, on: bool) -> Result<()> {
     let sign = if on { '+' } else { '-' };
     for set in uid_sets(uids) {
-        let query = format!("{sign}FLAGS.SILENT ({})", flag.imap());
+        let query = format!("{sign}FLAGS.SILENT ({list})");
         timed(TIMEOUT, "STORE", async {
             session
                 .uid_store(&set, &query)
@@ -715,14 +770,24 @@ pub async fn create(session: &mut Session, folder: &str) -> Result<()> {
 }
 
 /// SEARCH criteria for messages whose headers or text have every word of
-/// `query`. Words are quoted; CHARSET UTF-8 is asked for when needed.
+/// `query`, and the tag of every `tag:` word. Words are quoted; CHARSET
+/// UTF-8 is asked for when needed.
 pub fn search_criteria(query: &str) -> Option<String> {
     let words: Vec<String> = query
         .split_whitespace()
         .take(8)
         .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
         .filter(|w| !w.is_empty())
-        .map(|w| format!("TEXT \"{}\"", w.replace('\\', "\\\\").replace('"', "\\\"")))
+        .map(|w| {
+            let keywords = tags::searched(&w).map_or_else(Vec::new, |tag| tags::keywords(&tag));
+            match keywords.split_first() {
+                // Any spelling of the tag (`OR` takes two at a time).
+                Some((first, rest)) => rest.iter().fold(format!("KEYWORD {first}"), |all, k| {
+                    format!("OR {all} KEYWORD {k}")
+                }),
+                None => format!("TEXT \"{}\"", w.replace('\\', "\\\\").replace('"', "\\\"")),
+            }
+        })
         .collect();
     if words.is_empty() {
         return None;
@@ -961,5 +1026,19 @@ mod tests {
                 .contains('\n')
         );
         assert_eq!(search_criteria("   "), None);
+    }
+
+    #[test]
+    fn a_tag_word_searches_for_the_tags_keywords() {
+        assert_eq!(
+            search_criteria("tag:Receipts march").unwrap(),
+            "KEYWORD receipts TEXT \"march\""
+        );
+        assert_eq!(
+            search_criteria("tag:work").unwrap(),
+            "OR KEYWORD $label2 KEYWORD work"
+        );
+        // Not a tag: searched for as text.
+        assert_eq!(search_criteria("tag:a(b").unwrap(), "TEXT \"tag:a(b\"");
     }
 }

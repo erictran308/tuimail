@@ -17,6 +17,7 @@ mod settings;
 mod setup;
 mod smtp;
 mod store;
+mod tags;
 mod text;
 mod theme;
 mod tools;

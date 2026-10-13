@@ -17,7 +17,7 @@ use crate::imap::{self, Caps, FlagKind, Session};
 use crate::net::Endpoint;
 use crate::secrets::{Credentials, NeedPassword};
 use crate::store::{Flags, Folder, Header, Known};
-use crate::{pop3, smtp, text};
+use crate::{pop3, smtp, tags, text};
 
 /// After a failed connection, requests fail at once for this long instead
 /// of each waiting to time out.
@@ -97,6 +97,14 @@ pub enum Request {
         uids: Vec<u32>,
         uidvalidity: u32,
     },
+    /// Puts a tag on messages (`on`) or takes it off.
+    Tag {
+        folder: String,
+        uids: Vec<u32>,
+        tag: String,
+        on: bool,
+        uidvalidity: u32,
+    },
     Search {
         folder: String,
         query: String,
@@ -117,6 +125,7 @@ impl Request {
         matches!(
             self,
             Request::Flag { .. }
+                | Request::Tag { .. }
                 | Request::Move { .. }
                 | Request::Delete { .. }
                 | Request::Append { retry: true, .. }
@@ -131,6 +140,7 @@ impl Request {
             Request::Older { .. } => "fetching older mail",
             Request::Body { .. } => "downloading the message",
             Request::Flag { .. } => "changing flags",
+            Request::Tag { .. } => "tagging",
             Request::Move { .. } => "moving mail",
             Request::Delete { .. } => "deleting mail",
             Request::Append { .. } => "saving a copy",
@@ -505,19 +515,24 @@ async fn run_imap(
 /// SELECTs `folder` for something done to UIDs read under `uidvalidity`
 /// (0: unknown). A folder the server has made again since has other
 /// messages under those UIDs: that's refused, not done.
-async fn select_same(s: &mut Session, folder: &str, uidvalidity: u32) -> Result<()> {
+async fn select_same(s: &mut Session, folder: &str, uidvalidity: u32) -> Result<imap::Selected> {
     let selected = imap::select(s, folder).await?;
     if uidvalidity != 0 && selected.uidvalidity != uidvalidity {
         return Err(imap::Said(format!(
             "{} was made again on the server, so its messages changed: nothing was done",
-            text::one_line(
-                &crate::utf7::decode(folder).unwrap_or_else(|| folder.to_string()),
-                60
-            )
+            shown_folder(folder)
         ))
         .into());
     }
-    Ok(())
+    Ok(selected)
+}
+
+/// A folder's name as an error message shows it.
+fn shown_folder(folder: &str) -> String {
+    text::one_line(
+        &crate::utf7::decode(folder).unwrap_or_else(|| folder.to_string()),
+        60,
+    )
 }
 
 async fn handle_imap(
@@ -574,7 +589,7 @@ async fn handle_imap(
             uidvalidity,
         } => {
             let result = match select_same(s, &folder, uidvalidity).await {
-                Ok(()) => imap::body(s, uid).await,
+                Ok(_) => imap::body(s, uid).await,
                 Err(e) => Err(e),
             };
             match result {
@@ -600,6 +615,30 @@ async fn handle_imap(
         } => {
             select_same(s, &folder, uidvalidity).await?;
             imap::set_flag(s, &uids, flag, on).await?;
+        }
+        Request::Tag {
+            folder,
+            uids,
+            tag,
+            on,
+            uidvalidity,
+        } => {
+            let selected = select_same(s, &folder, uidvalidity).await?;
+            if on {
+                let keyword = tags::keyword(&tag).unwrap_or_default();
+                // A keyword the folder can't keep would be gone at the
+                // next connection, with no word said.
+                if !selected.keeps(&keyword) {
+                    return Err(imap::Said(format!(
+                        "{} doesn't keep tags on the server",
+                        shown_folder(&folder)
+                    ))
+                    .into());
+                }
+                imap::set_keywords(s, &uids, &[keyword], true).await?;
+            } else {
+                imap::set_keywords(s, &uids, &tags::keywords(&tag), false).await?;
+            }
         }
         Request::Move {
             folder,
@@ -627,7 +666,7 @@ async fn handle_imap(
             id,
             ..
         } => {
-            if let Err(e) = imap::append(s, &folder, &raw, flags).await {
+            if let Err(e) = imap::append(s, &folder, &raw, flags.clone()).await {
                 // A folder that isn't there yet (Sent, Drafts) is made.
                 if broken(&e) {
                     return Err(e);

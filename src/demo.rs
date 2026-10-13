@@ -144,7 +144,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                  Sure, ask him. I'll tell him it's a numbers-free lunch.\n\nAlice",
                 &[("menu.pdf", "application/pdf", 184_320)],
             ),
-            unread,
+            unread.clone(),
         ),
         (
             html(
@@ -157,7 +157,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                  <p><a href=\"https://github.example/erictran308/tuimail/releases\">View it on GitHub</a></p>\
                  <img src=\"https://github.example/beacon.gif\" alt=\"\">",
             ),
-            unread,
+            unread.clone(),
         ),
         (
             message(
@@ -171,6 +171,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
             Flags {
                 seen: true,
                 flagged: true,
+                tags: vec!["work".into()],
                 ..Flags::default()
             },
         ),
@@ -186,6 +187,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
             Flags {
                 seen: true,
                 answered: true,
+                tags: vec!["travel".into()],
                 ..Flags::default()
             },
         ),
@@ -201,7 +203,10 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                  <li><a href=\"https://tuimail.example\">tuimail</a>: your mail</li></ol>\
                  <p><code>cargo install tuimail</code></p>",
             ),
-            read,
+            Flags {
+                tags: vec!["newsletter".into()],
+                ..read.clone()
+            },
         ),
         (
             message(
@@ -212,7 +217,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 "Notes from today:\n\n1. Rounded corners everywhere\n2. Keys in the accent color\n\
                  3. Fewer popups\n\nMaya",
             ),
-            read,
+            read.clone(),
         ),
         (
             with_files(
@@ -226,16 +231,16 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                     ("summit.jpg", "image/jpeg", 1_048_576),
                 ],
             ),
-            read,
+            read.clone(),
         ),
     ];
     let answered = Flags {
         answered: true,
-        ..read
+        ..read.clone()
     };
     let starred = Flags {
         flagged: true,
-        ..read
+        ..read.clone()
     };
     // Older mail, so the inbox looks lived in.
     let older: Vec<(String, Flags)> = vec![
@@ -247,7 +252,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 13 * DAY,
                 "Merged, thanks! Search over 50k messages went from 900 ms to 40 ms.\n\nKai",
             ),
-            answered,
+            answered.clone(),
         ),
         (
             message(
@@ -257,7 +262,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 15 * DAY,
                 "We meet Thursday at 7. Bring your favorite line from chapter 7.\n\nNora",
             ),
-            read,
+            read.clone(),
         ),
         (
             with_files(
@@ -268,7 +273,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 "Booking SKY4K2. Friday 14 November, 10:40, seat 23A.\nYour itinerary is attached.",
                 &[("itinerary.pdf", "application/pdf", 98_304)],
             ),
-            starred,
+            starred.clone(),
         ),
         (
             message(
@@ -278,7 +283,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 20 * DAY,
                 "Free Tuesday or Wednesday morning? The usual place.\n\nTom",
             ),
-            answered,
+            answered.clone(),
         ),
         (
             with_files(
@@ -289,7 +294,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 "Maya Chen invites you to Sprint planning, Monday 10:00 to 11:00.",
                 &[("invite.ics", "text/calendar", 2_048)],
             ),
-            read,
+            read.clone(),
         ),
         (
             with_files(
@@ -300,7 +305,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 "Here are the slides, and the notes from the afternoon.\n\nHana",
                 &[("offsite.pdf", "application/pdf", 1_572_864)],
             ),
-            read,
+            read.clone(),
         ),
         (
             with_files(
@@ -311,7 +316,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 "Your invoice for September is attached: 12.00 USD, paid by card.",
                 &[("invoice-2026-09.pdf", "application/pdf", 65_536)],
             ),
-            read,
+            read.clone(),
         ),
         (
             message(
@@ -321,7 +326,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 33 * DAY,
                 "Welcome aboard, Sam! Your desk is by the window. Lunch is on us Friday.\n\nOmar",
             ),
-            starred,
+            starred.clone(),
         ),
         (
             message(
@@ -331,7 +336,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 36 * DAY,
                 "Async closures are stable, and cargo builds got faster again.",
             ),
-            read,
+            read.clone(),
         ),
         (
             message(
@@ -341,7 +346,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 45 * DAY,
                 "The talk is in! Room B, Saturday at 2. Slides due a week before.\n\nIvy",
             ),
-            answered,
+            answered.clone(),
         ),
         (
             message(
@@ -351,7 +356,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 52 * DAY,
                 "From Monday the standup is at 9:30, same room.\n\nJonas",
             ),
-            read,
+            read.clone(),
         ),
     ];
     let inbox: Vec<(String, Flags)> = inbox.into_iter().chain(older).collect();
@@ -370,7 +375,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
             "Which dates work for you?\n",
         )
         .as_bytes(),
-        read,
+        read.clone(),
         None,
     );
     let _ = store.add_local(
@@ -402,7 +407,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
             "Draft is up for review.",
         )
         .as_bytes(),
-        read,
+        read.clone(),
         None,
     );
     if let Some(home) = accounts.get(1) {
@@ -420,7 +425,7 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 "Safe travels! Call me when you land.\n\nLove, Mom",
             )
             .as_bytes(),
-            unread,
+            unread.clone(),
             None,
         );
         let _ = store.add_local(
@@ -434,7 +439,10 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 "<p>Your October statement is ready.</p><p><a href=\"https://bank.example/statements\">Sign in to see it</a></p>",
             )
             .as_bytes(),
-            read,
+            Flags {
+                tags: vec!["bills".into()],
+                ..read.clone()
+            },
             None,
         );
         previews(store, &home);

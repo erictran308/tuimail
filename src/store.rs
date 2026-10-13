@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::config;
 use crate::mail::{self, Addr, Summary};
-use crate::text;
+use crate::{tags, text};
 
 pub struct Store {
     db: Connection,
@@ -82,12 +82,14 @@ pub struct Known {
     pub high: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Flags {
     pub seen: bool,
     pub flagged: bool,
     pub answered: bool,
     pub draft: bool,
+    /// Its tags ([`tags`]), sorted.
+    pub tags: Vec<String>,
 }
 
 /// A message in the list.
@@ -147,6 +149,7 @@ CREATE TABLE IF NOT EXISTS messages (
     size INTEGER NOT NULL DEFAULT 0,
     preview TEXT NOT NULL DEFAULT '',
     pop_id TEXT,
+    tags TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (account, folder, uid)
 );
 CREATE INDEX IF NOT EXISTS messages_by_date ON messages(account, folder, date DESC);
@@ -183,7 +186,7 @@ CREATE TABLE IF NOT EXISTS addresses (
 
 const MESSAGE_COLUMNS: &str = "folder, uid, message_id, in_reply_to, refs, date, from_name, \
      from_addr, to_list, cc_list, subject, attachments, seen, flagged, answered, draft, size, \
-     preview";
+     preview, tags";
 
 /// Messages bigger than this aren't kept: they're fetched again to read.
 pub const MAX_KEPT_BODY: usize = 25 << 20;
@@ -215,6 +218,7 @@ fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
             flagged: row.get(13)?,
             answered: row.get(14)?,
             draft: row.get(15)?,
+            tags: tags::from_stored(&row.get::<_, String>(18)?),
         },
         size: row.get(16)?,
         preview: one(17, 300)?,
@@ -233,6 +237,7 @@ impl Store {
         // which removals do.
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA secure_delete = ON;")?;
         db.execute_batch(SCHEMA)
+            .and_then(|()| Self::migrate(&db))
             .with_context(|| format!("cannot set up {shown}"))?;
         Self::protect(path).with_context(|| format!("cannot protect {shown}"))?;
         Ok(Self { db })
@@ -243,6 +248,19 @@ impl Store {
         let db = Connection::open_in_memory().expect("SQLite opens in memory");
         db.execute_batch(SCHEMA).expect("the schema is valid");
         Self { db }
+    }
+
+    /// Adds what a cache made by an older tuimail lacks.
+    fn migrate(db: &Connection) -> rusqlite::Result<()> {
+        let tagged: bool = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'tags'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !tagged {
+            db.execute_batch("ALTER TABLE messages ADD COLUMN tags TEXT NOT NULL DEFAULT '';")?;
+        }
+        Ok(())
     }
 
     /// The database and its journal files readable only by you, whatever
@@ -432,8 +450,8 @@ impl Store {
     }
 
     /// The account's messages whose sender, recipients, subject or text
-    /// contain every word of `query`, newest first; in `folder` only if
-    /// given.
+    /// contain every word of `query` (and that have the tag of every
+    /// `tag:` word), newest first; in `folder` only if given.
     pub fn search(
         &self,
         account: &str,
@@ -441,18 +459,20 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> Result<Vec<Message>> {
-        let words: Vec<String> = query
-            .split_whitespace()
-            .take(8)
-            .map(|w| {
-                let escaped = w
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_");
-                format!("%{escaped}%")
-            })
-            .collect();
-        if words.is_empty() {
+        let mut tagged = Vec::new();
+        let mut words = Vec::new();
+        for w in query.split_whitespace().take(8) {
+            if let Some(tag) = tags::searched(w) {
+                tagged.push(tag);
+                continue;
+            }
+            let escaped = w
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            words.push(format!("%{escaped}%"));
+        }
+        if words.is_empty() && tagged.is_empty() {
             return Ok(Vec::new());
         }
         let mut sql = format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE account = ?1");
@@ -460,6 +480,13 @@ impl Store {
         if let Some(folder) = folder {
             values.push(folder.to_string().into());
             sql.push_str(&format!(" AND folder = ?{}", values.len()));
+        }
+        for tag in tagged {
+            values.push(tag.into());
+            let n = values.len();
+            sql.push_str(&format!(
+                " AND instr(' ' || tags || ' ', ' ' || ?{n} || ' ') > 0"
+            ));
         }
         for word in words {
             values.push(word.into());
@@ -484,12 +511,13 @@ impl Store {
             let mut stmt = tx.prepare(
                 "INSERT INTO messages (account, folder, uid, message_id, in_reply_to, refs, date,
                      from_name, from_addr, to_list, cc_list, subject, attachments, seen, flagged,
-                     answered, draft, size)
+                     answered, draft, size, tags)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18)
+                     ?17, ?18, ?19)
                  ON CONFLICT(account, folder, uid) DO UPDATE SET
                      seen = excluded.seen, flagged = excluded.flagged,
-                     answered = excluded.answered, draft = excluded.draft",
+                     answered = excluded.answered, draft = excluded.draft,
+                     tags = excluded.tags",
             )?;
             for h in headers {
                 let s = &h.summary;
@@ -511,7 +539,8 @@ impl Store {
                     h.flags.flagged,
                     h.flags.answered,
                     h.flags.draft,
-                    h.size
+                    h.size,
+                    tags::to_stored(&h.flags.tags)
                 ])?;
             }
         }
@@ -524,17 +553,39 @@ impl Store {
         let tx = self.db.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "UPDATE messages SET seen = ?4, flagged = ?5, answered = ?6, draft = ?7
+                "UPDATE messages SET seen = ?4, flagged = ?5, answered = ?6, draft = ?7,
+                     tags = ?8
                  WHERE account = ?1 AND folder = ?2 AND uid = ?3",
             )?;
             for (uid, f) in flags {
                 stmt.execute(params![
-                    account, folder, uid, f.seen, f.flagged, f.answered, f.draft
+                    account,
+                    folder,
+                    uid,
+                    f.seen,
+                    f.flagged,
+                    f.answered,
+                    f.draft,
+                    tags::to_stored(&f.tags)
                 ])?;
             }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Every tag on a cached message, of any account, sorted: the ones to
+    /// offer when tagging.
+    pub fn all_tags(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT DISTINCT tags FROM messages WHERE tags != '' LIMIT 5000")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut all = std::collections::BTreeSet::new();
+        for row in rows {
+            all.extend(tags::from_stored(&row?));
+        }
+        Ok(all.into_iter().take(500).collect())
     }
 
     /// The UIDs cached in `folder` from `low` to `high`.
@@ -950,6 +1001,82 @@ pub mod tests {
             unread: 0,
             total: 0,
         }
+    }
+
+    fn tagged(uid: u32, subject: &str, tags: &[&str]) -> Header {
+        let mut h = header(uid, subject, i64::from(uid));
+        h.flags.tags = tags.iter().map(|t| t.to_string()).collect();
+        h
+    }
+
+    #[test]
+    fn tags_are_kept_with_the_flags_and_found_by_tag_words() {
+        let mut store = Store::in_memory();
+        store
+            .add_headers(
+                "a",
+                "INBOX",
+                &[
+                    tagged(1, "Invoice March", &["receipts", "work"]),
+                    tagged(2, "Invoice April", &["receipts"]),
+                    tagged(3, "Lunch", &[]),
+                ],
+            )
+            .unwrap();
+        let tags = |store: &Store, uid| {
+            store
+                .message("a", "INBOX", uid)
+                .unwrap()
+                .unwrap()
+                .flags
+                .tags
+        };
+        assert_eq!(tags(&store, 1), ["receipts", "work"]);
+        let found = |store: &Store, q: &str| -> Vec<u32> {
+            let found = store.search("a", Some("INBOX"), q, 50).unwrap();
+            found.iter().map(|m| m.uid).collect()
+        };
+        assert_eq!(found(&store, "tag:receipts"), [2, 1]);
+        assert_eq!(found(&store, "tag:receipts march"), [1]);
+        assert_eq!(found(&store, "tag:work tag:receipts"), [1]);
+        assert!(found(&store, "tag:rec").is_empty(), "whole tags only");
+        // The next check's flags replace them.
+        let flags = Flags {
+            tags: vec!["later".into()],
+            ..Flags::default()
+        };
+        store.set_flags("a", "INBOX", &[(1, flags)]).unwrap();
+        assert_eq!(tags(&store, 1), ["later"]);
+        store
+            .add_headers("a", "INBOX", &[tagged(1, "Invoice March", &[])])
+            .unwrap();
+        assert!(tags(&store, 1).is_empty());
+        assert_eq!(store.all_tags().unwrap(), ["receipts"]);
+        // Read back checked: a cache changed by hand shows no bad tag.
+        store
+            .db
+            .execute(
+                "UPDATE messages SET tags = 'ok Bad \u{1b}x' WHERE uid = 3",
+                [],
+            )
+            .unwrap();
+        assert_eq!(tags(&store, 3), ["ok"]);
+    }
+
+    #[test]
+    fn a_cache_made_before_tags_gets_them() {
+        let db = Connection::open_in_memory().unwrap();
+        let old = SCHEMA.replace("    tags TEXT NOT NULL DEFAULT '',\n", "");
+        assert_ne!(old, SCHEMA);
+        db.execute_batch(&old).unwrap();
+        Store::migrate(&db).unwrap();
+        Store::migrate(&db).unwrap();
+        let mut store = Store { db };
+        store
+            .add_headers("a", "INBOX", &[tagged(1, "Hi", &["work"])])
+            .unwrap();
+        let m = store.message("a", "INBOX", 1).unwrap().unwrap();
+        assert_eq!(m.flags.tags, ["work"]);
     }
 
     #[test]

@@ -164,6 +164,19 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(date, Style::new().fg(c.text)),
         ]));
     }
+    if !m.flags.tags.is_empty() {
+        let text: Vec<String> = m.flags.tags.iter().map(|t| format!("#{t}")).collect();
+        for (i, part) in textwrap::wrap(&text.join(" "), width.saturating_sub(6).max(10))
+            .iter()
+            .take(2)
+            .enumerate()
+        {
+            lines.push(Line::from(vec![
+                label(if i == 0 { "Tags" } else { "" }),
+                Span::styled(part.to_string(), Style::new().fg(c.tag)),
+            ]));
+        }
+    }
     if let Some(parsed) = parsed
         && !parsed.attachments.is_empty()
     {
@@ -332,5 +345,29 @@ mod tests {
         // Narrow: the reader takes the window, then Esc goes back.
         let shown = screen(&mut app, 60, 30);
         assert!(shown.contains("Are we still on"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn tags_show_under_the_date() {
+        let mut app = app();
+        with_mail(&mut app);
+        let (id, uid) = (app.accounts[0].id.clone(), app.items[0].message.uid);
+        let flags = Flags {
+            tags: vec!["travel".into(), "work".into()],
+            ..Flags::default()
+        };
+        app.store.set_flags(&id, "INBOX", &[(uid, flags)]).unwrap();
+        app.reload();
+        open_first(&mut app).await;
+        let shown = screen(&mut app, 160, 40);
+        let date = shown
+            .lines()
+            .position(|l| l.contains("Date  "))
+            .expect(&shown);
+        let tags = shown
+            .lines()
+            .position(|l| l.contains("Tags  #travel #work"))
+            .expect(&shown);
+        assert_eq!(tags, date + 1, "{shown}");
     }
 }
