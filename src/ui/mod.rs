@@ -793,6 +793,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         check(settings.mark_read),
         "Mark messages read when they're shown",
     );
+    add(
+        &mut lines,
+        HelpMenu::THREADS,
+        check(settings.threads),
+        "Group conversations (threads)",
+    );
     lines.push(Line::default());
     lines.push(heading(" Asking first"));
     add(

@@ -31,6 +31,8 @@ pub struct Settings {
     pub prefer_plain: bool,
     /// Mark a message read when it's opened.
     pub mark_read: bool,
+    /// Group the list's messages in conversations.
+    pub threads: bool,
     /// Ask before deleting mail.
     pub confirm_delete: bool,
     /// Ask before sending.
@@ -66,6 +68,7 @@ impl Default for Settings {
             preview: true,
             prefer_plain: false,
             mark_read: true,
+            threads: true,
             confirm_delete: false,
             confirm_send: true,
             check_minutes: 5,
@@ -190,13 +193,14 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuimail reads.
-const KNOWN: [&str; 15] = [
+const KNOWN: [&str; 16] = [
     "theme",
     "icons",
     "notifications",
     "preview",
     "prefer_plain",
     "mark_read",
+    "threads",
     "confirm_delete",
     "confirm_send",
     "check_minutes",

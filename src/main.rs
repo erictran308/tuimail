@@ -22,6 +22,7 @@ mod store;
 mod tags;
 mod text;
 mod theme;
+mod threads;
 mod tools;
 mod ui;
 mod utf7;

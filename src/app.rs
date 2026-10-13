@@ -164,6 +164,16 @@ pub enum Row {
 pub struct Item {
     pub account: usize,
     pub message: Message,
+    /// Where it is in its conversation (threads on).
+    pub thread: Thread,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Thread {
+    /// The lines before it: `├─`, `└─`… (`threads::Placed::tree`).
+    pub tree: String,
+    /// It answers a message with the same subject.
+    pub same_subject: bool,
 }
 
 impl Item {
@@ -440,12 +450,13 @@ impl HelpMenu {
     pub const PREVIEW: usize = 0;
     pub const PREFER_PLAIN: usize = 1;
     pub const MARK_READ: usize = 2;
-    pub const CONFIRM_DELETE: usize = 3;
-    pub const CONFIRM_SEND: usize = 4;
-    pub const NOTIFICATIONS: usize = 5;
-    pub const AGENTS: usize = 6;
-    pub const CONFIRM_AGENTS: usize = 7;
-    pub const THEMES: usize = 8;
+    pub const THREADS: usize = 3;
+    pub const CONFIRM_DELETE: usize = 4;
+    pub const CONFIRM_SEND: usize = 5;
+    pub const NOTIFICATIONS: usize = 6;
+    pub const AGENTS: usize = 7;
+    pub const CONFIRM_AGENTS: usize = 8;
+    pub const THEMES: usize = 9;
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
     pub fn new(tab: HelpTab) -> Self {
@@ -1732,10 +1743,29 @@ impl App {
             items.extend(found.unwrap_or_default().into_iter().map(|message| Item {
                 account: i,
                 message,
+                thread: Thread::default(),
             }));
         }
         if matches!(self.place, Place::AllInboxes) {
             items.sort_by_key(|it| std::cmp::Reverse(it.message.summary.date));
+        }
+        // In conversations; what a search finds stays newest first.
+        if self.settings.threads && self.search.is_none() {
+            let summaries: Vec<&mail::Summary> =
+                items.iter().map(|it| &it.message.summary).collect();
+            let order = crate::threads::arrange(&summaries);
+            let mut slots: Vec<Option<Item>> = items.into_iter().map(Some).collect();
+            items = order
+                .into_iter()
+                .filter_map(|placed| {
+                    let mut item = slots.get_mut(placed.index)?.take()?;
+                    item.thread = Thread {
+                        tree: placed.tree,
+                        same_subject: placed.same_subject,
+                    };
+                    Some(item)
+                })
+                .collect();
         }
         self.items = items;
         self.selected = current
@@ -4855,6 +4885,10 @@ impl App {
                 self.render();
             }
             HelpMenu::MARK_READ => self.save_setting("mark_read", flip(self.settings.mark_read)),
+            HelpMenu::THREADS => {
+                self.save_setting("threads", flip(self.settings.threads));
+                self.reload();
+            }
             HelpMenu::CONFIRM_DELETE => {
                 self.save_setting("confirm_delete", flip(self.settings.confirm_delete))
             }
@@ -5599,7 +5633,7 @@ pub mod tests {
             }
         );
         assert_eq!(subjects(&app)[0], "Lunch tomorrow?");
-        assert_eq!(app.items.len(), 18);
+        assert_eq!(app.items.len(), 20);
     }
 
     #[tokio::test]
@@ -6229,7 +6263,9 @@ pub mod tests {
         let mut app = two_accounts();
         app.open_place(Place::AllInboxes);
         app.focus = Focus::List;
-        app.marked = app.items.iter().take(3).map(Item::key).collect();
+        let work = app.items.iter().filter(|it| it.account == 0).take(2);
+        let home = app.items.iter().find(|it| it.account == 1);
+        app.marked = work.chain(home).map(Item::key).collect();
         let marked: Vec<_> = app.marked.iter().cloned().collect();
         assert!(marked.iter().any(|k| k.0 == 1), "a POP3 message among them");
         app.test_sent.borrow_mut().clear();

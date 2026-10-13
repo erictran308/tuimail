@@ -49,6 +49,24 @@ fn message(from: &str, to: &str, subject: &str, ago: i64, body: &str) -> String 
     )
 }
 
+/// A plain message answering those sent `answers` ago, oldest first: the
+/// last is the one it replies to.
+fn reply(from: &str, to: &str, subject: &str, ago: i64, body: &str, answers: &[i64]) -> String {
+    let ids: Vec<String> = answers
+        .iter()
+        .map(|ago| format!("<{ago}.demo@example.org>"))
+        .collect();
+    message(from, to, subject, ago, body).replacen(
+        "Content-Type: ",
+        &format!(
+            "In-Reply-To: {}\r\nReferences: {}\r\nContent-Type: ",
+            ids.last().map_or("", String::as_str),
+            ids.join(" ")
+        ),
+        1,
+    )
+}
+
 /// A message with an HTML body.
 fn html(from: &str, to: &str, subject: &str, ago: i64, body: &str) -> String {
     message(from, to, subject, ago, "").replace(
@@ -216,6 +234,28 @@ pub fn fill(store: &mut Store, accounts: &[Account]) {
                 12 * DAY,
                 "Notes from today:\n\n1. Rounded corners everywhere\n2. Keys in the accent color\n\
                  3. Fewer popups\n\nMaya",
+            ),
+            read.clone(),
+        ),
+        (
+            reply(
+                "Leo Park <leo@example.com>",
+                me,
+                "Re: Design review notes",
+                4 * DAY,
+                "Agreed on all three. Can confirmations keep their popup?\n\nLeo",
+                &[12 * DAY],
+            ),
+            read.clone(),
+        ),
+        (
+            reply(
+                "Maya Chen <maya@example.com>",
+                me,
+                "Re: Design review notes",
+                3 * HOUR,
+                "Yes: one popup, for questions only.\n\nMaya",
+                &[12 * DAY, 4 * DAY],
             ),
             read.clone(),
         ),

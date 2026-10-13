@@ -203,11 +203,21 @@ fn row(
     } else {
         String::new()
     };
-    let subject = if m.summary.subject.is_empty() {
+    // In a conversation, a reply's subject shows only if it's new.
+    let subject = if item.thread.same_subject && !m.preview.is_empty() {
+        String::new()
+    } else if m.summary.subject.is_empty() {
         "(no subject)".to_string()
     } else {
         m.summary.subject.clone()
     };
+    let tree = if item.thread.tree.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", item.thread.tree)
+    };
+    let tree = fit(&tree, tree.width().min(text_width / 2));
+    let text_width = text_width.saturating_sub(tree.width());
     let folder_width = folder.width().min(text_width);
     let folder = fit(&folder, folder_width);
     // Tags after the subject, in at most a third of its room.
@@ -217,7 +227,12 @@ fn row(
     let subject = fit(&subject, room.saturating_sub(tags.width()));
     let mut spare = room.saturating_sub(subject.width() + tags.width());
     let preview = if spare > 4 && !m.preview.is_empty() {
-        let p = fit(&format!(" · {}", m.preview), spare);
+        let lead = if subject.is_empty() && tags.is_empty() {
+            ""
+        } else {
+            " · "
+        };
+        let p = fit(&format!("{lead}{}", m.preview), spare);
         spare -= p.width();
         p
     } else {
@@ -235,6 +250,7 @@ fn row(
         clip,
         Span::styled(pad(&who, who_width), who_style),
         Span::raw(" "),
+        Span::styled(tree, Style::new().fg(c.dim)),
         Span::styled(folder, Style::new().fg(c.dim)),
         Span::styled(subject, subject_style),
         Span::styled(tags, Style::new().fg(c.tag)),
@@ -284,6 +300,29 @@ mod tests {
             "unread"
         );
         assert!(shown.contains("2 unread"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn a_conversation_is_drawn_as_a_tree_its_replies_by_their_text() {
+        let mut app = app();
+        with_mail(&mut app);
+        let shown = screen(&mut app, 160, 30);
+        let lines: Vec<&str> = shown.lines().collect();
+        let root = lines
+            .iter()
+            .position(|l| l.contains("Design review notes · Notes"))
+            .expect(&shown);
+        assert!(
+            lines[root + 1].contains("└─ Agreed on all three"),
+            "{shown}"
+        );
+        assert!(lines[root + 2].contains("  └─ Yes: one popup"), "{shown}");
+        // Second in the list: its newest message is the second newest.
+        assert!(lines[root - 1].contains("Release v0.1.0"), "{shown}");
+        app.settings.threads = false;
+        app.reload();
+        let flat = screen(&mut app, 160, 30);
+        assert!(!flat.contains("└─"), "{flat}");
     }
 
     #[tokio::test]
