@@ -104,6 +104,55 @@ pub struct Message {
     pub preview: String,
 }
 
+/// A change made to mail (a star, read or unread, a tag, a move), kept so
+/// it can be listed and undone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    /// 0 until it's kept.
+    pub id: i64,
+    /// Unix seconds.
+    pub at: i64,
+    /// Who made it: empty for you, else the program's name.
+    pub who: String,
+    pub what: What,
+    pub messages: Vec<Changed>,
+    pub undone: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum What {
+    /// Marked read (`true`) or unread.
+    Seen(bool),
+    /// Starred or not.
+    Flagged(bool),
+    /// A tag put on (`true`) or taken off.
+    Tag(String, bool),
+    /// Moved: each message says where to.
+    Move,
+}
+
+/// A message a [`Change`] changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Changed {
+    pub account: String,
+    pub folder: String,
+    /// What `uid` meant when it was changed.
+    pub uidvalidity: u32,
+    pub uid: u32,
+    /// Its Message-ID: how a moved message is found again.
+    pub message_id: String,
+    /// It had the flag or tag before.
+    pub had: bool,
+    /// Moves: the folder it went to, and its UID there if known (folders
+    /// kept here).
+    pub moved_to: String,
+    pub new_uid: u32,
+}
+
+/// Changes are kept this long (seconds), and at most [`MAX_CHANGES`].
+const KEEP_CHANGES_FOR: i64 = 30 * 24 * 3600;
+const MAX_CHANGES: i64 = 1000;
+
 /// A message's headers as fetched, to store.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Header {
@@ -176,6 +225,30 @@ CREATE TABLE IF NOT EXISTS pop_seen (
     remove INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, pop_id)
 );
+-- Changes made to mail, so they can be listed and undone: a row per
+-- action, and a `changed` row per message. Nothing a message says is kept
+-- here: it's looked up in the cache to show.
+CREATE TABLE IF NOT EXISTS changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at INTEGER NOT NULL,
+    who TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    tag TEXT NOT NULL DEFAULT '',
+    turned_on INTEGER NOT NULL DEFAULT 0,
+    undone INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS changed (
+    change_id INTEGER NOT NULL,
+    account TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    uidvalidity INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    message_id TEXT NOT NULL,
+    had INTEGER NOT NULL DEFAULT 0,
+    moved_to TEXT NOT NULL DEFAULT '',
+    new_uid INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS changed_by_change ON changed(change_id);
 CREATE TABLE IF NOT EXISTS addresses (
     addr TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -693,14 +766,15 @@ impl Store {
         Ok(uid)
     }
 
-    /// Moves messages between folders kept here; their new UIDs.
+    /// Moves messages between folders kept here; the UIDs of those moved,
+    /// before and after.
     pub fn move_local(
         &mut self,
         account: &str,
         from: &str,
         uids: &[u32],
         to: &str,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Vec<(u32, u32)>> {
         let mut moved = Vec::new();
         for &uid in uids {
             let Some(raw) = self.body(account, from, uid)? else {
@@ -724,7 +798,7 @@ impl Store {
         // Only what was copied goes.
         let gone: Vec<u32> = moved.iter().map(|(old, _)| *old).collect();
         self.remove(account, from, &gone)?;
-        Ok(moved.into_iter().map(|(_, new)| new).collect())
+        Ok(moved)
     }
 
     /// The POP3 ids of every message ever downloaded for the account, so
@@ -918,6 +992,141 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    // Changes.
+
+    /// Keeps a change; its id. Changes older than [`KEEP_CHANGES_FOR`], or
+    /// past the newest [`MAX_CHANGES`], go.
+    pub fn add_change(&mut self, change: &Change, now: i64) -> Result<i64> {
+        let (kind, tag, on) = match &change.what {
+            What::Seen(on) => ("seen", "", *on),
+            What::Flagged(on) => ("flagged", "", *on),
+            What::Tag(tag, on) => ("tag", tag.as_str(), *on),
+            What::Move => ("move", "", false),
+        };
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "INSERT INTO changes (at, who, kind, tag, turned_on, undone)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![change.at, change.who, kind, tag, on, change.undone],
+        )?;
+        let id = tx.last_insert_rowid();
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO changed (change_id, account, folder, uidvalidity, uid, message_id,
+                     had, moved_to, new_uid)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for m in &change.messages {
+                stmt.execute(params![
+                    id,
+                    m.account,
+                    m.folder,
+                    m.uidvalidity,
+                    m.uid,
+                    m.message_id,
+                    m.had,
+                    m.moved_to,
+                    m.new_uid
+                ])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM changes WHERE at < ?1 OR id <= ?2",
+            params![now - KEEP_CHANGES_FOR, id - MAX_CHANGES],
+        )?;
+        tx.execute(
+            "DELETE FROM changed WHERE change_id NOT IN (SELECT id FROM changes)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// The newest changes first, at most `limit`.
+    pub fn changes(&self, limit: usize) -> Result<Vec<Change>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, at, who, kind, tag, turned_on, undone FROM changes
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            let kind: String = r.get(3)?;
+            let on: bool = r.get(5)?;
+            let what = match kind.as_str() {
+                "seen" => What::Seen(on),
+                "flagged" => What::Flagged(on),
+                "tag" => What::Tag(r.get(4)?, on),
+                _ => What::Move,
+            };
+            Ok(Change {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                who: text::one_line(&r.get::<_, String>(2)?, 60),
+                what,
+                messages: Vec::new(),
+                undone: r.get(6)?,
+            })
+        })?;
+        let mut changes = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stmt = self.db.prepare(
+            "SELECT account, folder, uidvalidity, uid, message_id, had, moved_to, new_uid
+             FROM changed WHERE change_id = ?1",
+        )?;
+        for change in &mut changes {
+            let rows = stmt.query_map(params![change.id], |r| {
+                Ok(Changed {
+                    account: r.get(0)?,
+                    folder: r.get(1)?,
+                    uidvalidity: r.get(2)?,
+                    uid: r.get(3)?,
+                    message_id: r.get(4)?,
+                    had: r.get(5)?,
+                    moved_to: r.get(6)?,
+                    new_uid: r.get(7)?,
+                })
+            })?;
+            change.messages = rows.collect::<rusqlite::Result<_>>()?;
+        }
+        // A tag changed by hand in the file is no tag.
+        changes.retain(
+            |c| !matches!(&c.what, What::Tag(tag, _) if tags::normalize(tag).as_ref() != Some(tag)),
+        );
+        Ok(changes)
+    }
+
+    pub fn change(&self, id: i64) -> Result<Option<Change>> {
+        // Few enough to read them all.
+        Ok(self
+            .changes(MAX_CHANGES as usize)?
+            .into_iter()
+            .find(|c| c.id == id))
+    }
+
+    pub fn set_undone(&self, id: i64) -> Result<()> {
+        self.db
+            .execute("UPDATE changes SET undone = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// The UIDs in `folder` of cached messages with these Message-IDs.
+    pub fn with_message_ids(
+        &self,
+        account: &str,
+        folder: &str,
+        ids: &[String],
+    ) -> Result<Vec<u32>> {
+        let mut stmt = self.db.prepare(
+            "SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 AND message_id = ?3",
+        )?;
+        let mut uids = Vec::new();
+        for id in ids.iter().filter(|id| !id.is_empty()) {
+            let rows = stmt.query_map(params![account, folder, id], |r| r.get(0))?;
+            uids.extend(rows.collect::<rusqlite::Result<Vec<u32>>>()?);
+        }
+        uids.sort_unstable();
+        uids.dedup();
+        Ok(uids)
+    }
+
     /// Forgets everything about an account: it was removed.
     pub fn forget_account(&self, account: &str) -> Result<()> {
         for table in [
@@ -926,12 +1135,17 @@ impl Store {
             "bodies",
             "pop_seen",
             "pending_deletes",
+            "changed",
         ] {
             self.db.execute(
                 &format!("DELETE FROM {table} WHERE account = ?1"),
                 params![account],
             )?;
         }
+        self.db.execute(
+            "DELETE FROM changes WHERE id NOT IN (SELECT change_id FROM changed)",
+            [],
+        )?;
         self.scrub();
         Ok(())
     }
@@ -1079,6 +1293,49 @@ pub mod tests {
         assert_eq!(m.flags.tags, ["work"]);
     }
 
+    fn a_change(at: i64, account: &str) -> Change {
+        Change {
+            id: 0,
+            at,
+            who: String::new(),
+            what: What::Tag("work".into(), true),
+            messages: vec![Changed {
+                account: account.into(),
+                folder: "INBOX".into(),
+                uidvalidity: 7,
+                uid: 1,
+                message_id: "a@b".into(),
+                ..Changed::default()
+            }],
+            undone: false,
+        }
+    }
+
+    #[test]
+    fn changes_are_kept_newest_first_for_a_while() {
+        let mut store = Store::in_memory();
+        let day = 24 * 3600;
+        let old = store.add_change(&a_change(0, "a"), 0).unwrap();
+        let mut moved = a_change(40 * day, "a");
+        moved.what = What::Move;
+        moved.messages[0].moved_to = "Trash".into();
+        let id = store.add_change(&moved, 40 * day).unwrap();
+        let changes = store.changes(10).unwrap();
+        assert_eq!(changes.len(), 1, "the 40-day-old one went");
+        assert!(store.change(old).unwrap().is_none());
+        assert_eq!(changes[0], Change { id, ..moved });
+        store.set_undone(id).unwrap();
+        assert!(store.change(id).unwrap().unwrap().undone);
+        for i in 0..MAX_CHANGES + 5 {
+            store
+                .add_change(&a_change(40 * day + i, "b"), 40 * day)
+                .unwrap();
+        }
+        assert_eq!(store.changes(5000).unwrap().len(), MAX_CHANGES as usize);
+        store.forget_account("b").unwrap();
+        assert!(store.changes(5000).unwrap().is_empty());
+    }
+
     #[test]
     fn folders_are_kept_in_the_sidebars_order_and_gone_ones_removed() {
         let mut store = Store::in_memory();
@@ -1194,7 +1451,7 @@ Hi,\r\n\r\nthe numbers are in.\r\n> old quote\r\n-- \r\nAlice\r\n";
         assert_eq!((one, two), (1, 2));
         assert_eq!(store.pop_seen("p").unwrap().len(), 2);
         let moved = store.move_local("p", "INBOX", &[1], "Trash").unwrap();
-        assert_eq!(moved, [1]);
+        assert_eq!(moved, [(1, 1)]);
         store.mark_pop_removal("p", "Trash", &[1]).unwrap();
         assert_eq!(store.pop_removals("p").unwrap(), ["uidl-1"]);
         store

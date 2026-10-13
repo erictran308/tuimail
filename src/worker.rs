@@ -97,6 +97,13 @@ pub enum Request {
         uids: Vec<u32>,
         uidvalidity: u32,
     },
+    /// Moves messages back from `folder` to `to` (an undo): found by their
+    /// Message-IDs, since their UIDs in `folder` aren't known.
+    MoveBack {
+        folder: String,
+        message_ids: Vec<String>,
+        to: String,
+    },
     /// Puts a tag on messages (`on`) or takes it off.
     Tag {
         folder: String,
@@ -127,6 +134,7 @@ impl Request {
             Request::Flag { .. }
                 | Request::Tag { .. }
                 | Request::Move { .. }
+                | Request::MoveBack { .. }
                 | Request::Delete { .. }
                 | Request::Append { retry: true, .. }
         )
@@ -141,7 +149,7 @@ impl Request {
             Request::Body { .. } => "downloading the message",
             Request::Flag { .. } => "changing flags",
             Request::Tag { .. } => "tagging",
-            Request::Move { .. } => "moving mail",
+            Request::Move { .. } | Request::MoveBack { .. } => "moving mail",
             Request::Delete { .. } => "deleting mail",
             Request::Append { .. } => "saving a copy",
             Request::Headers { .. } => "checking for mail",
@@ -221,6 +229,14 @@ pub enum Event {
     /// The server did what was asked (a move).
     Done {
         folder: String,
+    },
+    /// Messages moved back ([`Request::MoveBack`]): `found` of the
+    /// `asked` Message-IDs were in `folder`.
+    MovedBack {
+        folder: String,
+        to: String,
+        found: usize,
+        asked: usize,
     },
     /// Deletes for good the server made (`all`: and expunged).
     Deleted {
@@ -649,6 +665,23 @@ async fn handle_imap(
             select_same(s, &folder, uidvalidity).await?;
             imap::move_to(s, caps, &uids, &to).await?;
             sink(Event::Done { folder: to });
+        }
+        Request::MoveBack {
+            folder,
+            message_ids,
+            to,
+        } => {
+            imap::select(s, &folder).await?;
+            let (uids, found) = imap::find_message_ids(s, &message_ids).await?;
+            if !uids.is_empty() {
+                imap::move_to(s, caps, &uids, &to).await?;
+            }
+            sink(Event::MovedBack {
+                folder,
+                to,
+                found,
+                asked: message_ids.len(),
+            });
         }
         Request::Delete {
             folder,

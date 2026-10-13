@@ -454,6 +454,39 @@ pub async fn search(session: &mut Session, criteria: &str) -> Result<Vec<u32>> {
     Ok(uids)
 }
 
+/// The UIDs of messages in the selected folder whose Message-ID (without
+/// its angle brackets) is one of `ids`, and how many of `ids` were found.
+/// SEARCH HEADER matches part of a header, so what it finds is checked
+/// against the whole Message-ID.
+pub async fn find_message_ids(session: &mut Session, ids: &[String]) -> Result<(Vec<u32>, usize)> {
+    // Valid ids have no quotes, backslashes, spaces or brackets: they go
+    // in a quoted string as they are.
+    let ids: Vec<&String> = ids.iter().filter(|id| mail::valid_id(id)).collect();
+    let mut found = Vec::new();
+    for chunk in ids.chunks(20) {
+        let criteria = chunk
+            .iter()
+            .rev()
+            .map(|id| format!("HEADER Message-ID \"<{id}>\""))
+            .reduce(|rest, one| format!("OR {one} {rest}"));
+        if let Some(criteria) = criteria {
+            found.extend(search(session, &criteria).await?);
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    let wanted: std::collections::HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+    let mut uids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for header in headers(session, &found).await? {
+        if wanted.contains(header.summary.message_id.as_str()) {
+            uids.push(header.uid);
+            seen.insert(header.summary.message_id);
+        }
+    }
+    Ok((uids, seen.len()))
+}
+
 /// UIDs written as IMAP sets, `1:5,7,9:12`, a command's worth each.
 pub fn uid_sets(uids: &[u32]) -> Vec<String> {
     let mut sorted = uids.to_vec();

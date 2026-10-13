@@ -162,7 +162,7 @@ fn ids(value: &HeaderValue) -> Vec<String> {
 
 /// A message id tuimail keeps and sends back in a reply's headers: no
 /// spaces, brackets or control characters, so it can't break a header.
-fn valid_id(id: &str) -> bool {
+pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_ID
         && id

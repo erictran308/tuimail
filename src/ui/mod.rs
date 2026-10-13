@@ -377,6 +377,7 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
         PickerKind::Links => " `Enter` open · `y` copy · `Esc` close ",
         PickerKind::Attachments => " `Enter` open · `s` save to Downloads · `Esc` close ",
         PickerKind::Tag { .. } => " `Enter` put on or take off · `Esc` cancel ",
+        PickerKind::Changes(_) => " `Enter` undo · `Esc` close ",
     };
     // Links in columns: the site (from the whole URL, never from what the
     // link says), what it says, then the URL.
@@ -597,7 +598,7 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const HELP: [(&str, &str); 30] = [
+const HELP: [(&str, &str); 31] = [
     ("←↓↑→  h j k l", "move; Enter or → opens"),
     ("Tab", "folders → messages → message"),
     ("gg  G  Ctrl-u Ctrl-d", "first, last, half a page"),
@@ -607,6 +608,10 @@ const HELP: [(&str, &str); 30] = [
     ("e  /  !", "archive  /  junk"),
     ("m", "move to a folder"),
     ("t", "tag: put a tag on or take it off; tag:work searches"),
+    (
+        "z  /  Z",
+        "undo the last change  /  the changes, to undo one",
+    ),
     ("s  /  u", "star  /  read or unread"),
     (
         "Space  /  *",

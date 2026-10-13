@@ -326,6 +326,29 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
         _ => None,
     })
     .await;
+    // Undone: found in Archive by its Message-ID (one that isn't there
+    // is said to be missing), moved back, and moved to Archive again.
+    let ids = vec![
+        header.summary.message_id.clone(),
+        "nowhere@example.com".into(),
+    ];
+    assert!(!ids[0].is_empty());
+    for (from, to, found) in [("Archive", "INBOX", 1), ("INBOX", "Archive", 1)] {
+        bob.tx
+            .send(Request::MoveBack {
+                folder: from.into(),
+                message_ids: ids.clone(),
+                to: to.into(),
+            })
+            .unwrap();
+        let back = next(&mut events, |e| match e {
+            Event::MovedBack { found, asked, .. } => Some((found, asked)),
+            Event::Failed { error, .. } => panic!("{error}"),
+            _ => None,
+        })
+        .await;
+        assert_eq!(back, (found, 2), "from {from}");
+    }
     bob.tx
         .send(Request::Append {
             folder: "Archive".into(),

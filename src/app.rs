@@ -25,7 +25,7 @@ use crate::notify::{self, Notifications, Notifier};
 use crate::secrets::{Credentials, Secret};
 use crate::settings::Settings;
 use crate::setup::{self, Setup};
-use crate::store::{self, Flags, Folder, Known, Message, Role, Store};
+use crate::store::{self, Change, Changed, Flags, Folder, Known, Message, Role, Store, What};
 use crate::theme::{self, Colors};
 use crate::worker::{self, Endpoints, Request, State, Worker};
 use crate::{net, tags, text, tools};
@@ -277,6 +277,8 @@ pub enum PickerKind {
     },
     Links,
     Attachments,
+    /// Changes to undo, by id, in the items' order.
+    Changes(Vec<i64>),
     /// A tag to put on these messages or take off, or (the last item) a
     /// new one to type.
     Tag {
@@ -447,6 +449,8 @@ pub struct App {
     pub prompt: Option<Prompt>,
     /// The messages a new tag being typed is for.
     tagging: Vec<Group>,
+    /// The change being made, kept once the key that makes it is done.
+    change: Option<Change>,
     pub picker: Option<Picker>,
     pub confirm: Option<Confirm>,
     confirm_at: Instant,
@@ -567,6 +571,7 @@ impl App {
             setup: None,
             prompt: None,
             tagging: Vec::new(),
+            change: None,
             picker: None,
             confirm: None,
             confirm_at: Instant::now(),
@@ -1123,6 +1128,22 @@ impl App {
                 }
             }
             E::Done { folder } => self.folder_changed(i, &folder),
+            E::MovedBack {
+                folder,
+                to,
+                found,
+                asked,
+            } => {
+                self.folder_changed(i, &folder);
+                self.folder_changed(i, &to);
+                if found < asked {
+                    self.error(format!(
+                        "{} of them weren't in {} any more, so stay where they are",
+                        asked - found,
+                        self.folder_name(i, &folder)
+                    ));
+                }
+            }
             E::Waiting(n) => self.accounts[i].waiting = n,
             E::Deleted { folder, uids, all } => {
                 let id = self.accounts[i].id.clone();
@@ -1910,6 +1931,23 @@ impl App {
             },
             _ => return,
         };
+        let what = match flag {
+            FlagKind::Seen => What::Seen(on),
+            FlagKind::Flagged => What::Flagged(on),
+            FlagKind::Answered => return,
+        };
+        let changed = targets
+            .iter()
+            .filter_map(|key| {
+                let mut c = self.changed(key)?;
+                c.had = match flag {
+                    FlagKind::Seen => self.flags_of(key)?.seen,
+                    _ => self.flags_of(key)?.flagged,
+                };
+                Some(c)
+            })
+            .collect();
+        self.note_change(what, changed);
         self.set_flag(&targets, flag, on);
         if flag == FlagKind::Seen
             && let Some(reader) = self.reader.as_mut()
@@ -1990,8 +2028,35 @@ impl App {
     }
 
     /// Puts `tag` on messages (`on`) or takes it off, here and on the
-    /// server.
+    /// server, as a change that can be undone.
     fn tag(&mut self, groups: Vec<Group>, tag: &str, on: bool) {
+        let changed = groups
+            .iter()
+            .filter(|g| {
+                self.uidvalidity(g.account, &g.folder) == g.uidvalidity || g.uidvalidity == 0
+            })
+            .flat_map(|g| g.uids.iter().map(|u| (g.account, g.folder.clone(), *u)))
+            .filter_map(|key| {
+                let mut c = self.changed(&key)?;
+                c.had = self.flags_of(&key)?.tags.iter().any(|t| t == tag);
+                Some(c)
+            })
+            .collect();
+        self.note_change(What::Tag(tag.to_string(), on), changed);
+        let count = self.apply_tag(groups, tag, on);
+        if count > 0 {
+            self.info(if on {
+                format!("{} tagged {tag}", plural(count, "message"))
+            } else {
+                format!("{tag} taken off {}", plural(count, "message"))
+            });
+        }
+        self.marked.clear();
+    }
+
+    /// Puts `tag` on messages or takes it off, here and on the server; how
+    /// many.
+    fn apply_tag(&mut self, groups: Vec<Group>, tag: &str, on: bool) -> usize {
         let mut count = 0;
         for g in groups {
             if g.account >= self.accounts.len()
@@ -2019,14 +2084,273 @@ impl App {
                 );
             }
         }
-        if count > 0 {
-            self.info(if on {
-                format!("{} tagged {tag}", plural(count, "message"))
-            } else {
-                format!("{tag} taken off {}", plural(count, "message"))
-            });
+        count
+    }
+
+    // Changes: kept so they can be listed and undone.
+
+    /// A message as a change keeps it (before the change).
+    fn changed(&self, key: &(usize, String, u32)) -> Option<Changed> {
+        let account = self.accounts.get(key.0)?;
+        let message = self.store.message(&account.id, &key.1, key.2).ok()??;
+        Some(Changed {
+            account: account.id.clone(),
+            folder: key.1.clone(),
+            uidvalidity: self.uidvalidity(key.0, &key.1),
+            uid: key.2,
+            message_id: message.summary.message_id,
+            ..Changed::default()
+        })
+    }
+
+    fn flags_of(&self, key: &(usize, String, u32)) -> Option<Flags> {
+        let account = self.accounts.get(key.0)?;
+        let message = self.store.message(&account.id, &key.1, key.2).ok()??;
+        Some(message.flags)
+    }
+
+    /// Adds to the change being made (one key's, which can act on several
+    /// folders), or starts another.
+    fn note_change(&mut self, what: What, messages: Vec<Changed>) {
+        if messages.is_empty() {
+            return;
         }
-        self.marked.clear();
+        match self.change.as_mut() {
+            Some(change) if change.what == what => change.messages.extend(messages),
+            _ => {
+                self.keep_change();
+                self.change = Some(Change {
+                    id: 0,
+                    at: now(),
+                    who: String::new(),
+                    what,
+                    messages,
+                    undone: false,
+                });
+            }
+        }
+    }
+
+    /// Keeps the change being made, if any.
+    fn keep_change(&mut self) {
+        if let Some(change) = self.change.take() {
+            let _ = self.store.add_change(&change, now());
+        }
+    }
+
+    /// What a change did, as the status line says it.
+    pub fn describe(&self, change: &Change) -> String {
+        let n = plural(change.messages.len(), "message");
+        match &change.what {
+            What::Seen(true) => format!("{n} marked read"),
+            What::Seen(false) => format!("{n} marked unread"),
+            What::Flagged(true) => format!("{n} starred"),
+            What::Flagged(false) => format!("{n} unstarred"),
+            What::Tag(tag, true) => format!("{n} tagged {tag}"),
+            What::Tag(tag, false) => format!("{tag} taken off {n}"),
+            What::Move => {
+                let to = change
+                    .messages
+                    .first()
+                    .and_then(|m| {
+                        Some(self.folder_name(self.account_index(&m.account)?, &m.moved_to))
+                    })
+                    .unwrap_or_default();
+                format!("{n} moved to {to}")
+            }
+        }
+    }
+
+    /// `z`: undoes the newest change not undone yet.
+    fn undo_last(&mut self) {
+        self.keep_change();
+        let last = self
+            .store
+            .changes(50)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| !c.undone);
+        match last {
+            Some(change) => self.undo(change),
+            None => self.info("Nothing to undo"),
+        }
+    }
+
+    /// `Z`: picks a change to undo, newest first.
+    fn pick_change(&mut self) {
+        self.keep_change();
+        let changes = self.store.changes(100).unwrap_or_default();
+        if changes.is_empty() {
+            return self.info("No changes yet");
+        }
+        let now = now();
+        let items = changes
+            .iter()
+            .map(|c| {
+                let who = if c.who.is_empty() { "you" } else { &c.who };
+                let undone = if c.undone { " (undone)" } else { "" };
+                format!(
+                    "{:>9}  {who}: {}{undone}",
+                    mail::short_date(c.at, now),
+                    self.describe(c)
+                )
+            })
+            .collect();
+        self.picker = Some(Picker {
+            kind: PickerKind::Changes(changes.iter().map(|c| c.id).collect()),
+            title: " Changes ".into(),
+            items,
+            labels: Vec::new(),
+            selected: 0,
+        });
+    }
+
+    /// Undoes a change: flags and tags set back on the messages it changed
+    /// (those that were already so are left), moved messages moved back.
+    fn undo(&mut self, change: Change) {
+        if change.undone {
+            return self.info("That was undone already");
+        }
+        let what = self.describe(&change);
+        // By account and folder, and for moves where they went.
+        let mut groups: Vec<(usize, String, u32, String, Vec<Changed>)> = Vec::new();
+        for m in change.messages {
+            let Some(account) = self.account_index(&m.account) else {
+                continue;
+            };
+            match groups.iter_mut().find(|g| {
+                g.0 == account && g.1 == m.folder && g.2 == m.uidvalidity && g.3 == m.moved_to
+            }) {
+                Some(g) => g.4.push(m),
+                None => groups.push((
+                    account,
+                    m.folder.clone(),
+                    m.uidvalidity,
+                    m.moved_to.clone(),
+                    vec![m],
+                )),
+            }
+        }
+        let _ = self.store.set_undone(change.id);
+        self.info(format!("Undone: {what}"));
+        for (account, folder, uidvalidity, moved_to, messages) in groups {
+            match &change.what {
+                What::Seen(on) | What::Flagged(on) => {
+                    if !self.still_means(account, &folder, uidvalidity) {
+                        continue;
+                    }
+                    let flag = if matches!(change.what, What::Seen(_)) {
+                        FlagKind::Seen
+                    } else {
+                        FlagKind::Flagged
+                    };
+                    let keys: Vec<_> = messages
+                        .iter()
+                        .filter(|m| m.had != *on)
+                        .map(|m| (account, folder.clone(), m.uid))
+                        .collect();
+                    self.set_flag(&keys, flag, !on);
+                }
+                What::Tag(tag, on) => {
+                    let uids = messages
+                        .iter()
+                        .filter(|m| m.had != *on)
+                        .map(|m| m.uid)
+                        .collect();
+                    let group = Group {
+                        account,
+                        folder,
+                        uids,
+                        uidvalidity,
+                    };
+                    self.apply_tag(vec![group], tag, !on);
+                }
+                What::Move => self.move_back(account, &moved_to, &folder, &messages),
+            }
+        }
+    }
+
+    /// Moves messages back from `from`, where a change moved them, to
+    /// `to`. In folders kept here, a message is found by its UID there if
+    /// that's still it, else by its Message-ID; on the server, by its
+    /// Message-ID.
+    fn move_back(&mut self, account: usize, from: &str, to: &str, messages: &[Changed]) {
+        let id = self.accounts[account].id.clone();
+        let ids: Vec<String> = messages
+            .iter()
+            .map(|m| m.message_id.clone())
+            .filter(|m| !m.is_empty())
+            .collect();
+        let local = self.accounts[account].is_pop() || self.demo;
+        let mut uids = self
+            .store
+            .with_message_ids(&id, from, &ids)
+            .unwrap_or_default();
+        if local {
+            uids.extend(messages.iter().map(|m| m.new_uid).filter(|&uid| {
+                uid != 0
+                    && messages.iter().any(|m| {
+                        m.new_uid == uid
+                            && self
+                                .store
+                                .message(&id, from, uid)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|x| x.summary.message_id == m.message_id)
+                    })
+            }));
+            uids.sort_unstable();
+            uids.dedup();
+        }
+        let keys: Vec<_> = uids
+            .iter()
+            .map(|u| (account, from.to_string(), *u))
+            .collect();
+        if local {
+            let _ = self.store.move_local(&id, from, &uids, to);
+            self.refresh_counts(account, from);
+            self.refresh_counts(account, to);
+            let missing = messages.len().saturating_sub(uids.len());
+            if missing > 0 {
+                self.error(format!(
+                    "{} of them weren't in {} any more, so stay where they are",
+                    missing,
+                    self.folder_name(account, from)
+                ));
+            }
+        } else {
+            // Off the list here at once; the server finds them by
+            // Message-ID, and the next check brings them back where they
+            // were.
+            let unread = self.unread_among(account, from, &uids);
+            let _ = self.store.remove(&id, from, &uids);
+            for key in &keys {
+                self.local_removed.insert(key.clone(), Instant::now());
+            }
+            self.note_removed(account, from, uids.len(), unread);
+            if !ids.is_empty() {
+                self.send(
+                    account,
+                    Request::MoveBack {
+                        folder: from.to_string(),
+                        message_ids: ids.clone(),
+                        to: to.to_string(),
+                    },
+                );
+            }
+            let nameless = messages.len() - ids.len();
+            if nameless > 0 {
+                self.error(format!(
+                    "{} without a Message-ID can't be found again: look in {}",
+                    plural(nameless, "message"),
+                    self.folder_name(account, from)
+                ));
+            }
+        }
+        self.take_off_list(&keys);
+        if self.shows(account, to) {
+            self.reload();
+        }
     }
 
     /// Takes messages off the list (moved or deleted), keeping the cursor
@@ -2057,8 +2381,21 @@ impl App {
             .map(|u| (account, folder.to_string(), *u))
             .collect();
         let unread = self.unread_among(account, folder, uids);
+        let mut changed: Vec<Changed> = keys.iter().filter_map(|k| self.changed(k)).collect();
+        for c in &mut changed {
+            c.moved_to = to.to_string();
+        }
         if self.accounts[account].is_pop() || self.demo {
-            let _ = self.store.move_local(&id, folder, uids, to);
+            let moved = self
+                .store
+                .move_local(&id, folder, uids, to)
+                .unwrap_or_default();
+            for c in &mut changed {
+                c.new_uid = moved
+                    .iter()
+                    .find(|(old, _)| *old == c.uid)
+                    .map_or(0, |(_, new)| *new);
+            }
             self.refresh_counts(account, to);
         } else {
             let _ = self.store.remove(&id, folder, uids);
@@ -2077,6 +2414,7 @@ impl App {
         }
         self.note_removed(account, folder, uids.len(), unread);
         self.take_off_list(&keys);
+        self.note_change(What::Move, changed);
     }
 
     /// How many of these messages are unread, before they go.
@@ -2950,6 +3288,12 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        self.handle_key(key);
+        // What the key changed is one change, to undo at once.
+        self.keep_change();
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
         }
@@ -3015,6 +3359,8 @@ impl App {
                     self.setup = Some(Setup::default());
                     return;
                 }
+                KeyCode::Char('z') => return self.undo_last(),
+                KeyCode::Char('Z') => return self.pick_change(),
                 _ => {}
             }
         }
@@ -3438,6 +3784,15 @@ impl App {
                             self.prompt = Some(Prompt::new(PromptKind::Tag, ""));
                         }
                     },
+                    (PickerKind::Changes(ids), KeyCode::Enter) => {
+                        match ids
+                            .get(n)
+                            .and_then(|id| self.store.change(*id).ok().flatten())
+                        {
+                            Some(change) => self.undo(change),
+                            None => self.error("That change is no longer kept"),
+                        }
+                    }
                     (PickerKind::Links, code) => {
                         let link = self
                             .reader
@@ -5073,5 +5428,154 @@ pub mod tests {
         assert!(app.items.is_empty());
         app.run_search("tag:nothing");
         assert!(app.items.is_empty());
+    }
+    #[tokio::test]
+    async fn z_undoes_the_last_change_and_only_what_it_changed() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        let unread = |app: &App| app.accounts[0].folder_for(Role::Inbox).unwrap().unread;
+        let seen = |app: &App| -> Vec<bool> {
+            app.items
+                .iter()
+                .take(3)
+                .map(|i| i.message.flags.seen)
+                .collect()
+        };
+        let before = seen(&app);
+        assert_eq!(before, [false, false, true]);
+        assert_eq!(unread(&app), 2);
+        app.marked = app.items.iter().take(3).map(Item::key).collect();
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(seen(&app), [true, true, true]);
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(seen(&app), before, "the one read before stays read");
+        assert_eq!(unread(&app), 2);
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "Undone: 3 messages marked read"
+        );
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(app.status.as_ref().unwrap().text, "Nothing to undo");
+    }
+
+    #[tokio::test]
+    async fn changes_are_undone_newest_first() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        app.selected = 0;
+        pick_tag(&mut app, Some("work"));
+        app.on_key(key(KeyCode::Char('s')));
+        let message = |app: &App| app.items[0].message.flags.clone();
+        assert!(message(&app).flagged && message(&app).tags == ["work"]);
+        app.on_key(key(KeyCode::Char('z')));
+        assert!(!message(&app).flagged && message(&app).tags == ["work"]);
+        app.on_key(key(KeyCode::Char('z')));
+        assert!(message(&app).tags.is_empty());
+        assert!(stored_selected(&app).flags.tags.is_empty());
+        assert!(matches!(
+            last_sent(&app),
+            Some((0, Request::Tag { on: false, .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_message_moved_to_trash_comes_back_with_z() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        app.selected = 0;
+        let total = subjects(&app).len();
+        app.on_key(key(KeyCode::Char('d')));
+        assert!(!subjects(&app).contains(&"Lunch tomorrow?".to_string()));
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "Undone: 1 message moved to Trash"
+        );
+        assert_eq!(subjects(&app).len(), total);
+        assert_eq!(subjects(&app)[0], "Lunch tomorrow?");
+        let trash = app.accounts[0]
+            .folder_for(Role::Trash)
+            .unwrap()
+            .name
+            .clone();
+        assert!(
+            app.store
+                .messages(&app.accounts[0].id, &trash, 100)
+                .unwrap()
+                .iter()
+                .all(|m| m.summary.subject != "Lunch tomorrow?")
+        );
+    }
+
+    #[tokio::test]
+    async fn on_the_server_a_move_is_undone_by_message_id() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.demo = false;
+        app.focus = Focus::List;
+        app.selected = 0;
+        let message_id = app.items[0].message.summary.message_id.clone();
+        assert!(!message_id.is_empty());
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(matches!(
+            last_sent(&app),
+            Some((0, Request::Move { ref to, .. })) if to == "Archive"
+        ));
+        app.on_key(key(KeyCode::Char('z')));
+        assert!(
+            matches!(
+                last_sent(&app),
+                Some((0, Request::MoveBack { ref folder, ref message_ids, ref to }))
+                    if folder == "Archive" && message_ids == std::slice::from_ref(&message_id) && to == "INBOX"
+            ),
+            "{:?}",
+            last_sent(&app)
+        );
+        // The server didn't find it there any more.
+        app.on_worker(
+            0,
+            worker::Event::MovedBack {
+                folder: "Archive".into(),
+                to: "INBOX".into(),
+                found: 0,
+                asked: 1,
+            },
+        );
+        let status = app.status.as_ref().unwrap();
+        assert!(
+            status.error && status.text.starts_with("1 of them"),
+            "{}",
+            status.text
+        );
+    }
+
+    #[tokio::test]
+    async fn the_changes_list_undoes_the_one_picked() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        app.selected = 0;
+        app.on_key(key(KeyCode::Char('s')));
+        app.selected = 1;
+        app.on_key(key(KeyCode::Char('s')));
+        app.on_key(key(KeyCode::Char('Z')));
+        let picker = app.picker.as_ref().expect("the changes");
+        assert_eq!(picker.items.len(), 2);
+        assert!(
+            picker.items[0].ends_with("you: 1 message starred"),
+            "{:?}",
+            picker.items
+        );
+        // The older one: the first message's star.
+        app.picker.as_mut().unwrap().selected = 1;
+        app.on_key(key(KeyCode::Enter));
+        assert!(!app.items[0].message.flags.flagged);
+        assert!(app.items[1].message.flags.flagged, "the newer one stays");
+        app.on_key(key(KeyCode::Char('Z')));
+        let items = &app.picker.as_ref().unwrap().items;
+        assert!(items[1].ends_with("(undone)"), "{items:?}");
     }
 }
