@@ -6,12 +6,12 @@ use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
-use unicode_width::UnicodeWidthStr;
 
 use super::{bordered, fit, hint_spans};
 use crate::app::App;
 use crate::composer::{Field, Kind};
 use crate::mail;
+use crate::text::cols;
 
 /// The labels' column.
 const LABEL: u16 = 9;
@@ -201,7 +201,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         let widest = composer
             .suggestions
             .iter()
-            .map(|a| a.display().width())
+            .map(|a| cols(&a.display()))
             .max()
             .unwrap_or(0);
         let width = (widest as u16 + 4).min(rect.width).max(10);

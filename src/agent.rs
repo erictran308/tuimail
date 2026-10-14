@@ -36,6 +36,10 @@ pub const MAX_TEXT_CHARS: usize = 20_000;
 /// The most messages agents change in an hour, and move to Trash.
 pub const CHANGES_PER_HOUR: usize = 300;
 pub const TRASH_PER_HOUR: usize = 100;
+/// The most messages agents' reads download in an hour, and bytes: they're
+/// the user's connection and bandwidth.
+pub const DOWNLOADS_PER_HOUR: usize = 200;
+pub const DOWNLOAD_BYTES_PER_HOUR: u64 = 512 << 20;
 /// How long a change waits for the user's `y`.
 pub const ASK_FOR: Duration = Duration::from_secs(5 * 60);
 
@@ -51,7 +55,7 @@ pub struct Request {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tool", rename_all = "snake_case")]
 pub enum Call {
-    ListAccounts,
+    ListAccounts(NoArgs),
     ListFolders(FolderArgs),
     SearchMessages(SearchArgs),
     ReadMessage(ReadArgs),
@@ -180,6 +184,12 @@ pub struct IdsArgs {
     pub ids: Vec<String>,
 }
 
+/// A call without arguments: none others either (a unit variant would
+/// take any).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NoArgs {}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChangesArgs {
@@ -234,14 +244,18 @@ pub fn unhandle(id: &str) -> Option<(String, String, u32, u32)> {
     Some((account.into(), folder.into(), uidvalidity, uid))
 }
 
-/// A message's text for an agent: links shown by their site only, so a
-/// sender's link isn't one to follow (the user opens links, with `o`).
+/// Text from mail for an agent (a body, a subject, a name, a preview):
+/// links shown by their site only, so a sender's link isn't one to follow
+/// (the user opens links, with `o`). Every one, glued to a word or however
+/// long (`mail::find_any_url`).
 pub fn hide_links(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
-    while let Some((start, end)) = crate::mail::find_url(rest) {
+    while let Some((start, end)) = crate::mail::find_any_url(rest) {
         out.push_str(&rest[..start]);
-        let host = crate::app::link_host(&rest[start..end]);
+        // The site is at the start: a link of megabytes costs no more.
+        let link = crate::text::first_chars(&rest[start..end], 4096);
+        let host = crate::app::link_host(link);
         out.push_str(&format!("[link: {host}]"));
         rest = &rest[end..];
     }
@@ -315,27 +329,58 @@ mod unix {
         Error(String),
     }
 
-    /// tuimail listening for agents; dropping it stops, and removes the
-    /// socket.
+    /// tuimail listening for agents; dropping it stops, ends every
+    /// connection open, and removes the socket (if it's still this one).
     pub struct Listener {
         path: PathBuf,
+        /// The socket's device and inode, as bound.
+        made: (u64, u64),
         task: JoinHandle<()>,
     }
 
     impl Drop for Listener {
         fn drop(&mut self) {
+            // The connections are the task's: they end with it.
             self.task.abort();
-            let _ = std::fs::remove_file(&self.path);
+            // Another tuimail may have put its own there since.
+            if identity(&self.path) == Some(self.made) {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
+    }
+
+    /// A socket's device and inode, if it's a socket of this user's alone
+    /// (not a link, one name).
+    fn identity(path: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        (meta.file_type().is_socket() && meta.nlink() == 1 && meta.uid() == me)
+            .then(|| (meta.dev(), meta.ino()))
+    }
+
+    /// Whether a tuimail answers at `path`, asked for at most a moment: a
+    /// listener that never accepts must not hold up the screen.
+    fn answers(path: &Path) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(std::os::unix::net::UnixStream::connect(path).is_ok());
+        });
+        // No answer in time: something holds it, so it isn't taken.
+        rx.recv_timeout(std::time::Duration::from_millis(500))
+            .unwrap_or(true)
     }
 
     /// Listens at `path`; each request reaches the app as
     /// [`AppEvent::Agent`].
     pub fn listen(path: &Path, tx: UnboundedSender<AppEvent>) -> Result<Listener> {
         // A socket left by a tuimail that's gone is removed; one another
-        // tuimail answers on is left to it.
+        // tuimail answers on is left to it. Anything else there (a link, a
+        // socket not this user's) is never asked: it goes.
         if std::fs::symlink_metadata(path).is_ok() {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            if identity(path).is_some() && answers(path) {
                 bail!("another tuimail is answering agents");
             }
             std::fs::remove_file(path).context("cannot remove the old agent socket")?;
@@ -349,12 +394,21 @@ mod unix {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
+        let made = identity(path).context("cannot listen for agents")?;
         // A few at a time: one agent's calls come one by one.
         let slots = Arc::new(Semaphore::new(8));
         let task = tokio::spawn(async move {
+            // Owned here, so stopping the listener stops them too.
+            let mut connections = tokio::task::JoinSet::new();
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    continue;
+                while connections.try_join_next().is_some() {}
+                let stream = match listener.accept().await {
+                    Ok((stream, _)) => stream,
+                    // Out of files, say: not again at once.
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
                 };
                 // SAFETY: geteuid has no preconditions.
                 let me = unsafe { libc::geteuid() };
@@ -365,7 +419,7 @@ mod unix {
                     continue;
                 };
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _ = serve(stream, tx).await;
                     drop(slot);
                 });
@@ -373,6 +427,7 @@ mod unix {
         });
         Ok(Listener {
             path: path.to_path_buf(),
+            made,
             task,
         })
     }
@@ -391,11 +446,18 @@ mod unix {
             Ok(request) => {
                 let (reply, answer) = oneshot::channel();
                 tx.send(AppEvent::Agent { request, reply })?;
-                match tokio::time::timeout(ASK_FOR + std::time::Duration::from_secs(15), answer)
-                    .await
-                {
-                    Ok(Ok(answer)) => answer,
-                    _ => Err("tuimail didn't answer in time".into()),
+                let waited =
+                    tokio::time::timeout(ASK_FOR + std::time::Duration::from_secs(15), answer);
+                // An agent that leaves stops waiting: dropping the answer
+                // takes its question off the screen, so a `y` can't make
+                // a change nobody waits for.
+                let mut byte = [0u8; 1];
+                tokio::select! {
+                    answer = waited => match answer {
+                        Ok(Ok(answer)) => answer,
+                        _ => Err("tuimail didn't answer in time".into()),
+                    },
+                    _ = reader.read(&mut byte) => return Ok(()),
                 }
             }
             Err(_) => Err("that isn't a request tuimail understands".into()),
@@ -407,15 +469,27 @@ mod unix {
         let mut out = serde_json::to_vec(&wire)?;
         out.truncate(MAX_ANSWER);
         out.push(b'\n');
-        write.write_all(&out).await?;
+        // One that never reads doesn't hold its slot for good.
+        tokio::time::timeout(std::time::Duration::from_secs(30), write.write_all(&out)).await??;
         Ok(())
     }
 
-    /// Asks the tuimail listening at `path` (`tuimail mcp`'s side).
+    /// Asks the tuimail listening at `path` (`tuimail mcp`'s side): only a
+    /// socket of this user's, not through a link, and only a listener of
+    /// this user's, since what it answers goes to the agent as the user's
+    /// mail.
     pub async fn ask(path: &Path, request: &Request) -> Answer {
+        if identity(path).is_none() {
+            return Err(NOT_LISTENING.to_string());
+        }
         let mut stream = UnixStream::connect(path)
             .await
             .map_err(|_| NOT_LISTENING.to_string())?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !stream.peer_cred().is_ok_and(|c| c.uid() == me) {
+            return Err("what answers at tuimail's socket isn't yours: not asked".into());
+        }
         let mut out = serde_json::to_vec(request).map_err(|e| e.to_string())?;
         if out.len() >= MAX_REQUEST {
             return Err("the request is too long".into());
@@ -456,12 +530,30 @@ mod tests {
     }
 
     #[test]
+    fn a_call_takes_only_its_own_arguments() {
+        let call = |json: &str| serde_json::from_str::<Call>(json);
+        assert!(call(r#"{"tool":"list_accounts"}"#).is_ok());
+        assert!(call(r#"{"tool":"list_accounts","delete":true}"#).is_err());
+        assert!(call(r#"{"tool":"move_to_trash","ids":[],"forever":true}"#).is_err());
+    }
+
+    #[test]
     fn links_show_only_their_site() {
         assert_eq!(
             hide_links("Reset it: https://evil.example/r?t=1 or mailto:x@y.z now"),
             "Reset it: [link: evil.example] or [link: y.z] now"
         );
         assert_eq!(hide_links("no links"), "no links");
+        // Glued to a word, or longer than the reader numbers: hidden too.
+        assert_eq!(
+            hide_links("Clickhttps://evil.example/r?t=2 now"),
+            "Click[link: evil.example] now"
+        );
+        let long = format!("https://evil.example/l?p={}", "a".repeat(5000));
+        assert_eq!(
+            hide_links(&format!("Long: {long}.")),
+            "Long: [link: evil.example]."
+        );
     }
 
     #[test]

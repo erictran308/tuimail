@@ -6,11 +6,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use unicode_width::UnicodeWidthStr;
 
 use super::{border, bordered, fit, fit_middle, hint_spans, scrollbar};
 use crate::app::{App, Focus};
 use crate::mail::{self, Addr, Role};
+use crate::text::{cols, wrap};
 use crate::theme::Colors;
 
 /// A sender as the reader shows it: the address always in full (cut in
@@ -34,7 +34,7 @@ fn sender<'a>(label: Span<'a>, from: &Addr, room: usize, c: &Colors) -> Line<'a>
         .strip_suffix(&format!(" <{}>", from.addr))
         .unwrap_or(&from.name)
         .to_string();
-    let name_room = room.saturating_sub(addr.width() + 1);
+    let name_room = room.saturating_sub(cols(&addr) + 1);
     let mut spans = vec![label];
     if name_room >= 4 {
         spans.push(Span::styled(
@@ -91,9 +91,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         m.summary.subject.clone()
     };
-    for part in textwrap::wrap(&subject, width.max(10)) {
+    for part in wrap(&subject, width.max(10)) {
         lines.push(Line::from(Span::styled(
-            part.into_owned(),
+            part.to_string(),
             Style::new().fg(c.text).add_modifier(Modifier::BOLD),
         )));
     }
@@ -121,7 +121,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         if list.is_empty() {
             return;
         }
-        let wrapped = textwrap::wrap(list, width.saturating_sub(6).max(10));
+        let wrapped = wrap(list, width.saturating_sub(6).max(10));
         for (i, part) in wrapped.iter().take(4).enumerate() {
             lines.push(Line::from(vec![
                 label(if i == 0 { name } else { "" }),
@@ -166,7 +166,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if !m.flags.tags.is_empty() {
         let text: Vec<String> = m.flags.tags.iter().map(|t| format!("#{t}")).collect();
-        for (i, part) in textwrap::wrap(&text.join(" "), width.saturating_sub(6).max(10))
+        for (i, part) in wrap(&text.join(" "), width.saturating_sub(6).max(10))
             .iter()
             .take(2)
             .enumerate()
@@ -186,7 +186,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|a| format!("{} ({})", a.name, mail::size(a.size)))
             .collect();
         let text = format!("{} {}", app.icons.attachment, names.join(", "));
-        for (i, part) in textwrap::wrap(&text, width.saturating_sub(6).max(10))
+        for (i, part) in wrap(&text, width.saturating_sub(6).max(10))
             .iter()
             .take(3)
             .enumerate()
@@ -310,6 +310,23 @@ mod tests {
         .await;
         let row = shown.lines().find(|l| l.contains("From")).unwrap();
         assert!(row.contains("evil.example"), "{row}");
+    }
+
+    #[tokio::test]
+    async fn halfwidth_sound_marks_never_hide_the_address() {
+        // No columns to unicode-width, one each as drawn: measured the
+        // first way, the name would push the address out of the row.
+        for name in [
+            format!(
+                "PayPal Security{}",
+                format!(" {}", "\u{FF9E}".repeat(10)).repeat(6)
+            ),
+            format!("PayPal Security {}", "\u{FF76}\u{FF9E}".repeat(40)),
+        ] {
+            let shown = reading(&format!("From: \"{name}\" <attacker@evil.example>")).await;
+            let row = shown.lines().find(|l| l.contains("From")).unwrap();
+            assert!(row.contains("<attacker@evil.example>"), "{row}");
+        }
     }
 
     #[tokio::test]

@@ -70,6 +70,14 @@ fn entry(id: &str) -> Result<keyring_core::Entry> {
     keyring_core::Entry::new(SERVICE, id).map_err(|e| anyhow!("the keychain: {e}"))
 }
 
+/// The keychain entry of an account's refresh token: its own, apart from
+/// the password's, so one is never sent as the other (to the provider as a
+/// refresh token, or to a server as a password) when an account changes
+/// how it logs in.
+pub fn token_key(id: &str) -> String {
+    format!("{id}#refresh-token")
+}
+
 /// The account's password from the keychain, or `None` if none is kept.
 pub async fn keychain_get(id: &str) -> Result<Option<Secret>> {
     let id = id.to_string();
@@ -172,8 +180,12 @@ pub struct Credentials {
     /// tried again and again (which can lock the account).
     keychain_refused: Arc<std::sync::atomic::AtomicBool>,
     /// Signing in here: the tokens got, the access token renewed with the
-    /// refresh token when it runs out.
-    tokens: Arc<Mutex<Option<Tokens>>>,
+    /// refresh token when it runs out; held only a moment (never while a
+    /// refresh is out), with how many sign-ins set them, so a refresh that
+    /// ends after a sign-in doesn't replace its tokens.
+    tokens: Arc<std::sync::Mutex<(u64, Option<Tokens>)>>,
+    /// Held while refreshing: one refresh at a time.
+    refreshing: Arc<Mutex<()>>,
 }
 
 /// No password is known: tuimail must ask.
@@ -197,8 +209,33 @@ impl Credentials {
             secret: Arc::new(Mutex::new(None)),
             keychain,
             keychain_refused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            tokens: Arc::new(Mutex::new(None)),
+            tokens: Arc::new(std::sync::Mutex::new((0, None))),
+            refreshing: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// The keychain entry for what this account keeps there: its password,
+    /// or its refresh token when it signs in here ([`token_key`]).
+    pub fn keychain_key(&self) -> String {
+        if self.signs_in() {
+            token_key(&self.id)
+        } else {
+            self.id.clone()
+        }
+    }
+
+    fn tokens(&self) -> std::sync::MutexGuard<'_, (u64, Option<Tokens>)> {
+        self.tokens.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn is_refused(&self) -> bool {
+        self.keychain_refused
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_refused(&self, refused: bool) {
+        self.keychain_refused
+            .store(refused, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Whether the password comes from a command, run for each login.
@@ -228,10 +265,7 @@ impl Credentials {
             // After a refusal, no login until the user asks again (R):
             // trying the same refused password at every check can lock the
             // account.
-            if self
-                .keychain_refused
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.is_refused() {
                 return Err(anyhow!(NeedPassword));
             }
             // A token may be short-lived: the command is asked each time.
@@ -241,11 +275,8 @@ impl Credentials {
         if let Some(secret) = kept.as_ref() {
             return Ok(secret.clone());
         }
-        let refused = self
-            .keychain_refused
-            .load(std::sync::atomic::Ordering::SeqCst);
         if self.uses_keychain()
-            && !refused
+            && !self.is_refused()
             && let Some(secret) = keychain_get(&self.id).await?
         {
             *kept = Some(secret.clone());
@@ -259,41 +290,54 @@ impl Credentials {
     /// `NeedPassword` if there's none, or the provider took it back: the
     /// user signs in again.
     async fn access_token(&self) -> Result<Secret> {
-        if self
-            .keychain_refused
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.is_refused() {
             return Err(anyhow!(NeedPassword));
         }
-        // Held while refreshing: the account's connections wait for one
-        // refresh rather than each making its own.
-        let mut kept = self.tokens.lock().await;
-        if let Some(tokens) = kept.as_ref().filter(|t| t.fresh()) {
-            return Ok(tokens.access.clone());
+        // One refresh at a time: the account's connections wait for it
+        // rather than each making its own.
+        let _one = self.refreshing.lock().await;
+        // Again: the refresh waited for may have found the sign-in taken
+        // back, and the revoked token mustn't be tried once more.
+        if self.is_refused() {
+            return Err(anyhow!(NeedPassword));
         }
-        let refresh = match kept.as_ref().and_then(|t| t.refresh.clone()) {
+        let (signed_in, refresh) = {
+            let kept = self.tokens();
+            if let Some(tokens) = kept.1.as_ref().filter(|t| t.fresh()) {
+                return Ok(tokens.access.clone());
+            }
+            (kept.0, kept.1.as_ref().and_then(|t| t.refresh.clone()))
+        };
+        let refresh = match refresh {
             Some(refresh) => refresh,
-            None if self.uses_keychain() => keychain_get(&self.id)
+            None if self.uses_keychain() => keychain_get(&self.keychain_key())
                 .await?
                 .ok_or_else(|| anyhow!(NeedPassword))?,
             None => return Err(anyhow!(NeedPassword)),
         };
         let client = oauth::client_for(&self.account)
             .ok_or_else(|| anyhow!("this account can't sign in: see OAuth2 in tuimail's README"))?;
-        match oauth::refresh(&client, &refresh).await {
+        let result = oauth::refresh(&client, &refresh).await;
+        let mut kept = self.tokens();
+        // Signed in again while this was out: those tokens stay.
+        if kept.0 != signed_in {
+            return (kept.1.as_ref())
+                .map(|t| t.access.clone())
+                .ok_or_else(|| anyhow!(NeedPassword));
+        }
+        match result {
             Ok(mut tokens) => {
                 // Not every refresh brings a new refresh token.
                 if tokens.refresh.is_none() {
                     tokens.refresh = Some(refresh);
                 }
                 let access = tokens.access.clone();
-                *kept = Some(tokens);
+                kept.1 = Some(tokens);
                 Ok(access)
             }
             Err(e) if e.downcast_ref::<oauth::SignInAgain>().is_some() => {
-                *kept = None;
-                self.keychain_refused
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                kept.1 = None;
+                self.set_refused(true);
                 Err(anyhow!(NeedPassword))
             }
             Err(e) => Err(e),
@@ -301,60 +345,69 @@ impl Credentials {
     }
 
     /// Uses the tokens of a sign-in from now on.
-    pub async fn set_tokens(&self, tokens: Tokens) {
-        *self.tokens.lock().await = Some(tokens);
-        self.keychain_refused
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+    pub fn set_tokens(&self, tokens: Tokens) {
+        let mut kept = self.tokens();
+        kept.0 += 1;
+        kept.1 = Some(tokens);
+        self.set_refused(false);
     }
 
     /// Uses `secret` from now on (typed in tuimail).
     pub async fn set(&self, secret: Secret) {
         *self.secret.lock().await = Some(secret);
-        self.keychain_refused
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.set_refused(false);
     }
 
     /// The user asks to try again (R): a password command is run again
     /// after a refusal.
     pub fn retry(&self) {
         if self.uses_command() || self.signs_in() {
-            self.keychain_refused
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.set_refused(false);
         }
     }
 
-    /// The server refused the password: it's forgotten, and not read from
-    /// the keychain again, so tuimail asks; a password command isn't run
-    /// again until the user asks (R).
-    pub async fn refused(&self) {
-        *self.secret.lock().await = None;
-        *self.tokens.lock().await = None;
-        self.keychain_refused
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    /// The server refused `used`: it's forgotten, and not read from the
+    /// keychain again, so tuimail asks; a password command isn't run again
+    /// until the user asks (R). Only if it's still the one in use: a
+    /// password typed, or a sign-in made, while that login was out stays.
+    pub async fn refused(&self, used: &Secret) {
+        if self.signs_in() {
+            let mut kept = self.tokens();
+            if kept.1.as_ref().is_none_or(|t| t.access == *used) {
+                kept.1 = None;
+                self.set_refused(true);
+            }
+            return;
+        }
+        let mut kept = self.secret.lock().await;
+        if kept.as_ref().is_none_or(|s| s == used) {
+            *kept = None;
+            self.set_refused(true);
+        }
     }
 
-    /// Keeps the password in the keychain, once the server took it.
-    /// Signing in here, the refresh token is what's kept.
-    pub async fn remember(&self) -> Result<()> {
+    /// Keeps the password in the keychain, once the server took it (`used`).
+    /// Signing in here, the refresh token is what's kept: the one that came
+    /// with the access token the server took, not one no login has used.
+    pub async fn remember(&self, used: &Secret) -> Result<()> {
         if !self.uses_keychain() {
             return Ok(());
         }
         let kept = if self.signs_in() {
-            self.tokens
-                .lock()
-                .await
-                .as_ref()
+            (self.tokens().1.as_ref())
+                .filter(|t| t.access == *used)
                 .and_then(|t| t.refresh.clone())
         } else {
-            self.secret.lock().await.clone()
+            self.secret.lock().await.clone().filter(|s| s == used)
         };
         let Some(secret) = kept else {
             return Ok(());
         };
-        if keychain_get(&self.id).await.ok().flatten().as_ref() == Some(&secret) {
+        let key = self.keychain_key();
+        if keychain_get(&key).await.ok().flatten().as_ref() == Some(&secret) {
             return Ok(());
         }
-        keychain_set(&self.id, &secret).await
+        keychain_set(&key, &secret).await
     }
 
     pub fn account(&self) -> &Account {
@@ -411,19 +464,26 @@ mod tests {
         assert!(creds.signs_in());
         let need = |r: Result<Secret>| r.unwrap_err().downcast_ref::<NeedPassword>().is_some();
         assert!(need(creds.get().await), "not signed in yet");
-        creds
-            .set_tokens(Tokens {
-                access: Secret::new("at"),
-                refresh: Some(Secret::new("rt")),
-                renew_at: std::time::Instant::now() + Duration::from_secs(600),
-            })
-            .await;
-        assert_eq!(creds.get().await.unwrap().expose(), "at");
+        let tokens = |access: &str| Tokens {
+            access: Secret::new(access),
+            refresh: Some(Secret::new("rt")),
+            renew_at: std::time::Instant::now() + Duration::from_secs(600),
+        };
+        creds.set_tokens(tokens("at"));
+        let used = creds.get().await.unwrap();
+        assert_eq!(used.expose(), "at");
+        // A sign-in while that login was out: the refusal of the old token
+        // doesn't throw the new one away.
+        creds.set_tokens(tokens("at-2"));
+        creds.refused(&used).await;
+        assert_eq!(creds.get().await.unwrap().expose(), "at-2");
         // Refused: forgotten, and the user signs in again.
-        creds.refused().await;
+        creds.refused(&Secret::new("at-2")).await;
         assert!(need(creds.get().await));
         creds.retry();
         assert!(need(creds.get().await), "nothing to refresh with");
+        // Its refresh token has its own keychain entry, not the password's.
+        assert_eq!(creds.keychain_key(), token_key(&creds.id));
     }
 
     #[cfg(unix)]
@@ -436,9 +496,10 @@ mod tests {
             ..Account::default()
         };
         let creds = Credentials::new(Arc::new(account), false);
-        assert_eq!(creds.get().await.unwrap().expose(), "token-1");
+        let used = creds.get().await.unwrap();
+        assert_eq!(used.expose(), "token-1");
         // Refused: not run again until the user asks.
-        creds.refused().await;
+        creds.refused(&used).await;
         assert!(
             creds
                 .get()
@@ -464,8 +525,13 @@ mod tests {
                 .is_some()
         );
         creds.set(Secret::new("typed")).await;
-        assert_eq!(creds.get().await.unwrap().expose(), "typed");
-        creds.refused().await;
+        let used = creds.get().await.unwrap();
+        assert_eq!(used.expose(), "typed");
+        // Typed again while the login with the first was out: kept.
+        creds.set(Secret::new("typed again")).await;
+        creds.refused(&used).await;
+        assert_eq!(creds.get().await.unwrap().expose(), "typed again");
+        creds.refused(&Secret::new("typed again")).await;
         assert!(creds.get().await.is_err());
     }
 }

@@ -119,7 +119,7 @@ pub struct Attachment {
     pub size: usize,
 }
 
-fn addrs(address: Option<&Address>) -> Vec<Addr> {
+pub fn addrs(address: Option<&Address>) -> Vec<Addr> {
     let Some(address) = address else {
         return Vec::new();
     };
@@ -520,10 +520,9 @@ pub fn render_text(source: &str, width: usize, flowed: bool) -> Body {
         // Links are found in the whole line, then the line is wrapped at
         // spaces only, so a link that wraps stays one link.
         let links = find_urls(rest, &mut body);
-        let options = textwrap::Options::new(room)
-            .break_words(true)
-            .word_separator(textwrap::WordSeparator::AsciiSpace);
-        for wrapped in textwrap::wrap(rest, options) {
+        // By the columns ratatui draws (`text::cols`), so no row runs past
+        // the pane and loses its end.
+        for wrapped in text::wrap(rest, room) {
             let mut segs = Vec::new();
             if !prefix.is_empty() {
                 segs.push(Seg {
@@ -531,9 +530,9 @@ pub fn render_text(source: &str, width: usize, flowed: bool) -> Body {
                     role,
                 });
             }
-            match offset_in(rest, &wrapped) {
-                Some(at) => segs.extend(split_links(&wrapped, at, &links, role)),
-                None => segs.extend(linkify(&wrapped, role, &mut body)),
+            match offset_in(rest, wrapped) {
+                Some(at) => segs.extend(split_links(wrapped, at, &links, role)),
+                None => segs.extend(linkify(wrapped, role, &mut body)),
             }
             body.lines.push(segs);
         }
@@ -635,7 +634,7 @@ fn find_urls(line: &str, body: &mut Body) -> Vec<(usize, usize, usize)> {
     out
 }
 
-/// Where `piece` (a slice of `line`, as textwrap returns them) starts in
+/// Where `piece` (a slice of `line`, as `text::wrap` returns them) starts in
 /// it.
 fn offset_in(line: &str, piece: &str) -> Option<usize> {
     let start = piece.as_ptr() as usize;
@@ -711,6 +710,17 @@ const MAX_LINKS: usize = 1000;
 /// Where the first URL in `text` starts and ends. One pass, so a long line
 /// costs no more than its length.
 pub fn find_url(text: &str) -> Option<(usize, usize)> {
+    url_in(text, true)
+}
+
+/// As [`find_url`], but also a link glued to the word before it
+/// ("Clickhttps://…") and one however long: for hiding links
+/// (`agent::hide_links`), where missing one matters, not numbering one.
+pub fn find_any_url(text: &str) -> Option<(usize, usize)> {
+    url_in(text, false)
+}
+
+fn url_in(text: &str, strict: bool) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -724,7 +734,7 @@ pub fn find_url(text: &str) -> Option<(usize, usize)> {
         // An ASCII scheme matched, so `i` is on a character boundary. Not
         // in the middle of a word ("xhttp://").
         let starts_word = || i == 0 || !text[..i].chars().last().is_some_and(char::is_alphanumeric);
-        let Some(scheme) = scheme.filter(|_| starts_word()) else {
+        let Some(scheme) = scheme.filter(|_| !strict || starts_word()) else {
             i += 1;
             continue;
         };
@@ -732,7 +742,7 @@ pub fn find_url(text: &str) -> Option<(usize, usize)> {
         let mut end = tail
             .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '`'))
             .unwrap_or(tail.len());
-        if end > MAX_LINK {
+        if strict && end > MAX_LINK {
             i += end;
             continue;
         }
@@ -860,15 +870,21 @@ pub fn usable_link(url: &str) -> bool {
 
 /// HTML without its tags: the fallback when html2text can't read it.
 /// Whether HTML nests deeper than [`MAX_DEPTH`], counted in one pass over
-/// its tags: an opening tag goes one in, a closing one out. Elements that
-/// have no end (`<br>`) or whose end is usually left out (`<p>`, `<li>`,
-/// table cells) don't count, so ordinary mail isn't taken for deep.
+/// its tags as a parser nests them: an opening tag goes one in; a closing
+/// one goes out of the element it closes (and those still open in it), and
+/// closes nothing if none is open by that name (`<div></x>` is still one
+/// deeper each time); `<div/>` opens a div (only void elements, and those
+/// in SVG or MathML, close themselves). Elements that have no end (`<br>`)
+/// or whose end is usually left out (`<p>`, `<li>`, table cells) don't
+/// count, so ordinary mail isn't taken for deep.
 fn too_deep(html: &str) -> bool {
     const LOOSE: [&str; 22] = [
         "br", "img", "hr", "meta", "link", "input", "area", "base", "col", "embed", "source",
         "track", "wbr", "param", "p", "li", "td", "th", "tr", "option", "dt", "dd",
     ];
-    let mut depth: usize = 0;
+    let mut open: Vec<String> = Vec::new();
+    // How many of each are open, so a closing tag is matched at once.
+    let mut count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let bytes = html.as_bytes();
     let mut i = 0;
     while let Some(at) = bytes[i..].iter().position(|&b| b == b'<') {
@@ -886,15 +902,33 @@ fn too_deep(html: &str) -> bool {
         if LOOSE.contains(&name.as_str()) {
             continue;
         }
-        let end = bytes[start..].iter().position(|&b| b == b'>');
-        let self_closing = end.is_some_and(|e| e > 0 && bytes[start + e - 1] == b'/');
         if closing {
-            depth = depth.saturating_sub(1);
-        } else if !self_closing {
-            depth += 1;
-            if depth > MAX_DEPTH {
-                return true;
+            if count.get(&name).is_some_and(|&n| n > 0) {
+                while let Some(last) = open.pop() {
+                    let done = last == name;
+                    if let Some(n) = count.get_mut(&last) {
+                        *n -= 1;
+                    }
+                    if done {
+                        break;
+                    }
+                }
             }
+            continue;
+        }
+        // The tag's end: up to the next `>`, or `<` (one pass in all).
+        let end = bytes[start..].iter().position(|&b| b == b'>' || b == b'<');
+        let self_closing =
+            end.is_some_and(|e| e > 0 && bytes[start + e] == b'>' && bytes[start + e - 1] == b'/');
+        let foreign =
+            count.get("svg").is_some_and(|&n| n > 0) || count.get("math").is_some_and(|&n| n > 0);
+        if self_closing && foreign {
+            continue;
+        }
+        *count.entry(name.clone()).or_default() += 1;
+        open.push(name);
+        if open.len() > MAX_DEPTH {
+            return true;
         }
     }
     false
@@ -1294,6 +1328,20 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
         assert!(!too_deep(&format!("{}x", "<div><p>".repeat(1_000))));
         assert!(too_deep(&"<div>".repeat(MAX_DEPTH + 1)));
         assert!(!too_deep(&"<div></div>".repeat(MAX_DEPTH * 2)));
+        // Closing tags that close nothing don't make it shallower, nor do
+        // ones written to look closed.
+        assert!(too_deep(&"<div></x>".repeat(MAX_DEPTH + 1)));
+        assert!(too_deep(&"<div/>".repeat(MAX_DEPTH + 1)));
+        assert!(!too_deep(&format!(
+            "<svg>{}</svg>",
+            "<path/>".repeat(MAX_DEPTH * 2)
+        )));
+        // A closing tag closes what's open inside its element too.
+        assert!(!too_deep(&"<div><span><b></div>".repeat(MAX_DEPTH)));
+        // Tags with no end cost no more than their length.
+        let started = std::time::Instant::now();
+        let _ = too_deep(&"<a".repeat(200_000));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

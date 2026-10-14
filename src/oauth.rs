@@ -63,6 +63,14 @@ impl Provider {
         }
     }
 
+    /// The sending servers its tokens are for: a token goes to no other.
+    pub fn smtp_hosts(self) -> &'static [&'static str] {
+        match self {
+            Provider::Microsoft => &["smtp.office365.com", "smtp-mail.outlook.com"],
+            Provider::Google => &["smtp.gmail.com"],
+        }
+    }
+
     fn authorize(self) -> &'static str {
         match self {
             Provider::Microsoft => "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
@@ -182,19 +190,48 @@ pub struct SignIn {
     listeners: Vec<TcpListener>,
 }
 
-impl SignIn {
-    /// Starts listening for the browser's return, and makes the link that
-    /// opens the provider's sign-in page (with `email` filled in).
-    pub async fn start(client: Client, email: &str) -> Result<Self> {
-        // Both loopback addresses, one port: `localhost` can be either.
+/// Both loopback addresses, one port, since `localhost` (where the browser
+/// comes back) can be either: a port another program holds on `[::1]` is
+/// never used, or the browser could take the sign-in's return there. With
+/// no IPv6 loopback at all, `127.0.0.1` alone.
+async fn loopback() -> Result<(u16, Vec<TcpListener>)> {
+    for _ in 0..20 {
         let v4 = TcpListener::bind(("127.0.0.1", 0))
             .await
             .context("cannot listen for the browser")?;
         let port = v4.local_addr()?.port();
-        let mut listeners = vec![v4];
-        if let Ok(v6) = TcpListener::bind(("::1", port)).await {
-            listeners.push(v6);
+        match TcpListener::bind(("::1", port)).await {
+            Ok(v6) => return Ok((port, vec![v4, v6])),
+            Err(e) if no_ipv6(&e) => return Ok((port, vec![v4])),
+            // Taken there: another port.
+            Err(_) => continue,
         }
+    }
+    bail!("cannot listen for the browser: no port is free on both loopback addresses")
+}
+
+/// The computer has no IPv6 loopback to listen on.
+fn no_ipv6(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::AddrNotAvailable | ErrorKind::Unsupported
+    ) || e.raw_os_error() == Some(eafnosupport())
+}
+
+/// EAFNOSUPPORT: the address family isn't there.
+fn eafnosupport() -> i32 {
+    #[cfg(unix)]
+    return libc::EAFNOSUPPORT;
+    #[cfg(windows)]
+    return 10047; // WSAEAFNOSUPPORT
+}
+
+impl SignIn {
+    /// Starts listening for the browser's return, and makes the link that
+    /// opens the provider's sign-in page (with `email` filled in).
+    pub async fn start(client: Client, email: &str) -> Result<Self> {
+        let (port, listeners) = loopback().await?;
         let verifier = random_token()?;
         let state = random_token()?;
         let redirect = client.provider.redirect(port);
@@ -249,27 +286,50 @@ impl SignIn {
 
     /// The code the browser brings back with our state.
     async fn code(&self) -> Result<String> {
+        if self.listeners.is_empty() {
+            bail!("no listener");
+        }
+        // Each connection on its own, a few at a time: one that sends
+        // nothing (from another program that sees the port) can't keep the
+        // browser's return waiting.
+        let mut answers = tokio::task::JoinSet::new();
         loop {
-            let accepted = match self.listeners.as_slice() {
-                [v4] => v4.accept().await,
-                [v4, v6, ..] => tokio::select! {
-                    a = v4.accept() => a,
-                    a = v6.accept() => a,
+            let accepted = tokio::select! {
+                accepted = accept(&self.listeners) => accepted,
+                Some(done) = answers.join_next(), if !answers.is_empty() => match done {
+                    Ok(Some(answer)) => return answer,
+                    // Something else (a favicon), or not ours: wait on.
+                    _ => continue,
                 },
-                [] => bail!("no listener"),
             };
             let Ok((mut stream, peer)) = accepted else {
                 continue;
             };
-            if !peer.ip().is_loopback() {
+            if !peer.ip().is_loopback() || answers.len() >= 16 {
                 continue;
             }
-            match callback(&mut stream, &self.state).await {
-                Ok(Some(answer)) => return answer,
-                // Something else (a favicon), or not ours: wait on.
-                Ok(None) | Err(_) => continue,
-            }
+            let state = self.state.clone();
+            answers.spawn(async move {
+                match callback(&mut stream, &state).await {
+                    Ok(Some(answer)) => Some(answer),
+                    Ok(None) | Err(_) => None,
+                }
+            });
         }
+    }
+}
+
+/// The next connection on either loopback address.
+async fn accept(
+    listeners: &[TcpListener],
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    match listeners {
+        [v4] => v4.accept().await,
+        [v4, v6, ..] => tokio::select! {
+            a = v4.accept() => a,
+            a = v6.accept() => a,
+        },
+        [] => std::future::pending().await,
     }
 }
 
@@ -615,6 +675,31 @@ fn decode(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_browser_comes_back_to_tuimail_on_both_loopback_addresses() {
+        // Ports held on [::1] by another program: never one tuimail takes
+        // on 127.0.0.1 alone.
+        let mut held = Vec::new();
+        for _ in 0..300 {
+            match TcpListener::bind(("::1", 0)).await {
+                Ok(l) => held.push(l),
+                Err(_) => break,
+            }
+        }
+        for _ in 0..30 {
+            let (port, listeners) = loopback().await.unwrap();
+            if held.is_empty() {
+                // No IPv6 loopback here.
+                assert_eq!(listeners.len(), 1);
+                continue;
+            }
+            assert_eq!(listeners.len(), 2, "{port}");
+            for l in &listeners {
+                assert_eq!(l.local_addr().unwrap().port(), port);
+            }
+        }
+    }
 
     #[test]
     fn the_pkce_challenge_is_rfc_7636s() {

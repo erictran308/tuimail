@@ -587,33 +587,22 @@ pub fn from_saved(parsed: &Parsed, raw: &[u8]) -> Draft {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    // As every address read: whole or not at all.
     let bcc = mail_parser::MessageParser::default()
         .parse(raw)
-        .map(|m| {
-            m.bcc()
-                .map(|b| {
-                    b.iter()
-                        .filter_map(|a| {
-                            Some(Addr {
-                                name: text::one_line(a.name().unwrap_or(""), mail::MAX_NAME),
-                                addr: text::one_line(a.address()?, mail::MAX_NAME),
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        })
+        .map(|m| mail::addrs(m.bcc()))
         .unwrap_or_default();
     let mut draft = forward(parsed, raw, &Account::default());
     draft.to = joined(&parsed.to);
     draft.cc = joined(&parsed.cc);
     draft.bcc = joined(&bcc);
     draft.subject = parsed.summary.subject.clone();
-    draft.body = parsed
-        .text
-        .clone()
-        .map(|t| text::clean(&t))
-        .unwrap_or_default();
+    // Its text, or what its HTML says (a draft written as HTML only, by
+    // another program, would otherwise lose all of it when saved again).
+    draft.body = match &parsed.text {
+        Some(t) => text::clean(t),
+        None => mail::plain_text(parsed),
+    };
     draft.in_reply_to = parsed.summary.in_reply_to.clone();
     draft.references = parsed.summary.references.clone();
     draft

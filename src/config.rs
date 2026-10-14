@@ -85,22 +85,27 @@ fn make_private_dir(dir: &Path) -> Result<PathBuf> {
     // What's in it must be yours alone too: a link or file another account
     // left while it could still write here would stay in use (a link at
     // accounts.toml choosing the program that gives your password).
-    for (entry, folder) in [
-        ("accounts.toml", false),
-        ("settings.toml", false),
-        ("tuimail.db", false),
-        ("tuimail.db-wal", false),
-        ("tuimail.db-shm", false),
-        ("drafts", true),
-        ("opened", true),
+    // So must the agents' sockets: one left there would get every agent's
+    // questions, and answer them.
+    use std::os::unix::fs::FileTypeExt;
+    for (entry, kind) in [
+        ("accounts.toml", Entry::File),
+        ("settings.toml", Entry::File),
+        ("tuimail.db", Entry::File),
+        ("tuimail.db-wal", Entry::File),
+        ("tuimail.db-shm", Entry::File),
+        ("drafts", Entry::Folder),
+        ("opened", Entry::Folder),
+        (crate::agent::SOCKET, Entry::Socket),
+        (crate::agent::DEMO_SOCKET, Entry::Socket),
     ] {
         let Ok(meta) = std::fs::symlink_metadata(dir.join(entry)) else {
             continue;
         };
-        let kind = if folder {
-            meta.is_dir()
-        } else {
-            meta.is_file() && meta.nlink() == 1
+        let kind = match kind {
+            Entry::Folder => meta.is_dir(),
+            Entry::File => meta.is_file() && meta.nlink() == 1,
+            Entry::Socket => meta.file_type().is_socket() && meta.nlink() == 1,
         };
         if meta.file_type().is_symlink() || !kind || meta.uid() != euid() {
             bail!(
@@ -109,6 +114,14 @@ fn make_private_dir(dir: &Path) -> Result<PathBuf> {
         }
     }
     Ok(dir)
+}
+
+/// What an entry of the data folder must be.
+#[cfg(unix)]
+enum Entry {
+    File,
+    Folder,
+    Socket,
 }
 
 /// On Windows, a folder set with `TM_DATA_DIR` must be in your own profile,
@@ -367,6 +380,21 @@ mod tests {
         std::fs::hard_link(&outside, made.join("settings.toml")).unwrap();
         assert!(make_private_dir(&made).is_err(), "a second name is refused");
         std::fs::remove_file(made.join("settings.toml")).unwrap();
+        // The agents' sockets: a link to someone else's, or not a socket.
+        for socket in [crate::agent::SOCKET, crate::agent::DEMO_SOCKET] {
+            std::os::unix::fs::symlink(&outside, made.join(socket)).unwrap();
+            assert!(
+                make_private_dir(&made).is_err(),
+                "a link at {socket} is refused"
+            );
+            std::fs::remove_file(made.join(socket)).unwrap();
+            std::fs::write(made.join(socket), "").unwrap();
+            assert!(
+                make_private_dir(&made).is_err(),
+                "a file at {socket} is refused"
+            );
+            std::fs::remove_file(made.join(socket)).unwrap();
+        }
         std::fs::write(made.join("accounts.toml"), "").unwrap();
         make_private_dir(&made).unwrap();
         std::fs::remove_dir_all(&parent).unwrap();

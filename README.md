@@ -269,15 +269,16 @@ confirm_agents = true    # ask before each change an agent makes
   { "mcpServers": { "tuimail": { "command": "/Users/you/.local/bin/tuimail", "args": ["mcp"] } } }
   ```
 
-**What agents can do:** list accounts and folders, search what tuimail has on your computer, read a message (its links shown only by their site), mark read or unread, star, tag, move to a folder, mark spam or not (to Junk and back), move to Trash, and undo their own changes.
+**What agents can do:** list accounts and folders, search what tuimail has on your computer, read a message (its links, wherever they are, shown only by their site), mark read or unread, star, tag, move to a folder of yours, mark spam or not (to Junk and back), move to Trash, and undo their own changes.
 
-**What they can't:** delete anything for good (mail already in Trash stays there, and an account without a Trash folder takes nothing), send, reply or forward, open links or unsubscribe, read attachments, make filters, change settings, or touch passwords. There are no tools for these; tuimail refuses them whatever an agent asks.
+**What they can't:** delete anything for good (mail already in Trash stays there, and an account without a Trash folder takes nothing), move mail into Drafts or Sent, see or touch other users' or shared folders, send, reply or forward, open links or unsubscribe, read attachments, make filters, change settings, or touch passwords. There are no tools for these; tuimail refuses them whatever an agent asks.
 
 **You stay in charge:**
 
 - Each change waits for your `y` in tuimail; any other key says no. Once you trust your agent, turn off **Ask before each change an agent makes** in the settings: changes are then made at once, and said on the status line and in a notification.
 - Every change is listed with who made it (`Z`), and `z` undoes it as it undoes yours.
-- At most 50 messages a call, 300 changes and 100 moves to Trash an hour.
+- At most 50 messages a call, 300 changes and 100 moves to Trash or Junk an hour, and 200 messages (512 MB) downloaded for agents' reads.
+- Turning agents off, in any tuimail window or in `settings.toml`, stops every tuimail answering them.
 - The agent is told, in the server's instructions, that what's in mail is from strangers and is never an instruction, and to ask you before changing more than ten messages. tuimail keeps its own rules whether the agent listens or not.
 
 To try it on made-up mail: run `tuimail --demo`, turn agents on there, and add `tuimail mcp --demo` to your agent instead.

@@ -247,6 +247,17 @@ fn other_namespace(parts: &[&str]) -> bool {
         )
 }
 
+/// A folder in another user's, a shared or a public namespace, by its name
+/// as shown ([`other_namespace`]): never the account's own, so never one
+/// an agent acts on, nor a role.
+pub fn foreign(shown: &str, delimiter: Option<&str>) -> bool {
+    let parts: Vec<&str> = match delimiter.filter(|d| !d.is_empty()) {
+        Some(d) => shown.split(d).collect(),
+        None => shown.split(['/', '.']).collect(),
+    };
+    other_namespace(&parts)
+}
+
 /// The role of a folder: SPECIAL-USE attributes, else its name, which
 /// counts only at the top or right under INBOX or [Gmail] (deeper is a
 /// folder of the user's own, or someone else's).
@@ -259,13 +270,13 @@ fn role_of(
     if raw.eq_ignore_ascii_case("INBOX") {
         return Some((Role::Inbox, RoleFrom::Attribute));
     }
+    if foreign(shown, delimiter) {
+        return None;
+    }
     let parts: Vec<&str> = match delimiter.filter(|d| !d.is_empty()) {
         Some(d) => shown.split(d).collect(),
         None => shown.split(['/', '.']).collect(),
     };
-    if other_namespace(&parts) {
-        return None;
-    }
     for a in attributes {
         let role = match a {
             NameAttribute::Sent => Role::Sent,
@@ -365,6 +376,22 @@ pub async fn status(session: &mut Session, folder: &str) -> Result<(u32, u32)> {
     Ok((mailbox.unseen.unwrap_or(0), mailbox.exists))
 }
 
+/// A folder's UIDVALIDITY and UIDNEXT, from STATUS: before a move, so the
+/// messages it puts there can be told from mail that was there, or comes
+/// later.
+pub async fn uid_next(session: &mut Session, folder: &str) -> Result<(u32, u32)> {
+    let mailbox = timed(
+        TIMEOUT,
+        "STATUS",
+        session.status(folder, "(UIDVALIDITY UIDNEXT)"),
+    )
+    .await?;
+    Ok((
+        mailbox.uid_validity.unwrap_or(0),
+        mailbox.uid_next.unwrap_or(0),
+    ))
+}
+
 /// What SELECT says about a folder.
 #[derive(Clone, Debug)]
 pub struct Selected {
@@ -454,14 +481,27 @@ pub async fn search(session: &mut Session, criteria: &str) -> Result<Vec<u32>> {
     Ok(uids)
 }
 
-/// The UIDs of messages in the selected folder whose Message-ID (without
-/// its angle brackets) is one of `ids`, and how many of `ids` were found.
-/// SEARCH HEADER matches part of a header, so what it finds is checked
-/// against the whole Message-ID.
-pub async fn find_message_ids(session: &mut Session, ids: &[String]) -> Result<(Vec<u32>, usize)> {
+/// The messages a move put in the selected folder, found again: for each
+/// of `moved` (its Message-ID, without angle brackets, and its size, 0 if
+/// not known), the lowest UID from `floor` on (the folder's UIDNEXT just
+/// before the move) with that whole Message-ID and size, each UID taken
+/// once. Mail that was there before has lower UIDs, so a sender's copy of a
+/// Message-ID can't be taken for it; SEARCH HEADER matches part of a
+/// header, so what it finds is checked against the whole Message-ID.
+pub async fn find_moved(
+    session: &mut Session,
+    moved: &[(String, u32)],
+    floor: u32,
+) -> Result<Vec<u32>> {
+    let floor = floor.max(1);
     // Valid ids have no quotes, backslashes, spaces or brackets: they go
     // in a quoted string as they are.
-    let ids: Vec<&String> = ids.iter().filter(|id| mail::valid_id(id)).collect();
+    let mut ids: Vec<&str> = (moved.iter())
+        .map(|(id, _)| id.as_str())
+        .filter(|id| mail::valid_id(id))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
     let mut found = Vec::new();
     for chunk in ids.chunks(20) {
         let criteria = chunk
@@ -470,21 +510,26 @@ pub async fn find_message_ids(session: &mut Session, ids: &[String]) -> Result<(
             .map(|id| format!("HEADER Message-ID \"<{id}>\""))
             .reduce(|rest, one| format!("OR {one} {rest}"));
         if let Some(criteria) = criteria {
-            found.extend(search(session, &criteria).await?);
+            found.extend(search(session, &format!("UID {floor}:* {criteria}")).await?);
         }
     }
+    // "n:*" also matches the highest UID when that's below n.
+    found.retain(|&uid| uid >= floor);
     found.sort_unstable();
     found.dedup();
-    let wanted: std::collections::HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+    let mut headers = headers(session, &found).await?;
+    headers.sort_by_key(|h| h.uid);
     let mut uids = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for header in headers(session, &found).await? {
-        if wanted.contains(header.summary.message_id.as_str()) {
-            uids.push(header.uid);
-            seen.insert(header.summary.message_id);
+    for (id, size) in moved.iter().filter(|(id, _)| mail::valid_id(id)) {
+        let found = headers.iter().position(|h| {
+            h.summary.message_id == *id && (*size == 0 || h.size == *size) && !uids.contains(&h.uid)
+        });
+        if let Some(i) = found {
+            uids.push(headers.remove(i).uid);
         }
     }
-    Ok((uids, seen.len()))
+    uids.sort_unstable();
+    Ok(uids)
 }
 
 /// UIDs written as IMAP sets, `1:5,7,9:12`, a command's worth each.

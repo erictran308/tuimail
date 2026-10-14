@@ -43,9 +43,11 @@ pub fn normalize(typed: &str) -> Option<String> {
         .to_lowercase();
     let ok = !tag.is_empty()
         && tag.chars().count() <= MAX_TAG
-        && tag
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && tag.chars().all(|c| {
+            // Not a letter that shows as nothing (a Hangul filler): "work"
+            // and "work" with one would look the same.
+            (c.is_alphanumeric() && !crate::text::is_hidden(c)) || matches!(c, '-' | '_' | '.')
+        })
         && !RESERVED.contains(&tag.as_str());
     ok.then_some(tag)
 }
@@ -83,9 +85,16 @@ pub fn from_keyword(keyword: &str) -> Option<String> {
         return None;
     }
     let decoded = utf7::decode(keyword).unwrap_or_else(|| keyword.to_string());
-    // Only a keyword that reads as it would be typed: anything else would
-    // show as one tag and be written back as another.
-    normalize(&decoded).filter(|tag| *tag == decoded.to_lowercase())
+    // Only a keyword that reads as it would be typed, and is what that tag
+    // is written back as: anything else would show as one tag and be taken
+    // off as another (`É` written `&AMk-` shows as `é`, which is `&AOk-`),
+    // so it couldn't be taken off.
+    normalize(&decoded).filter(|tag| {
+        *tag == decoded.to_lowercase()
+            && keywords(tag)
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(keyword))
+    })
 }
 
 /// A message's tags from its keywords: sorted, each once, at most
@@ -195,9 +204,16 @@ mod tests {
             "two/parts",
             "&Jjo-",
             "",
+            // É, shown as é but written back as another keyword: it could
+            // never be taken off.
+            "&AMk-",
+            // "work" and a Hangul filler: looks like work.
+            "work&MWQ-",
         ] {
             assert_eq!(from_keyword(keyword), None, "{keyword:?}");
         }
+        assert_eq!(normalize("work\u{3164}"), None);
+        assert_eq!(from_keyword("&AOk-").as_deref(), Some("é"));
         assert_eq!(from_keyword("$LABEL1").as_deref(), Some("important"));
         // Set with capitals by another program: shown, in lower case.
         assert_eq!(from_keyword("Work").as_deref(), Some("work"));

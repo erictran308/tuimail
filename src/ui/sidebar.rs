@@ -6,11 +6,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use unicode_width::UnicodeWidthStr;
 
 use super::{border, bordered, fit, scrollbar};
 use crate::app::{App, Focus, Place, Row, folder_label};
 use crate::store::Role;
+use crate::text::cols;
 use crate::worker::State;
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
@@ -134,9 +134,9 @@ fn line(app: &App, row: Row, selected: bool, focused: bool, width: usize) -> Lin
     };
     let lead = format!("{}{icon} ", "  ".repeat(indent));
     // A column for the cursor's bar, one before the right edge.
-    let room = width.saturating_sub(1 + lead.width() + right.width() + 1);
+    let room = width.saturating_sub(1 + cols(&lead) + cols(&right) + 1);
     let label = fit(&label, room);
-    let gap = room.saturating_sub(label.width());
+    let gap = room.saturating_sub(cols(&label));
     let bar = if selected && focused {
         Span::styled("▌", Style::new().fg(c.accent))
     } else {

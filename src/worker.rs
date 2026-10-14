@@ -97,11 +97,15 @@ pub enum Request {
         uids: Vec<u32>,
         uidvalidity: u32,
     },
-    /// Moves messages back from `folder` to `to` (an undo): found by their
-    /// Message-IDs, since their UIDs in `folder` aren't known.
+    /// Moves messages back from `folder` to `to` (an undo): each by its
+    /// Message-ID and size from UID `floor` on (the folder's UIDNEXT just
+    /// before the move put them there, under `uidvalidity`), since their
+    /// UIDs there aren't known.
     MoveBack {
         folder: String,
-        message_ids: Vec<String>,
+        uidvalidity: u32,
+        floor: u32,
+        moved: Vec<(String, u32)>,
         to: String,
     },
     /// Puts a tag on messages (`on`) or takes it off.
@@ -230,12 +234,22 @@ pub enum Event {
     Done {
         folder: String,
     },
-    /// Messages moved back ([`Request::MoveBack`]): `found` of the
-    /// `asked` Message-IDs were in `folder`.
+    /// A move was made: where to, `to`'s UIDVALIDITY and its UIDNEXT just
+    /// before (0 if the server didn't say), for undoing it.
+    Moved {
+        folder: String,
+        uidvalidity: u32,
+        uids: Vec<u32>,
+        to: String,
+        to_uidvalidity: u32,
+        floor: u32,
+    },
+    /// Messages moved back ([`Request::MoveBack`]): those `moved` (their
+    /// UIDs in `folder`) of the `asked`.
     MovedBack {
         folder: String,
         to: String,
-        found: usize,
+        moved: Vec<u32>,
         asked: usize,
     },
     /// Deletes for good the server made (`all`: and expunged).
@@ -344,17 +358,23 @@ async fn imap_login(creds: &Credentials, endpoint: &Endpoint) -> Result<(Session
     let account = creds.account();
     match imap::connect(endpoint, account.username(), secret.expose(), account.auth).await {
         Ok(session) => {
-            let _ = creds.remember().await;
+            let _ = creds.remember(&secret).await;
             Ok(session)
         }
         Err(e) => {
             if e.downcast_ref::<imap::Refused>().is_some() {
-                creds.refused().await;
+                creds.refused(&secret).await;
             }
             Err(e)
         }
     }
 }
+
+/// How many times a held change may break a connection that was up before
+/// it's given up: one that fails the same way each time (more than may be
+/// read for it, a command that always runs out of time) would otherwise
+/// hold every later change, and the account, offline until tuimail quits.
+const MAX_TRIES: u32 = 3;
 
 /// Requests waiting together, with repeats of the same check dropped
 /// (the last one's `known` wins).
@@ -365,6 +385,25 @@ fn batch(first: Request, rx: &mut UnboundedReceiver<Request>) -> VecDeque<Reques
     }
     let mut out: VecDeque<Request> = VecDeque::new();
     for request in all {
+        // A download already asked for answers everyone waiting for it.
+        let downloading = out.iter().any(|r| match (r, &request) {
+            (
+                Request::Body {
+                    folder: a,
+                    uid: x,
+                    uidvalidity: v,
+                },
+                Request::Body {
+                    folder: b,
+                    uid: y,
+                    uidvalidity: w,
+                },
+            ) => a == b && x == y && v == w,
+            _ => false,
+        });
+        if downloading {
+            continue;
+        }
         let duplicate = out.iter().position(|r| match (r, &request) {
             (Request::Folders, Request::Folders) => true,
             (Request::Sync { folder: a, .. }, Request::Sync { folder: b, .. }) => a == b,
@@ -434,8 +473,9 @@ async fn run_imap(
     let mut session: Option<(Session, Caps)> = None;
     let mut failed_at: Option<Instant> = None;
     let mut watcher = Watcher::default();
-    // Changes asked for while the connection was down, in order.
-    let mut held: VecDeque<Request> = VecDeque::new();
+    // Changes asked for while the connection was down, in order, and how
+    // many times each broke a connection that was up.
+    let mut held: VecDeque<(Request, u32)> = VecDeque::new();
     let mut waiting = 0;
     let mut report = |n: usize, sink: &Sink| {
         if n != waiting {
@@ -459,17 +499,17 @@ async fn run_imap(
             }
         };
         // What was held goes first, in the order it was asked for.
-        let mut requests: VecDeque<Request> = std::mem::take(&mut held);
-        requests.extend(fresh);
-        while let Some(request) = requests.pop_front() {
-            let queued = requests.iter().filter(|r| r.changes()).count();
+        let mut requests: VecDeque<(Request, u32)> = std::mem::take(&mut held);
+        requests.extend(fresh.into_iter().map(|r| (r, 0)));
+        while let Some((request, tries)) = requests.pop_front() {
+            let queued = requests.iter().filter(|(r, _)| r.changes()).count();
             report(held.len() + queued + usize::from(request.changes()), &sink);
             if session.is_none() {
                 let recently = failed_at.is_some_and(|at| at.elapsed() < OFFLINE_FOR);
                 let retrying = !held.is_empty();
                 if (recently || retrying) && !matches!(request, Request::Folders) {
                     if request.changes() {
-                        held.push_back(request);
+                        held.push_back((request, tries));
                     } else {
                         report_failure(&request, "offline".into(), &sink);
                     }
@@ -482,6 +522,11 @@ async fn run_imap(
                         session = Some(s);
                         failed_at = None;
                         sink(Event::State(State::Online));
+                        // Back (for a check): what was held goes before
+                        // anything newer, in order.
+                        while let Some(h) = held.pop_back() {
+                            requests.push_front(h);
+                        }
                         if idle && !watcher.running() {
                             watcher.0 = Some(tokio::spawn(watch_inbox(
                                 creds.clone(),
@@ -494,7 +539,7 @@ async fn run_imap(
                         failed_at = Some(Instant::now());
                         sink(Event::State(login_failed(&e)));
                         if request.changes() {
-                            held.push_back(request);
+                            held.push_back((request, tries));
                         } else {
                             report_failure(&request, "offline".into(), &sink);
                         }
@@ -508,9 +553,17 @@ async fn run_imap(
             if let Err(e) = handle_imap(request.clone(), s, *caps, &creds, &sink).await {
                 let lost = broken(&e);
                 let error = text::one_line(&format!("{e:#}"), 300);
-                if lost && request.changes() {
+                if lost && request.changes() && tries + 1 < MAX_TRIES {
                     // Made again once the connection is back.
-                    held.push_back(request);
+                    held.push_back((request, tries + 1));
+                } else if lost && request.changes() {
+                    // It fails each time: given up, not left holding
+                    // every later change (and the account) up for good.
+                    report_failure(
+                        &request,
+                        format!("{error} (each of {MAX_TRIES} tries: given up)"),
+                        &sink,
+                    );
                 } else {
                     report_failure(&request, error.clone(), &sink);
                 }
@@ -663,24 +716,42 @@ async fn handle_imap(
             uidvalidity,
         } => {
             select_same(s, &folder, uidvalidity).await?;
+            // Where they'll be, so the move can be undone: from `to`'s
+            // UIDNEXT on. Not known if the server doesn't say.
+            let (to_uidvalidity, floor) = match imap::uid_next(s, &to).await {
+                Ok(next) => next,
+                Err(e) if e.is::<imap::Said>() => (0, 0),
+                Err(e) => return Err(e),
+            };
             imap::move_to(s, caps, &uids, &to).await?;
+            sink(Event::Moved {
+                folder,
+                uidvalidity,
+                uids,
+                to: to.clone(),
+                to_uidvalidity,
+                floor,
+            });
             sink(Event::Done { folder: to });
         }
         Request::MoveBack {
             folder,
-            message_ids,
+            uidvalidity,
+            floor,
+            moved,
             to,
         } => {
-            imap::select(s, &folder).await?;
-            let (uids, found) = imap::find_message_ids(s, &message_ids).await?;
+            // The folder as it was when they were moved there.
+            select_same(s, &folder, uidvalidity).await?;
+            let uids = imap::find_moved(s, &moved, floor).await?;
             if !uids.is_empty() {
                 imap::move_to(s, caps, &uids, &to).await?;
             }
             sink(Event::MovedBack {
                 folder,
                 to,
-                found,
-                asked: message_ids.len(),
+                moved: uids,
+                asked: moved.len(),
             });
         }
         Request::Delete {
@@ -879,9 +950,6 @@ async fn run_pop(
                     sink(Event::Popped(popped));
                 }
                 Err(e) => {
-                    if e.downcast_ref::<pop3::Refused>().is_some() {
-                        creds.refused().await;
-                    }
                     let state = login_failed(&e);
                     // The state says it all when the password is wanted.
                     let said = matches!(state, State::NeedPassword { .. });
@@ -910,8 +978,16 @@ async fn pop_check(
     let secret = creds.get().await?;
     let account = creds.account();
     let mut pop =
-        pop3::connect(endpoint, account.username(), secret.expose(), account.auth).await?;
-    let _ = creds.remember().await;
+        match pop3::connect(endpoint, account.username(), secret.expose(), account.auth).await {
+            Ok(pop) => pop,
+            Err(e) => {
+                if e.downcast_ref::<pop3::Refused>().is_some() {
+                    creds.refused(&secret).await;
+                }
+                return Err(e);
+            }
+        };
+    let _ = creds.remember(&secret).await;
     let ids = pop.uidl().await?;
     let sizes: HashMap<u32, u64> = pop.list().await?.into_iter().collect();
     let mut popped = Popped {
@@ -1000,7 +1076,7 @@ pub async fn send(
             .any(|c| c.downcast_ref::<smtp::Refused>().is_some())
         && account.smtp_username() == account.username()
     {
-        creds.refused().await;
+        creds.refused(&secret).await;
     }
     result
 }
@@ -1043,6 +1119,27 @@ mod tests {
             matches!(&all[0], Request::Sync { known, .. } if known.high == 5),
             "the latest"
         );
+    }
+
+    #[test]
+    fn one_download_answers_every_read_waiting_for_it() {
+        let (tx, mut rx) = unbounded_channel();
+        let body = |uid| Request::Body {
+            folder: "INBOX".into(),
+            uid,
+            uidvalidity: 7,
+        };
+        for uid in [9, 9, 8, 9] {
+            tx.send(body(uid)).unwrap();
+        }
+        let all = batch(body(9), &mut rx);
+        let uids: Vec<u32> = (all.iter())
+            .map(|r| match r {
+                Request::Body { uid, .. } => *uid,
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(uids, [9, 8]);
     }
 
     #[test]

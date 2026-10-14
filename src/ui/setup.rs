@@ -27,10 +27,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     // The intro wraps to the room inside the border and its margin, and
     // the form grows by the rows it takes.
     let text_width = usize::from(76.min(area.width).saturating_sub(4)).max(10);
-    let intro: Vec<String> = textwrap::wrap(intro, text_width)
-        .into_iter()
-        .map(|l| l.into_owned())
-        .collect();
+    let intro = crate::text::wrap(intro, text_width);
     let rect = centered(area, 76, (ROWS.len() + 9 + intro.len()) as u16);
     frame.render_widget(Clear, rect);
     let hint = if setup.checking {
@@ -143,20 +140,20 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     y += 1;
     if let Some(error) = &setup.error {
-        for part in textwrap::wrap(error, usize::from(width)) {
+        for part in crate::text::wrap(error, usize::from(width)) {
             line(
                 frame,
                 y,
-                vec![Span::styled(part.into_owned(), Style::new().fg(c.red))],
+                vec![Span::styled(part.to_string(), Style::new().fg(c.red))],
             );
             y += 1;
         }
     } else if !setup.note.is_empty() {
-        for part in textwrap::wrap(&setup.note, usize::from(width)) {
+        for part in crate::text::wrap(&setup.note, usize::from(width)) {
             line(
                 frame,
                 y,
-                vec![Span::styled(part.into_owned(), Style::new().fg(c.warning))],
+                vec![Span::styled(part.to_string(), Style::new().fg(c.warning))],
             );
             y += 1;
         }

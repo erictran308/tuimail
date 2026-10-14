@@ -33,13 +33,30 @@ pub struct Placed {
 }
 
 /// `summaries` as threads: each conversation in turn, newest first.
+#[cfg(test)]
 pub fn arrange(summaries: &[&Summary]) -> Vec<Placed> {
+    arrange_arrived(summaries, &[])
+}
+
+/// As [`arrange`], knowing where each message is and its UID there
+/// (`arrived`: a number for its account and folder, and its UID): of
+/// messages with one Message-ID in one folder, the one that came first is
+/// the one replies go under, not one a sender dated later.
+pub fn arrange_arrived(summaries: &[&Summary], arrived: &[(usize, u32)]) -> Vec<Placed> {
     let n = summaries.len();
     // A Message-ID's first message: a copy (in two inboxes) stands alone.
     let mut by_id: HashMap<&str, usize> = HashMap::new();
     for (i, s) in summaries.iter().enumerate() {
-        if !s.message_id.is_empty() {
-            by_id.entry(s.message_id.as_str()).or_insert(i);
+        if s.message_id.is_empty() {
+            continue;
+        }
+        let first = by_id.entry(s.message_id.as_str()).or_insert(i);
+        if let (Some(&(place, uid)), Some(&(was_place, was_uid))) =
+            (arrived.get(i), arrived.get(*first))
+            && place == was_place
+            && uid < was_uid
+        {
+            *first = i;
         }
     }
     // Each message answers the nearest one it names that's here: the one
@@ -197,6 +214,21 @@ mod tests {
                 (1, "".into()),
             ]
         );
+    }
+
+    #[test]
+    fn a_later_copy_of_a_message_id_doesnt_take_its_replies() {
+        // The genuine message came first (UID 1); a sender's copy of its
+        // Message-ID, dated later, is listed before it.
+        let list = [
+            summary("a", "", "", 90, "Forged"),
+            summary("r", "a", "a", 20, "Re: Plan"),
+            summary("a", "", "", 10, "Plan"),
+        ];
+        let refs: Vec<&Summary> = list.iter().collect();
+        let placed = arrange_arrived(&refs, &[(0, 5), (0, 2), (0, 1)]);
+        let reply = placed.iter().position(|p| p.index == 1).unwrap();
+        assert_eq!(placed[reply - 1].index, 2, "under the first: {placed:?}");
     }
 
     #[test]

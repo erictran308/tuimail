@@ -217,6 +217,11 @@ impl Setup {
     }
 
     pub fn paste(&mut self, text: &str) {
+        // While the login is checked, the form is what's checked: what's
+        // saved is that, not something pasted meanwhile.
+        if self.checking {
+            return;
+        }
         let row = self.current();
         if let Some(input) = self.input_mut(row) {
             let line = if row == Row::Password {

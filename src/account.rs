@@ -268,7 +268,19 @@ impl Account {
                         provider.name()
                     ));
                 }
-                _ => {}
+                // The token is the user's mailbox at that provider: never
+                // sent to another server to log in with.
+                Some(provider) => {
+                    let smtp = self.smtp_host.trim().trim_end_matches('.').to_lowercase();
+                    if !provider.smtp_hosts().contains(&smtp.as_str()) {
+                        return Some(format!(
+                            "signing in with {} sends mail through {} only, not {}",
+                            provider.name(),
+                            provider.smtp_hosts().join(" or "),
+                            text::one_line(&self.smtp_host, 60)
+                        ));
+                    }
+                }
             }
         }
         let needs_command = self.password == PasswordFrom::Command
@@ -748,6 +760,22 @@ mod tests {
             ..good.clone()
         };
         assert!(command.problem().unwrap().contains("full path"));
+        // Signing in with Microsoft: its token goes to Microsoft's servers
+        // only.
+        let outlook = Account {
+            email: "me@outlook.com".into(),
+            host: "outlook.office365.com".into(),
+            smtp_host: "smtp.office365.com".into(),
+            auth: Auth::Oauth2,
+            oauth_client_id: "my-app".into(),
+            ..good.clone()
+        };
+        assert_eq!(outlook.problem(), None);
+        let elsewhere = Account {
+            smtp_host: "smtp.example.org".into(),
+            ..outlook
+        };
+        assert!(elsewhere.problem().unwrap().contains("smtp.office365.com"));
         assert!(!valid_address("a b@c.d"));
         assert!(!valid_address("<a@c.d>"));
         assert!(valid_address("a.b+tag@c.d"));

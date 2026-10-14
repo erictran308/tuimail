@@ -64,7 +64,8 @@ impl Mail {
         )
     )]
     async fn list_accounts(&self, context: RequestContext<RoleServer>) -> CallToolResult {
-        self.ask(&context, Call::ListAccounts).await
+        self.ask(&context, Call::ListAccounts(agent::NoArgs {}))
+            .await
     }
 
     #[tool(
@@ -174,8 +175,8 @@ impl Mail {
 
     #[tool(
         description = "Moves messages to another folder of their account (archive, or any from list_folders; \
-            not Trash or Junk, which have their own tools). The user sees it and can undo it; they may be \
-            asked first.",
+            not Trash or Junk, which have their own tools, nor Drafts or Sent, which hold what the user \
+            wrote). The user sees it and can undo it; they may be asked first.",
         annotations(
             title = "Move to a folder",
             read_only_hint = false,

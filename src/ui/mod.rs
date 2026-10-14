@@ -16,11 +16,11 @@ use ratatui::widgets::{
     Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, PickerKind, Place, PromptKind, plural};
 use crate::notify::Notifications;
 use crate::settings::Settings;
+use crate::text::cols;
 use crate::theme::{self, Colors};
 use crate::worker::State;
 
@@ -118,7 +118,7 @@ pub(super) fn hint_spans(hints: &str, c: &Colors) -> Vec<Span<'static>> {
 /// As many of `hints` (separated by " · ") as fit in `width`, whole, as
 /// `hint_spans`; cut with `…` if not even the first fits.
 pub(super) fn hints_fitting(hints: &str, width: usize, c: &Colors) -> Vec<Span<'static>> {
-    let shown = |items: &[&str]| items.join(" · ").replace('`', "").width();
+    let shown = |items: &[&str]| cols(&items.join(" · ").replace('`', ""));
     let mut items: Vec<&str> = hints.split(" · ").collect();
     while items.len() > 1 && shown(&items) > width {
         items.pop();
@@ -132,19 +132,18 @@ pub(super) fn hints_fitting(hints: &str, width: usize, c: &Colors) -> Vec<Span<'
 
 /// `text` cut to `width` columns, with `…` if it was longer.
 pub fn fit(text: &str, width: usize) -> String {
-    if text.width() <= width {
+    if cols(text) <= width {
         return text.to_string();
     }
     if width == 0 {
         return String::new();
     }
-    // By what shows as one character, measured as ratatui draws it: "⚠️"
-    // (a sign and a variation selector) is two columns, not its
-    // characters' one.
+    // By what shows as one character, measured as ratatui draws it
+    // (`text::cols`).
     let mut out = String::new();
     let mut used = 0;
     for grapheme in text.graphemes(true) {
-        let w = grapheme.width();
+        let w = cols(grapheme);
         if used + w > width - 1 {
             break;
         }
@@ -158,21 +157,21 @@ pub fn fit(text: &str, width: usize) -> String {
 /// `text` cut in the middle to `width` columns, with `…`: its start and
 /// its end stay (an address's name and its domain).
 pub fn fit_middle(text: &str, width: usize) -> String {
-    if text.width() <= width {
+    if cols(text) <= width {
         return text.to_string();
     }
     if width < 3 {
         return fit(text, width);
     }
     let tail = fit_end(text, (width - 1) / 2 + 1);
-    let head = fit(text, width - tail.width() + 1);
+    let head = fit(text, width - cols(&tail) + 1);
     format!("{}{}", head.trim_end_matches('…'), tail)
 }
 
 /// `text` cut to `width` columns from the left, with `…`: what it ends
 /// with stays (a host's site).
 pub fn fit_end(text: &str, width: usize) -> String {
-    if text.width() <= width {
+    if cols(text) <= width {
         return text.to_string();
     }
     if width == 0 {
@@ -181,7 +180,7 @@ pub fn fit_end(text: &str, width: usize) -> String {
     let mut kept = Vec::new();
     let mut used = 0;
     for grapheme in text.graphemes(true).rev() {
-        let w = grapheme.width();
+        let w = cols(grapheme);
         if used + w > width - 1 {
             break;
         }
@@ -195,7 +194,7 @@ pub fn fit_end(text: &str, width: usize) -> String {
 /// `text` cut or padded to exactly `width` columns.
 pub fn pad(text: &str, width: usize) -> String {
     let cut = fit(text, width);
-    let used = cut.width();
+    let used = cols(&cut);
     format!("{cut}{}", " ".repeat(width.saturating_sub(used)))
 }
 
@@ -236,7 +235,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
     let width = area.width as usize;
     let right = connection(app);
-    let right_width = right.iter().map(Span::width).sum::<usize>();
+    let right_width = right.iter().map(|s| cols(&s.content)).sum::<usize>();
     let room = width.saturating_sub(right_width);
     let left = match &app.status {
         Some(status) if app.prompt.is_none() => {
@@ -248,7 +247,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         _ => hints_fitting(&format!(" {}", hints(app)), room, c),
     };
-    let used: usize = left.iter().map(Span::width).sum();
+    let used: usize = left.iter().map(|s| cols(&s.content)).sum();
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(room.saturating_sub(used))));
     spans.extend(right);
@@ -392,7 +391,7 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
         picker
             .labels
             .iter()
-            .map(|l| column(l).width())
+            .map(|l| cols(column(l)))
             .max()
             .unwrap_or(0)
     };
@@ -402,11 +401,10 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
         (0, 0)
     };
     let gap = |w: usize| if w > 0 { w + 2 } else { 0 };
-    let widest =
-        picker.items.iter().map(|i| i.width()).max().unwrap_or(0) + gap(hosts) + gap(saids);
+    let widest = picker.items.iter().map(|i| cols(i)).max().unwrap_or(0) + gap(hosts) + gap(saids);
     let width = (widest + 6)
-        .max(picker.title.width() + 4)
-        .max(hint.replace('`', "").width() + 4)
+        .max(cols(&picker.title) + 4)
+        .max(cols(&hint.replace('`', "")) + 4)
         .min(usize::from(area.width).saturating_sub(4)) as u16;
     let height = (picker.items.len() as u16 + 2)
         .min(area.height.saturating_sub(2))
@@ -451,7 +449,7 @@ fn picker(frame: &mut Frame, app: &App, area: Rect) {
                     fit(&row, room)
                 }
                 // A link is cut from the left: its site stays in view.
-                PickerKind::Links if item.width() > room => {
+                PickerKind::Links if cols(item) > room => {
                     let host = crate::app::link_host(item);
                     fit(&format!("{host}  {item}"), room)
                 }
@@ -593,14 +591,13 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
             " `y` remove · any other key keeps it ",
         ),
     };
-    let hint_width = hint.replace('`', "").width();
-    let width = (text.width().max(hint_width).max(title.width()) + 6)
+    let hint_width = cols(&hint.replace('`', ""));
+    let width = (cols(&text).max(hint_width).max(cols(title)) + 6)
         .min(70)
         .min(usize::from(area.width)) as u16;
-    let wrapped: Vec<String> = textwrap::wrap(&text, usize::from(width).saturating_sub(4))
-        .into_iter()
-        .map(|l| l.into_owned())
-        .collect();
+    // Wrapped by the columns ratatui draws (an agent's name of halfwidth
+    // sound marks would otherwise push its question out of the box).
+    let wrapped = crate::text::wrap(&text, usize::from(width).saturating_sub(4));
     let height = (wrapped.len() as u16 + 4).min(area.height);
     let popup = centered(area, width, height);
     frame.render_widget(Clear, popup);
@@ -738,7 +735,7 @@ fn help(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn key_lines(c: &Colors) -> Vec<Line<'static>> {
-    let key_width = HELP.iter().map(|(k, _)| k.width()).max().unwrap_or(0);
+    let key_width = HELP.iter().map(|(k, _)| cols(k)).max().unwrap_or(0);
     HELP.iter()
         .map(|(key, what)| {
             Line::from(vec![
@@ -894,11 +891,16 @@ pub mod tests {
         // ratatui and the terminal draw it, though each of its characters
         // counts less.
         let warning = "\u{26A0}\u{FE0F} Your Gmail storage is almost full";
-        for width in 1..20 {
-            assert!(fit(warning, width).width() <= width, "{width}");
-            assert!(fit_end(warning, width).width() <= width, "{width}");
-            assert!(fit_middle(warning, width).width() <= width, "{width}");
-            assert_eq!(pad(warning, width).width(), width, "{width}");
+        // Halfwidth sound marks: no columns to unicode-width, one each as
+        // drawn.
+        let marks = format!("Pay{} Security", "\u{FF9E}".repeat(12));
+        for text in [warning, &marks] {
+            for width in 1..20 {
+                assert!(cols(&fit(text, width)) <= width, "{width}");
+                assert!(cols(&fit_end(text, width)) <= width, "{width}");
+                assert!(cols(&fit_middle(text, width)) <= width, "{width}");
+                assert_eq!(cols(&pad(text, width)), width, "{width}");
+            }
         }
         assert_eq!(fit(warning, 6), "\u{26A0}\u{FE0F} Yo…");
         assert_eq!(fit("👨‍👩‍👧 family", 4), "👨‍👩‍👧 …");

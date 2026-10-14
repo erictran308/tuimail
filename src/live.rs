@@ -321,34 +321,73 @@ async fn live_imap_sync_read_flag_move_search_and_idle() {
             to: "Archive".into(),
         })
         .unwrap();
+    // Where it went: from Archive's UIDNEXT before the move on.
+    let (to_uidvalidity, floor) = next(&mut events, |e| match e {
+        Event::Moved {
+            to_uidvalidity,
+            floor,
+            ..
+        } => Some((to_uidvalidity, floor)),
+        _ => None,
+    })
+    .await;
+    assert!(to_uidvalidity != 0 && floor != 0);
     next(&mut events, |e| match e {
         Event::Done { folder } if folder == "Archive" => Some(()),
         _ => None,
     })
     .await;
-    // Undone: found in Archive by its Message-ID (one that isn't there
-    // is said to be missing), moved back, and moved to Archive again.
-    let ids = vec![
-        header.summary.message_id.clone(),
-        "nowhere@example.com".into(),
+    // Undone: found there by its Message-ID and size (one that isn't there
+    // is said to be missing), moved back; a second time, nothing's there.
+    let moved = vec![
+        (header.summary.message_id.clone(), header.size),
+        ("nowhere@example.com".into(), 0),
     ];
-    assert!(!ids[0].is_empty());
-    for (from, to, found) in [("Archive", "INBOX", 1), ("INBOX", "Archive", 1)] {
+    assert!(!moved[0].0.is_empty());
+    for expected in [1, 0] {
         bob.tx
             .send(Request::MoveBack {
-                folder: from.into(),
-                message_ids: ids.clone(),
-                to: to.into(),
+                folder: "Archive".into(),
+                uidvalidity: to_uidvalidity,
+                floor,
+                moved: moved.clone(),
+                to: "INBOX".into(),
             })
             .unwrap();
         let back = next(&mut events, |e| match e {
-            Event::MovedBack { found, asked, .. } => Some((found, asked)),
+            Event::MovedBack { moved, asked, .. } => Some((moved.len(), asked)),
             Event::Failed { error, .. } => panic!("{error}"),
             _ => None,
         })
         .await;
-        assert_eq!(back, (found, 2), "from {from}");
+        assert_eq!(back, (expected, 2));
     }
+    // To Archive again, under its new UID in INBOX.
+    bob.tx
+        .send(Request::Search {
+            folder: "INBOX".into(),
+            query: subject.clone(),
+        })
+        .unwrap();
+    let back = next(&mut events, |e| match e {
+        Event::Searched { headers, .. } => Some(headers),
+        _ => None,
+    })
+    .await;
+    assert_eq!(back.len(), 1);
+    bob.tx
+        .send(Request::Move {
+            uidvalidity: synced.uidvalidity,
+            folder: "INBOX".into(),
+            uids: vec![back[0].uid],
+            to: "Archive".into(),
+        })
+        .unwrap();
+    next(&mut events, |e| match e {
+        Event::Done { folder } if folder == "Archive" => Some(()),
+        _ => None,
+    })
+    .await;
     bob.tx
         .send(Request::Append {
             folder: "Archive".into(),

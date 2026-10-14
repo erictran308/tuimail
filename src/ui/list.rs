@@ -6,12 +6,12 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use unicode_width::UnicodeWidthStr;
 
 use super::{border, bordered, fit, pad, scrollbar};
 use crate::app::{App, Focus, Item, Place, plural};
 use crate::mail;
 use crate::store::Role;
+use crate::text::cols;
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
@@ -19,7 +19,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let (title, right) = titles(app);
     let width = usize::from(area.width.saturating_sub(4));
     let right = fit(&right, width / 2);
-    let title = fit(&title, width.saturating_sub(right.width() + 2));
+    let title = fit(&title, width.saturating_sub(cols(&right) + 2));
     let block = bordered()
         .border_style(border(focused, c))
         .title(Span::styled(
@@ -216,16 +216,16 @@ fn row(
     } else {
         format!("{} ", item.thread.tree)
     };
-    let tree = fit(&tree, tree.width().min(text_width / 2));
-    let text_width = text_width.saturating_sub(tree.width());
-    let folder_width = folder.width().min(text_width);
+    let tree = fit(&tree, cols(&tree).min(text_width / 2));
+    let text_width = text_width.saturating_sub(cols(&tree));
+    let folder_width = cols(&folder).min(text_width);
     let folder = fit(&folder, folder_width);
     // Tags after the subject, in at most a third of its room.
     let tags: String = m.flags.tags.iter().map(|t| format!(" #{t}")).collect();
-    let room = text_width.saturating_sub(folder.width());
-    let tags = fit(&tags, tags.width().min(room / 3));
-    let subject = fit(&subject, room.saturating_sub(tags.width()));
-    let mut spare = room.saturating_sub(subject.width() + tags.width());
+    let room = text_width.saturating_sub(cols(&folder));
+    let tags = fit(&tags, cols(&tags).min(room / 3));
+    let subject = fit(&subject, room.saturating_sub(cols(&tags)));
+    let mut spare = room.saturating_sub(cols(&subject) + cols(&tags));
     let preview = if spare > 4 && !m.preview.is_empty() {
         let lead = if subject.is_empty() && tags.is_empty() {
             ""
@@ -233,7 +233,7 @@ fn row(
             " · "
         };
         let p = fit(&format!("{lead}{}", m.preview), spare);
-        spare -= p.width();
+        spare -= cols(&p);
         p
     } else {
         String::new()
