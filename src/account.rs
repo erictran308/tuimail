@@ -714,8 +714,13 @@ mod tests {
         };
         assert!(elsewhere.problem().unwrap().contains("password_command"));
         // With a command, it's the command's token, as before.
+        let program = if cfg!(windows) {
+            r"C:\Program Files\oama\oama.exe"
+        } else {
+            "/usr/bin/oama"
+        };
         let command = Account {
-            password_command: vec!["/usr/bin/oama".into(), "access".into()],
+            password_command: vec![program.into(), "access".into()],
             ..elsewhere
         };
         assert_eq!(command.problem(), None);
