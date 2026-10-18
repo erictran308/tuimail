@@ -1,6 +1,6 @@
 [package]
 name = "tuimail"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Email in your terminal: a vim-style IMAP, POP3 and SMTP client"
 license = "MIT"
