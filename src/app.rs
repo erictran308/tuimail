@@ -6294,11 +6294,7 @@ pub mod tests {
         );
         assert!(app.pending.is_none(), "it won't open much later");
         let status = app.status.as_ref().unwrap();
-        assert!(
-            status.error && status.text.contains("offline"),
-            "{}",
-            status.text
-        );
+        assert!(status.error && status.text.contains("offline"), "said why");
     }
 
     #[tokio::test]
