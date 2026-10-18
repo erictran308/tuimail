@@ -121,11 +121,12 @@ pub enum Request {
         query: String,
     },
     /// POP3: download new mail (ids not in `seen`) and delete `remove`
-    /// from the server.
+    /// from the server. A `first_check` takes only the newest `count`.
     Pop {
         seen: HashSet<String>,
         remove: Vec<String>,
         count: u32,
+        first_check: bool,
     },
 }
 
@@ -448,14 +449,24 @@ impl Drop for Watcher {
 /// often.
 const RETRY_EVERY: Duration = Duration::from_secs(30);
 
-/// Tells the app a request failed: an Append by its id, anything else by
-/// what it was.
+/// Tells the app a request failed: an Append by its id, a download by its
+/// message (the reader, a reply and agents' reads wait for it), anything
+/// else by what it was.
 fn report_failure(request: &Request, error: String, sink: &Sink) {
     match request {
         Request::Append { folder, id, .. } => sink(Event::Appended {
             folder: folder.clone(),
             id: *id,
             error: Some(error),
+        }),
+        Request::Body { folder, uid, .. } => sink(Event::Body {
+            folder: folder.clone(),
+            uid: *uid,
+            result: Err(if error == "offline" {
+                "Not downloaded: the account is offline".into()
+            } else {
+                error
+            }),
         }),
         _ => sink(Event::Failed {
             what: request.what(),
@@ -828,21 +839,7 @@ async fn sync(s: &mut Session, folder: &str, known: Known, count: u32) -> Result
     } else if known.high == 0 {
         // The newest `count`, by their place in the folder.
         let start = selected.exists.saturating_sub(count as u32 - 1).max(1);
-        let fetched: Vec<async_imap::types::Fetch> = {
-            use futures::TryStreamExt;
-            tokio::time::timeout(imap::TIMEOUT, async {
-                s.fetch(format!("{start}:{}", selected.exists), "(UID)")
-                    .await?
-                    .try_collect()
-                    .await
-            })
-            .await
-            .map_err(|_| anyhow!("FETCH: the server stopped answering"))?
-            .map_err(|e| anyhow!("FETCH: {e}"))?
-        };
-        let mut uids: Vec<u32> = fetched.iter().filter_map(|f| f.uid).collect();
-        uids.sort_unstable();
-        uids
+        imap::uids_at(s, start, selected.exists).await?
     } else {
         // Past the last UID there are none (`high + 1` would wrap to 0, and
         // `0:*` is every message).
@@ -939,12 +936,21 @@ async fn run_pop(
                 seen,
                 remove,
                 count,
+                first_check,
             } = request
             else {
                 continue;
             };
             sink(Event::State(State::Connecting));
-            match pop_check(&creds, &endpoints.incoming, &seen, &remove, count).await {
+            let check = pop_check(
+                &creds,
+                &endpoints.incoming,
+                &seen,
+                &remove,
+                count,
+                first_check,
+            );
+            match check.await {
                 Ok(popped) => {
                     sink(Event::State(State::Online));
                     sink(Event::Popped(popped));
@@ -974,6 +980,7 @@ async fn pop_check(
     seen: &HashSet<String>,
     remove: &[String],
     count: u32,
+    first_check: bool,
 ) -> Result<Popped> {
     let secret = creds.get().await?;
     let account = creds.account();
@@ -997,7 +1004,7 @@ async fn pop_check(
     let mut new: Vec<&(u32, String)> = ids.iter().filter(|(_, id)| !seen.contains(id)).collect();
     // Newest (highest number) first.
     new.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
-    if seen.is_empty() && new.len() > count as usize {
+    if first_check && new.len() > count as usize {
         // A first check takes the newest share; the rest stay on the server.
         popped
             .skipped
@@ -1158,5 +1165,24 @@ mod tests {
         assert!(needs_password(
             &anyhow!(smtp::Refused("x".into())).context("cannot log in")
         ));
+    }
+
+    #[test]
+    fn a_download_that_fails_is_answered_as_that_download() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = events.clone();
+        let sink: Sink = Arc::new(move |e| kept.lock().unwrap().push(e));
+        let body = Request::Body {
+            folder: "INBOX".into(),
+            uid: 9,
+            uidvalidity: 7,
+        };
+        report_failure(&body, "offline".into(), &sink);
+        let events = events.lock().unwrap();
+        // The reader, a reply and agents' reads wait for this one.
+        assert!(
+            matches!(&events[..], [Event::Body { uid: 9, result: Err(e), .. }] if e.contains("offline")),
+            "{events:?}"
+        );
     }
 }

@@ -59,14 +59,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Pop3<S> {
     /// Reads a status line: its text after `+OK`, or an error with the
     /// server's words after `-ERR`.
     async fn status(&mut self) -> Result<String> {
+        self.status_or_challenge()
+            .await?
+            .ok_or_else(|| anyhow!("the server isn't speaking POP3"))
+    }
+
+    /// [`Pop3::status`], or `None` for a SASL challenge (`+ `).
+    async fn status_or_challenge(&mut self) -> Result<Option<String>> {
         let line = tokio::time::timeout(TIMEOUT, net::read_line(&mut self.stream, MAX_LINE))
             .await
             .map_err(|_| anyhow!("the POP3 server stopped answering"))??;
         let line = String::from_utf8_lossy(&line);
         if let Some(rest) = line.strip_prefix("+OK") {
-            Ok(rest.trim().to_string())
+            Ok(Some(rest.trim().to_string()))
         } else if let Some(rest) = line.strip_prefix("-ERR") {
             bail!(ServerError(text::one_line(rest, 200)))
+        } else if line == "+" || line.starts_with("+ ") {
+            Ok(None)
         } else {
             bail!("the server isn't speaking POP3")
         }
@@ -182,7 +191,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Pop3<S> {
         let result = match auth {
             Auth::Oauth2 => {
                 let token = format!("user={user}\x01auth=Bearer {secret}\x01\x01");
-                self.command(&format!("AUTH XOAUTH2 {}", b64(&token))).await
+                self.send(&format!("AUTH XOAUTH2 {}", b64(&token))).await?;
+                let mut answer = self.status_or_challenge().await;
+                if let Ok(None) = answer {
+                    // The server's error, as a challenge: an empty line
+                    // ends the exchange.
+                    self.send("").await?;
+                    answer = self.status().await.map(Some);
+                }
+                answer.map(Option::unwrap_or_default)
             }
             Auth::Password if !self.has("USER") && self.sasl("PLAIN") => {
                 self.command(&format!(
@@ -199,6 +216,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Pop3<S> {
         result
             .map(drop)
             .map_err(|e| match e.downcast::<ServerError>() {
+                Ok(ServerError(words)) if busy(&words) => anyhow!(ServerError(words)),
                 Ok(ServerError(words)) => anyhow!(Refused(words)),
                 Err(e) => e,
             })
@@ -278,6 +296,16 @@ impl std::fmt::Display for ServerError {
 }
 
 impl std::error::Error for ServerError {}
+
+/// Whether a login's `-ERR` says the server can't let anyone in now (RFC
+/// 2449's IN-USE and LOGIN-DELAY, RFC 3206's SYS), not that the password
+/// is wrong: then it isn't forgotten.
+fn busy(words: &str) -> bool {
+    let words = words.trim_start().to_ascii_uppercase();
+    ["[IN-USE]", "[LOGIN-DELAY]", "[SYS/"]
+        .iter()
+        .any(|code| words.starts_with(code))
+}
 
 /// A message bigger than tuimail takes.
 #[derive(Debug)]
@@ -432,6 +460,43 @@ pub mod tests {
         let mut pop = Pop3::new(stream);
         pop.greeting().await.unwrap();
         let error = pop.login("me", "wrong", Auth::Password).await.unwrap_err();
+        assert!(error.downcast_ref::<Refused>().is_some(), "{error}");
+
+        // Locked by another device a moment: the password isn't wrong.
+        let stream = scripted(vec![
+            ("", "+OK\r\n"),
+            ("USER me", "+OK\r\n"),
+            ("PASS right", "-ERR [IN-USE] mailbox locked\r\n"),
+        ]);
+        let mut pop = Pop3::new(stream);
+        pop.greeting().await.unwrap();
+        let error = pop.login("me", "right", Auth::Password).await.unwrap_err();
+        assert!(error.downcast_ref::<Refused>().is_none(), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_token_comes_as_a_challenge_answered_with_nothing() {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut lines = BufReader::new(read).lines();
+            write.write_all(b"+OK\r\n").await.unwrap();
+            let auth = lines.next_line().await.unwrap().unwrap();
+            assert!(auth.starts_with("AUTH XOAUTH2 "));
+            write
+                .write_all(b"+ eyJzdGF0dXMiOiI0MDAifQ==\r\n")
+                .await
+                .unwrap();
+            assert_eq!(lines.next_line().await.unwrap().unwrap(), "");
+            write
+                .write_all(b"-ERR [AUTH] invalid token\r\n")
+                .await
+                .unwrap();
+        });
+        let mut pop = Pop3::new(client);
+        pop.greeting().await.unwrap();
+        let error = pop.login("me", "token", Auth::Oauth2).await.unwrap_err();
+        // A refusal, not a server that can't POP3: the user signs in again.
         assert!(error.downcast_ref::<Refused>().is_some(), "{error}");
     }
 

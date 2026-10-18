@@ -136,10 +136,7 @@ pub async fn connect(
     let mut session = match tokio::time::timeout(TIMEOUT, login).await {
         Err(_) => bail!("{} didn't answer the login", endpoint.shown()),
         Ok(Ok(session)) => session,
-        Ok(Err((
-            async_imap::error::Error::No(words) | async_imap::error::Error::Bad(words),
-            _,
-        ))) => {
+        Ok(Err((async_imap::error::Error::No(words), _))) if wrong_password(&words) => {
             bail!(Refused(text::one_line(&words, 200)))
         }
         Ok(Err((e, _))) => bail!("cannot log in: {}", text::one_line(&e.to_string(), 200)),
@@ -151,6 +148,22 @@ pub async fn connect(
         uidplus: caps.has_str("UIDPLUS"),
     };
     Ok((session, caps))
+}
+
+/// Whether a NO to a login says the password is wrong, not that the
+/// server can't let anyone in now (RFC 5530's codes, which async-imap
+/// leaves in the text): only then is it forgotten.
+fn wrong_password(words: &str) -> bool {
+    let words = words.to_ascii_uppercase();
+    ![
+        "[UNAVAILABLE]",
+        "[INUSE]",
+        "[SERVERBUG]",
+        "[LIMIT]",
+        "SIMULTANEOUS CONNECTIONS",
+    ]
+    .iter()
+    .any(|busy| words.contains(busy))
 }
 
 /// XOAUTH2's one message; an error comes back as a challenge, answered
@@ -625,6 +638,31 @@ pub async fn headers(session: &mut Session, uids: &[u32]) -> Result<Vec<Header>>
     Ok(out)
 }
 
+/// The UIDs of the messages at places `start..=end` in the folder. Only
+/// those: a FETCH the server adds unasked could name any UID.
+pub async fn uids_at(session: &mut Session, start: u32, end: u32) -> Result<Vec<u32>> {
+    if start == 0 || end < start {
+        return Ok(Vec::new());
+    }
+    let range = (end - start) as usize + 1;
+    let fetched = collect(
+        "FETCH",
+        TIMEOUT,
+        session.fetch(format!("{start}:{end}"), "(UID)"),
+        range.min(MAX_FLAGS) + 16,
+        1 << 20,
+    )
+    .await?;
+    let mut uids: Vec<u32> = fetched
+        .iter()
+        .filter(|f| (start..=end).contains(&f.message))
+        .filter_map(|f| f.uid)
+        .collect();
+    uids.sort_unstable();
+    uids.dedup();
+    Ok(uids)
+}
+
 /// The flags of every message with a UID in `low..=high`.
 pub async fn flags(session: &mut Session, low: u32, high: u32) -> Result<Vec<(u32, Flags)>> {
     if low == 0 || high < low {
@@ -903,6 +941,20 @@ pub async fn idle(session: Session, limit: Duration) -> Result<(Session, bool)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_busy_for_now_isnt_a_wrong_password() {
+        // As async-imap words a NO: codes it doesn't know stay in the text.
+        let no = |info: &str| format!("code: None, info: Some({info:?})");
+        assert!(wrong_password(&no(
+            "[AUTHENTICATIONFAILED] Invalid credentials"
+        )));
+        assert!(wrong_password(&no("LOGIN failed.")));
+        assert!(!wrong_password(&no("[UNAVAILABLE] Temporary problem")));
+        assert!(!wrong_password(&no(
+            "[ALERT] Too many simultaneous connections."
+        )));
+    }
 
     /// A one-connection IMAP server on 127.0.0.1 that answers each
     /// command after LOGIN with `answer(tag, command)`.

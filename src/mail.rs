@@ -1380,17 +1380,31 @@ pub fn panic_is_contained() -> bool {
 }
 
 /// Runs `job` on a thread of its own with a big stack, its panics
-/// contained, and hands its result (`None` if it panicked) to `done`.
+/// contained, and hands its result (`None` if it panicked, or there was no
+/// thread to run it on) to `done`.
 pub fn in_background<T: Send + 'static>(
     job: impl FnOnce() -> T + Send + 'static,
     done: impl FnOnce(Option<T>) + Send + 'static,
 ) {
+    fn take<F>(slot: &std::sync::Mutex<Option<F>>) -> Option<F> {
+        slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+    let done = std::sync::Arc::new(std::sync::Mutex::new(Some(done)));
+    let on_thread = done.clone();
     let spawned = std::thread::Builder::new()
         .name("tuimail-render".into())
         .stack_size(RENDER_STACK)
-        .spawn(move || done(contained(job)));
-    if let Err(e) = spawned {
-        // No thread: nothing can be laid out, which `done` would say.
-        let _ = e;
+        .spawn(move || {
+            let result = contained(job);
+            if let Some(done) = take(&on_thread) {
+                done(result);
+            }
+        });
+    // No thread: nothing is laid out, and `done` says so, so nothing waits
+    // for it (a reader on "Downloading…").
+    if spawned.is_err()
+        && let Some(done) = take(&done)
+    {
+        done(None);
     }
 }

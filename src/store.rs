@@ -231,6 +231,11 @@ CREATE TABLE IF NOT EXISTS pop_seen (
     remove INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, pop_id)
 );
+-- POP3 accounts checked before: only a first check leaves older mail on
+-- the server, and `pop_seen` can't tell (it's emptied with the server).
+CREATE TABLE IF NOT EXISTS pop_checked (
+    account TEXT PRIMARY KEY
+);
 -- Changes made to mail, so they can be listed and undone: a row per
 -- action, and a `changed` row per message. Nothing a message says is kept
 -- here: it's looked up in the cache to show.
@@ -982,6 +987,26 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the account's mail has been checked before. A cache from
+    /// before this was kept counts if it remembers an id.
+    pub fn pop_checked(&self, account: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pop_checked WHERE account = ?1)
+                 OR EXISTS (SELECT 1 FROM pop_seen WHERE account = ?1)",
+            params![account],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Notes that the account's mail has been checked.
+    pub fn set_pop_checked(&self, account: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO pop_checked (account) VALUES (?1)",
+            params![account],
+        )?;
+        Ok(())
+    }
+
     // Addresses, for completing To, Cc and Bcc.
 
     /// Remembers addresses written to (`used`) or seen. A name seen in mail
@@ -1257,6 +1282,7 @@ impl Store {
             "messages",
             "bodies",
             "pop_seen",
+            "pop_checked",
             "pending_deletes",
             "changed",
             "local_uids",
@@ -1639,6 +1665,12 @@ Hi,\r\n\r\nthe numbers are in.\r\n> old quote\r\n-- \r\nAlice\r\n";
             store.pop_seen("p").unwrap(),
             HashSet::from(["uidl-2".into()])
         );
+        // Checked once, the account stays checked when the server empties.
+        store.set_pop_checked("p").unwrap();
+        store.pop_forget("p", &HashSet::new()).unwrap();
+        assert!(store.pop_seen("p").unwrap().is_empty());
+        assert!(store.pop_checked("p").unwrap());
+        assert!(!store.pop_checked("q").unwrap());
     }
 
     #[test]

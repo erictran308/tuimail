@@ -86,9 +86,10 @@ pub enum AppEvent {
         parsed: Option<Arc<Parsed>>,
         body: Option<Body>,
     },
-    /// A reply, forward or saved draft made ready for the composer.
+    /// A reply, forward or saved draft made ready for the composer, by the
+    /// account's id (an index could mean another once one is removed).
     Drafted {
-        account: usize,
+        account: String,
         kind: Kind,
         draft: Option<Draft>,
         replying: Option<Kept>,
@@ -110,6 +111,9 @@ pub enum AppEvent {
     Checked {
         result: Result<Option<crate::oauth::Tokens>, String>,
     },
+    /// What a background task couldn't do, for the status line (keeping a
+    /// new account's password in the keychain).
+    Failed { error: String },
     /// A sign-in with Microsoft or Google waits for the browser: open it
     /// on `url`.
     SignInOpened { url: String },
@@ -215,6 +219,9 @@ pub struct AccountState {
     popped_once: bool,
     /// POP3: a check was asked for while one ran: another follows it.
     pop_again: bool,
+    /// The password prompt was put off (`Esc`): it isn't opened on its own
+    /// again, only with P or Enter on the account's row.
+    password_put_off: bool,
     /// Changes (moves, flags, deletes) not yet made on the server.
     waiting: std::cell::Cell<usize>,
 }
@@ -576,6 +583,8 @@ pub struct App {
     pub picker: Option<Picker>,
     pub confirm: Option<Confirm>,
     confirm_at: Instant,
+    /// `d`'s questions still to ask: one each account and folder.
+    deletes_waiting: VecDeque<Confirm>,
     pub help: Option<HelpMenu>,
     pub status: Option<Status>,
     pending: Option<((usize, String, u32), Pending)>,
@@ -741,6 +750,7 @@ impl App {
             picker: None,
             confirm: None,
             confirm_at: Instant::now(),
+            deletes_waiting: VecDeque::new(),
             help: None,
             status: None,
             pending: None,
@@ -817,11 +827,16 @@ impl App {
                 }
             }
         };
+        // With no worker nothing connects: said, so nothing waits on it.
+        let state = match &worker {
+            None if !self.demo => State::Offline("can't connect: see the error at start".into()),
+            _ => State::Connecting,
+        };
         self.accounts.push(AccountState {
             account,
             id,
             worker,
-            state: State::Connecting,
+            state,
             folders,
             expanded: true,
             syncing: HashSet::new(),
@@ -830,6 +845,7 @@ impl App {
             checks: 0,
             popped_once: false,
             pop_again: false,
+            password_put_off: false,
             waiting: Default::default(),
         });
         self.accounts.len() - 1
@@ -1027,6 +1043,8 @@ impl App {
         let seen = self.store.pop_seen(&id).unwrap_or_default();
         let remove = self.store.pop_removals(&id).unwrap_or_default();
         let count = self.settings.fetch_count();
+        // Unsure, it's not a first check: that would leave mail behind.
+        let first_check = !self.store.pop_checked(&id).unwrap_or(true);
         self.accounts[i].syncing.insert("INBOX".into());
         self.send(
             i,
@@ -1034,6 +1052,7 @@ impl App {
                 seen,
                 remove,
                 count,
+                first_check,
             },
         );
     }
@@ -1133,13 +1152,13 @@ impl App {
                 draft,
                 replying,
                 draft_of,
-            } => match draft {
+            } => match (draft, self.account_index(&account)) {
                 // A reply made ready late never takes the place of a
                 // message being written, or of the one a question is about.
-                Some(_) if self.composer.is_some() || self.confirm.is_some() => {
+                (Some(_), _) if self.composer.is_some() || self.confirm.is_some() => {
                     self.info("A message is open: finish it, then start the reply again")
                 }
-                Some(draft) if account < self.accounts.len() => {
+                (Some(draft), Some(account)) => {
                     let mut composer = Composer::new(account, kind, draft);
                     composer.replying = replying;
                     composer.draft_of = draft_of;
@@ -1190,6 +1209,7 @@ impl App {
                 }
             }
             AppEvent::Checked { result } => self.on_checked(result),
+            AppEvent::Failed { error } => self.error(error),
             AppEvent::SignInOpened { url } => self.open_sign_in(&url),
             AppEvent::SignedIn { account, result } => self.on_signed_in(&account, result),
             AppEvent::Quit => self.quit = true,
@@ -1217,6 +1237,7 @@ impl App {
                     } else if self.prompt.is_none()
                         && self.composer.is_none()
                         && self.setup.is_none()
+                        && !self.accounts[i].password_put_off
                     {
                         self.prompt = Some(Prompt::new(PromptKind::Password(i), ""));
                         if refused {
@@ -1237,6 +1258,13 @@ impl App {
                     }
                 }
                 self.accounts[i].folders = self.store.folders(&id).unwrap_or_default();
+                // Deletes waiting in a folder the server no longer has went
+                // with it: not asked for again at every start.
+                for (folder, _, uids) in self.store.pending_deletes(&id).unwrap_or_default() {
+                    if !folders.iter().any(|f| f.name == folder) {
+                        let _ = self.store.done_deletes(&id, &folder, &uids);
+                    }
+                }
                 if let Place::Folder { account, folder } = &self.place
                     && *account == i
                     && !self.accounts[i].folders.iter().any(|f| &f.name == folder)
@@ -1300,22 +1328,23 @@ impl App {
                         }
                     }
                     Ok(None) => {
+                        let gone = "This message is gone from the server";
                         for read in self.agent_reads_for(&key) {
-                            let _ = read
-                                .reply
-                                .send(Err("This message is gone from the server".into()));
+                            let _ = read.reply.send(Err(gone.into()));
                         }
                         if let Some(reader) = self.reader.as_mut().filter(|r| r.key() == key) {
-                            reader.error = Some("This message is gone from the server".into());
+                            reader.error = Some(gone.into());
                         }
+                        self.drop_pending(&key, gone);
                     }
                     Err(e) => {
                         for read in self.agent_reads_for(&key) {
                             let _ = read.reply.send(Err(e.clone()));
                         }
                         if let Some(reader) = self.reader.as_mut().filter(|r| r.key() == key) {
-                            reader.error = Some(e);
+                            reader.error = Some(e.clone());
                         }
+                        self.drop_pending(&key, &e);
                     }
                 }
             }
@@ -1441,6 +1470,15 @@ impl App {
             }
             E::Changed { folder } => self.sync_folder(i, &folder),
             E::Popped(popped) => self.on_popped(i, popped),
+        }
+    }
+
+    /// A reply, forward or draft waiting for this message's text, which
+    /// didn't come: dropped, saying why, so it doesn't open much later.
+    fn drop_pending(&mut self, key: &(usize, String, u32), why: &str) {
+        if self.pending.as_ref().is_some_and(|(k, _)| k == key) {
+            self.pending = None;
+            self.error(format!("Not opened in the composer: {why}"));
         }
     }
 
@@ -1580,8 +1618,7 @@ impl App {
     fn on_popped(&mut self, i: usize, popped: worker::Popped) {
         let id = self.accounts[i].id.clone();
         self.accounts[i].syncing.clear();
-        let first = !self.accounts[i].popped_once
-            && self.store.pop_seen(&id).unwrap_or_default().is_empty();
+        let first = !self.accounts[i].popped_once && !self.store.pop_checked(&id).unwrap_or(true);
         let mut summaries = Vec::new();
         let mut added = Vec::new();
         let seen = self.store.pop_seen(&id).unwrap_or_default();
@@ -1609,6 +1646,7 @@ impl App {
             keep.remove(gone);
         }
         let _ = self.store.pop_forget(&id, &keep);
+        let _ = self.store.set_pop_checked(&id);
         self.accounts[i].popped_once = true;
         if !first {
             self.announce(i, summaries.iter());
@@ -1678,7 +1716,8 @@ impl App {
         let id = self.accounts[i].id.clone();
         for (folder, uidvalidity, uids) in self.store.pending_deletes(&id).unwrap_or_default() {
             let now = self.uidvalidity(i, &folder);
-            if now != 0 && uidvalidity != 0 && now != uidvalidity {
+            let gone = !self.accounts[i].folders.iter().any(|f| f.name == folder);
+            if gone || (now != 0 && uidvalidity != 0 && now != uidvalidity) {
                 let _ = self.store.done_deletes(&id, &folder, &uids);
                 continue;
             }
@@ -1878,8 +1917,11 @@ impl App {
             .and_then(|key| self.items.iter().position(|it| it.key() == key))
             .unwrap_or(self.selected)
             .min(self.items.len().saturating_sub(1));
-        self.marked
-            .retain(|key| self.items.iter().any(|it| &it.key() == key));
+        if !self.marked.is_empty() {
+            // Looked up in one set: thousands marked in a list of thousands.
+            let listed: HashSet<_> = self.items.iter().map(Item::key).collect();
+            self.marked.retain(|key| listed.contains(key));
+        }
     }
 
     /// Opens a folder (or every inbox) in the list.
@@ -1967,8 +2009,10 @@ impl App {
         if enter && self.role_of(item.account, &item.message.folder) == Some(Role::Drafts) {
             return self.start_from(key, Pending::EditDraft);
         }
+        // Open already; Enter downloads again one that failed.
         if let Some(reader) = &mut self.reader
             && reader.key() == key
+            && !(enter && reader.raw.is_none() && reader.error.is_some())
         {
             if enter {
                 self.focus = Focus::Reader;
@@ -2129,6 +2173,11 @@ impl App {
         change: impl Fn(&mut Flags),
     ) -> usize {
         let id = self.accounts[account].id.clone();
+        // Where each is in the list, found once rather than for each.
+        let listed: HashMap<u32, usize> = (self.items.iter().enumerate())
+            .filter(|(_, it)| it.account == account && it.message.folder == folder)
+            .map(|(i, it)| (it.message.uid, i))
+            .collect();
         let mut changed = Vec::new();
         for uid in uids {
             let Ok(Some(message)) = self.store.message(&id, folder, *uid) else {
@@ -2138,8 +2187,8 @@ impl App {
             change(&mut flags);
             let key = (account, folder.to_string(), *uid);
             self.local_flags.insert(key.clone(), Instant::now());
-            if let Some(item) = self.items.iter_mut().find(|it| it.key() == key) {
-                item.message.flags = flags.clone();
+            if let Some(&i) = listed.get(uid) {
+                self.items[i].message.flags = flags.clone();
             }
             if let Some(reader) = self.reader.as_mut().filter(|r| r.key() == key) {
                 reader.message.flags = flags.clone();
@@ -2154,13 +2203,22 @@ impl App {
     fn set_flag(&mut self, keys: &[(usize, String, u32)], flag: FlagKind, on: bool) {
         for (account, folder, uids) in Self::grouped(keys) {
             let id = self.accounts[account].id.clone();
-            let changed = self.change_here(account, &folder, &uids, |flags| match flag {
+            // The count moves by those whose flag changes, not all of them.
+            let unread = match flag {
+                FlagKind::Seen => self.unread_among(account, &folder, &uids),
+                _ => 0,
+            };
+            let found = self.change_here(account, &folder, &uids, |flags| match flag {
                 FlagKind::Seen => flags.seen = on,
                 FlagKind::Flagged => flags.flagged = on,
                 FlagKind::Answered => flags.answered = on,
             });
             if flag == FlagKind::Seen {
-                let delta = changed as i64;
+                let delta = if on {
+                    i64::from(unread)
+                } else {
+                    found as i64 - i64::from(unread)
+                };
                 if let Some(f) = self.accounts[account]
                     .folders
                     .iter_mut()
@@ -2459,7 +2517,9 @@ impl App {
             .into_iter()
             .find(|c| !c.undone);
         match last {
-            Some(change) => self.undo(change),
+            Some(change) => {
+                let _ = self.undo(change);
+            }
             None => self.info("Nothing to undo"),
         }
     }
@@ -2500,9 +2560,12 @@ impl App {
 
     /// Undoes a change: flags and tags set back on the messages it changed
     /// (those that were already so are left), moved messages moved back.
-    fn undo(&mut self, change: Change) {
+    /// Shows why when it can't, and says so.
+    fn undo(&mut self, change: Change) -> Result<(), &'static str> {
         if change.undone {
-            return self.info("That was undone already");
+            let why = "That was undone already";
+            self.info(why);
+            return Err(why);
         }
         let what = self.describe(&change);
         // By account and folder, and for moves where they went.
@@ -2535,9 +2598,9 @@ impl App {
                         .any(|m| m.moved_floor == 0 || m.moved_uidvalidity == 0)
             };
         if change.what == What::Move && groups.iter().any(unplaced) {
-            return self.error(
-                "That move hasn't reached the server yet, or where it put the mail isn't known: undo it once it has, or move them back by hand",
-            );
+            let why = "That move hasn't reached the server yet, or where it put the mail isn't known: undo it once it has, or move them back by hand";
+            self.error(why);
+            return Err(why);
         }
         let _ = self.store.set_undone(change.id);
         self.info(format!("Undone: {what}"));
@@ -2576,6 +2639,7 @@ impl App {
                 What::Move => self.move_back(account, &moved_to, &folder, &messages),
             }
         }
+        Ok(())
     }
 
     /// Moves messages back from `from`, where a change moved them, to
@@ -3278,7 +3342,9 @@ impl App {
         match plan.action {
             Action::Undo(change) => {
                 let what = self.describe(&change);
-                self.undo(*change);
+                if let Err(why) = self.undo(*change) {
+                    return Err(why.into());
+                }
                 self.agent_spent.push_back((Instant::now(), count, 0));
                 self.info(format!("{who} undid this: {what}"));
                 return Ok(serde_json::json!({ "done": format!("undid this: {what}") }));
@@ -3633,39 +3699,47 @@ impl App {
         }
     }
 
-    /// `d`: to Trash, or for good from Trash (asking first).
-    fn delete(&mut self, confirmed: bool) {
+    /// `d`: to Trash, or for good from Trash (asking first). Each account
+    /// and folder that needs a question gets its own, one after another.
+    fn delete(&mut self) {
         let targets = self.targets();
+        self.deletes_waiting.clear();
         for (account, folder, uids) in Self::grouped(&targets) {
             let trash = self.accounts[account]
                 .folder_for(Role::Trash)
                 .map(|f| f.name.clone());
             let forever = trash.as_deref().is_none_or(|t| t == folder);
-            if forever && !confirmed {
-                self.confirm(Confirm::DeleteForever {
-                    uidvalidity: self.uidvalidity(account, &folder),
-                    account,
-                    folder,
-                    uids,
-                });
-                return;
-            }
-            if !forever && !confirmed && self.settings.confirm_delete {
-                self.confirm(Confirm::Delete {
-                    uidvalidity: self.uidvalidity(account, &folder),
-                    account,
-                    folder,
-                    uids,
-                });
-                return;
-            }
+            let uidvalidity = self.uidvalidity(account, &folder);
             match trash.filter(|_| !forever) {
+                None => self.deletes_waiting.push_back(Confirm::DeleteForever {
+                    account,
+                    folder,
+                    uidvalidity,
+                    uids,
+                }),
+                Some(_) if self.settings.confirm_delete => {
+                    self.deletes_waiting.push_back(Confirm::Delete {
+                        account,
+                        folder,
+                        uids,
+                        uidvalidity,
+                    })
+                }
                 Some(trash) => {
                     self.move_messages(account, &folder, &uids, &trash);
                     self.info(format!("{} moved to Trash", plural(uids.len(), "message")));
                 }
-                None => self.delete_forever(account, &folder, &uids),
             }
+        }
+        self.ask_next_delete();
+    }
+
+    /// Asks the next of `d`'s questions, if there's one and no other.
+    fn ask_next_delete(&mut self) {
+        if self.confirm.is_none()
+            && let Some(next) = self.deletes_waiting.pop_front()
+        {
+            self.confirm(next);
         }
     }
 
@@ -3853,7 +3927,7 @@ impl App {
         let account = self.accounts[key.0].account.clone();
         let kept = self.kept(&key);
         let tx = self.tx.clone();
-        let index = key.0;
+        let account_id = self.accounts[key.0].id.clone();
         mail::in_background(
             move || {
                 let parsed = mail::parse(&raw)?;
@@ -3883,7 +3957,7 @@ impl App {
                     None => (Kind::New, None, None, None),
                 };
                 let _ = tx.send(AppEvent::Drafted {
-                    account: index,
+                    account: account_id,
                     kind,
                     draft,
                     replying,
@@ -4177,7 +4251,9 @@ impl App {
             self.info("Saved in Drafts");
             return;
         }
-        if !matches!(self.accounts[i].state, State::Online | State::Connecting) {
+        if self.accounts[i].worker.is_none()
+            || !matches!(self.accounts[i].state, State::Online | State::Connecting)
+        {
             return self.error(format!(
                 "{} isn't connected, so the draft can't be saved there now",
                 self.account_name(i)
@@ -4589,7 +4665,7 @@ impl App {
             KeyCode::Char('r') => self.reply(Pending::Reply { all: false }),
             KeyCode::Char('a') => self.reply(Pending::Reply { all: true }),
             KeyCode::Char('f') => self.reply(Pending::Forward),
-            KeyCode::Char('d') | KeyCode::Delete => self.delete(false),
+            KeyCode::Char('d') | KeyCode::Delete => self.delete(),
             KeyCode::Char('e') => self.move_to_role(Role::Archive),
             KeyCode::Char('!') => self.move_to_role(Role::Junk),
             KeyCode::Char('m') => self.pick_folder(),
@@ -4846,7 +4922,14 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Esc => self.prompt = None,
+            KeyCode::Esc => {
+                if let PromptKind::Password(i) = prompt.kind
+                    && let Some(account) = self.accounts.get_mut(i)
+                {
+                    account.password_put_off = true;
+                }
+                self.prompt = None;
+            }
             KeyCode::Enter => {
                 let Some(prompt) = self.prompt.take() else {
                     return;
@@ -4858,7 +4941,9 @@ impl App {
                         self.use_password(i, text);
                         // The next account waiting for its password asks.
                         let next = (0..self.accounts.len()).find(|&j| {
-                            j != i && matches!(self.accounts[j].state, State::NeedPassword { .. })
+                            j != i
+                                && matches!(self.accounts[j].state, State::NeedPassword { .. })
+                                && !self.accounts[j].password_put_off
                         });
                         if let Some(j) = next {
                             self.prompt = Some(Prompt::new(PromptKind::Password(j), ""));
@@ -4900,6 +4985,7 @@ impl App {
         };
         let creds = worker.creds.clone();
         futures::executor::block_on(creds.set(Secret::new(password)));
+        self.accounts[i].password_put_off = false;
         self.accounts[i].state = State::Connecting;
         self.check(i, true);
     }
@@ -4989,7 +5075,9 @@ impl App {
                             .get(n)
                             .and_then(|id| self.store.change(*id).ok().flatten())
                         {
-                            Some(change) => self.undo(change),
+                            Some(change) => {
+                                let _ = self.undo(change);
+                            }
                             None => self.error("That change is no longer kept"),
                         }
                     }
@@ -5075,9 +5163,14 @@ impl App {
         };
         let yes = key.code == KeyCode::Char('y') && !early;
         let no = key.code == KeyCode::Char('n') && !early;
+        let deleting = matches!(
+            confirm,
+            Confirm::Delete { .. } | Confirm::DeleteForever { .. }
+        );
         match confirm {
-            // Any key but `y` says no.
-            Confirm::Agent { id } => self.agent_answer(id, yes),
+            // Any key but `y` says no, once there's been time to read it:
+            // it comes up on its own, maybe while keys are being pressed.
+            Confirm::Agent { id } if !early => self.agent_answer(id, yes),
             Confirm::DeleteForever {
                 account,
                 folder,
@@ -5121,6 +5214,10 @@ impl App {
             Confirm::Quit { .. } if yes => self.quit = true,
             confirm if early => self.confirm = Some(confirm),
             _ => {}
+        }
+        // Answered: `d`'s question about another folder's messages.
+        if deleting {
+            self.ask_next_delete();
         }
     }
 
@@ -5403,8 +5500,9 @@ impl App {
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 if let Err(e) = crate::secrets::keychain_set(&key, &secret).await {
-                    let _ = tx.send(AppEvent::Checked {
-                        result: Err(format!("{e:#}")),
+                    // The form is closed by now: said on the status line.
+                    let _ = tx.send(AppEvent::Failed {
+                        error: text::one_line(&format!("{e:#}"), 300),
                     });
                 }
             });
@@ -5608,20 +5706,29 @@ fn percent_decoded(s: &str) -> String {
 }
 
 pub fn link_host(url: &str) -> String {
-    // Browsers skip any `/` and `\` after the scheme, and end the host at
-    // `\` as at `/`, in http and https.
-    let rest = url.split_once(':').map_or(url, |(_, r)| r);
+    use unicode_normalization::UnicodeNormalization;
+    // As browsers read it (the URL Standard): tabs and line breaks dropped,
+    // any `/` and `\` after the scheme skipped, the host ended at `\` as
+    // at `/`.
+    let url: String = url
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let rest = url.split_once(':').map_or(url.as_str(), |(_, r)| r);
     let rest = rest.trim_start_matches(['/', '\\']);
     let host = rest.split(['/', '\\', '?', '#']).next().unwrap_or(rest);
-    let host = host.rsplit('@').next().unwrap_or(host);
+    // Then `%XX` decoded and letters mapped as IDNA maps them (NFKC, lower
+    // case): `%2E`, `․` and `﹒` are all a dot to the browser, so here.
+    let host = percent_decoded(host);
+    let host = host.rsplit('@').next().unwrap_or(&host);
     let host = text::one_line(host, host.len());
+    let host = host.nfkc().collect::<String>().to_lowercase();
     // Letters from other alphabets are shown as the browser sends them
     // (punycode, `xn--`): `аpple.com` with a Cyrillic а isn't apple.com.
     let host = if host.is_ascii() {
         host
     } else {
-        host.to_lowercase()
-            .split(['.', '。', '．', '｡'])
+        host.split(['.', '。', '．', '｡'])
             .map(ascii_label)
             .collect::<Vec<_>>()
             .join(".")
@@ -5872,6 +5979,24 @@ pub mod tests {
     }
 
     #[test]
+    fn a_link_site_is_the_one_the_browser_opens() {
+        // Decoded, as the browser decodes it.
+        assert_eq!(
+            link_host("https://paypal.com%2Eevil.com/login"),
+            "paypal.com.evil.com"
+        );
+        // Characters IDNA maps to a dot are one.
+        for dot in ['\u{2024}', '\u{fe52}', '\u{ff0e}'] {
+            let url = format!("https://paypal.com{dot}evil.com/login");
+            assert_eq!(link_host(&url), "paypal.com.evil.com", "{dot:?}");
+        }
+        // Fullwidth letters are their ASCII ones; case doesn't matter.
+        assert_eq!(link_host("https://\u{ff30}ay\u{ff30}al.COM/"), "paypal.com");
+        // Line breaks inside are dropped, not shown as spaces.
+        assert_eq!(link_host("https://pay\npal.com/"), "paypal.com");
+    }
+
+    #[test]
     fn a_site_with_letters_from_other_alphabets_shows_as_its_browser_sends_it() {
         // A Cyrillic а in place of a.
         assert_eq!(
@@ -6084,6 +6209,112 @@ pub mod tests {
         app.confirm_at = Instant::now() - AGENT_GRACE;
         app.on_key(key(KeyCode::Char('y')));
         assert!(app.items.is_empty(), "gone for good");
+    }
+
+    #[tokio::test]
+    async fn deleting_from_several_folders_asks_about_each_that_needs_it() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.focus = Focus::List;
+        let (a, b) = (app.items[0].clone(), app.items[1].clone());
+        app.move_messages(0, "INBOX", &[a.message.uid], "Trash");
+        app.move_messages(0, "INBOX", &[b.message.uid], "Website");
+        let in_folder = |app: &mut App, folder: &str| {
+            app.open_place(Place::Folder {
+                account: 0,
+                folder: folder.into(),
+            });
+            app.items.iter().map(Item::key).collect::<Vec<_>>()
+        };
+        let mut marked = in_folder(&mut app, "Website");
+        marked.extend(in_folder(&mut app, "Trash"));
+        assert_eq!(marked.len(), 2);
+        app.marked = marked.into_iter().collect();
+        app.focus = Focus::List;
+        app.on_key(key(KeyCode::Char('d')));
+        // Trash's asks; Website's, which comes after it, isn't left behind.
+        assert!(matches!(
+            &app.confirm,
+            Some(Confirm::DeleteForever { folder, .. }) if folder == "Trash"
+        ));
+        assert!(in_folder(&mut app, "Website").is_empty());
+        app.confirm_at = Instant::now() - AGENT_GRACE;
+        app.on_key(key(KeyCode::Char('y')));
+        app.open_place(Place::Folder {
+            account: 0,
+            folder: "Trash".into(),
+        });
+        assert_eq!(
+            subjects(&app),
+            std::slice::from_ref(&b.message.summary.subject)
+        );
+    }
+
+    #[tokio::test]
+    async fn marking_read_counts_only_those_that_were_unread() {
+        let mut app = app();
+        with_mail(&mut app);
+        let unread = |app: &App| app.accounts[0].folder_for(Role::Inbox).unwrap().unread;
+        assert_eq!(unread(&app), 2);
+        let one_unread = app
+            .items
+            .iter()
+            .find(|it| !it.message.flags.seen)
+            .unwrap()
+            .key();
+        let one_read = app
+            .items
+            .iter()
+            .find(|it| it.message.flags.seen)
+            .unwrap()
+            .key();
+        app.set_flag(
+            &[one_unread.clone(), one_read.clone()],
+            FlagKind::Seen,
+            true,
+        );
+        assert_eq!(unread(&app), 1);
+        app.set_flag(&[one_unread, one_read], FlagKind::Seen, false);
+        assert_eq!(unread(&app), 3);
+    }
+
+    #[tokio::test]
+    async fn a_download_that_failed_drops_the_reply_waiting_for_it() {
+        let mut app = app();
+        with_mail(&mut app);
+        let key = app.items[0].key();
+        app.pending = Some((key.clone(), Pending::Reply { all: false }));
+        app.on_worker(
+            0,
+            worker::Event::Body {
+                folder: key.1,
+                uid: key.2,
+                result: Err("Not downloaded: the account is offline".into()),
+            },
+        );
+        assert!(app.pending.is_none(), "it won't open much later");
+        let status = app.status.as_ref().unwrap();
+        assert!(
+            status.error && status.text.contains("offline"),
+            "{}",
+            status.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_password_prompt_put_off_isnt_opened_again_on_its_own() {
+        let mut app = app();
+        with_mail(&mut app);
+        let need = || worker::Event::State(State::NeedPassword { refused: true });
+        app.on_worker(0, need());
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| p.kind),
+            Some(PromptKind::Password(0))
+        ));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.prompt.is_none());
+        app.on_worker(0, need());
+        assert!(app.prompt.is_none(), "put off: keys stay the list's");
     }
 
     #[tokio::test]
@@ -7182,7 +7413,8 @@ pub mod tests {
         assert!(refused.contains("said no"), "{refused}");
         assert!(!app.items[0].message.flags.flagged);
         assert!(app.confirm.is_none());
-        // A key pressed as the question comes up says no too.
+        // A key pressed as the question comes up answers nothing: it
+        // stays, for a key pressed once it can be read.
         let id = first_id(&mut app);
         let mut answer = agent_call(
             &mut app,
@@ -7192,8 +7424,32 @@ pub mod tests {
             }),
         );
         app.on_key(key(KeyCode::Char('y')));
-        assert!(answer.try_recv().unwrap().is_err(), "too soon to be a yes");
+        assert!(answer.try_recv().is_err(), "too soon to be an answer");
+        assert!(matches!(app.confirm, Some(Confirm::Agent { .. })));
         assert!(!app.items[0].message.flags.flagged);
+        app.confirm_at = Instant::now() - AGENT_GRACE;
+        app.on_key(key(KeyCode::Char('j')));
+        assert!(answer.try_recv().unwrap().is_err(), "any other key is a no");
+        assert!(!app.items[0].message.flags.flagged);
+    }
+
+    #[tokio::test]
+    async fn an_agent_is_told_when_its_undo_isnt_made() {
+        let mut app = app();
+        with_mail(&mut app);
+        app.settings.confirm_agents = false;
+        // On a server: a move is undone once the server says where it went.
+        app.demo = false;
+        let id = first_id(&mut app);
+        let moved = agent_now(
+            &mut app,
+            Call::MoveToTrash(agent::IdsArgs { ids: vec![id] }),
+        );
+        let change = moved.unwrap()["change"].as_i64().unwrap();
+        let undo = agent_now(&mut app, Call::UndoChange(agent::UndoArgs { change }));
+        let refused = undo.unwrap_err();
+        assert!(refused.contains("hasn't reached the server"), "{refused}");
+        assert!(!app.store.change(change).unwrap().unwrap().undone);
     }
 
     #[tokio::test]

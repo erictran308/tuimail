@@ -498,8 +498,10 @@ pub fn reply(parsed: &Parsed, account: &Account, all: bool) -> Draft {
     } else {
         &parsed.reply_to
     });
-    // Replying to your own message goes to whom it was to.
-    if to.iter().all(|a| a.addr.to_lowercase() == me) && !parsed.to.is_empty() {
+    // Replying to your own message goes to whom it was to; to a sender
+    // with no address mail can go to, to nobody.
+    let mine = !to.is_empty() && to.iter().all(|a| a.addr.to_lowercase() == me);
+    if mine && !parsed.to.is_empty() {
         to = usable(&parsed.to);
     }
     let mut cc = Vec::new();
@@ -736,6 +738,20 @@ mod tests {
             "{:?}",
             b.rcpts
         );
+
+        // A sender with no usable address: the reply goes to nobody, not
+        // to everyone it was to.
+        let raw = [
+            r#"From: "Boss" <boss"@corp.example>"#,
+            "To: everyone@corp.example, me@example.org",
+            "Subject: s",
+            "",
+            "hi",
+            "",
+        ]
+        .join("\r\n");
+        let parsed = mail::parse(raw.as_bytes()).unwrap();
+        assert_eq!(reply(&parsed, &me(), false).to, "");
 
         // Typed or completed: a quote between brackets quotes nothing, and
         // the address is refused rather than another one taken.

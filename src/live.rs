@@ -489,6 +489,7 @@ async fn live_pop3_downloads_new_mail_once_and_deletes_when_asked() {
             seen: Default::default(),
             remove: Vec::new(),
             count: 500,
+            first_check: true,
         })
         .unwrap();
     let popped = next(&mut events, |e| match e {
@@ -516,6 +517,7 @@ async fn live_pop3_downloads_new_mail_once_and_deletes_when_asked() {
             seen: seen.clone(),
             remove: vec![id.clone()],
             count: 500,
+            first_check: false,
         })
         .unwrap();
     let second = next(&mut events, |e| match e {
@@ -532,6 +534,7 @@ async fn live_pop3_downloads_new_mail_once_and_deletes_when_asked() {
             seen,
             remove: Vec::new(),
             count: 500,
+            first_check: false,
         })
         .unwrap();
     let third = next(&mut events, |e| match e {

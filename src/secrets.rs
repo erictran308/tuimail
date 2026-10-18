@@ -238,7 +238,8 @@ impl Credentials {
             .store(refused, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Whether the password comes from a command, run for each login.
+    /// Whether the password comes from a command: run once and kept, or,
+    /// for OAuth2, run for each login (tokens expire).
     fn uses_command(&self) -> bool {
         self.account.password == PasswordFrom::Command
             || (self.account.auth == Auth::Oauth2 && !self.signs_in())
@@ -261,19 +262,25 @@ impl Credentials {
         if self.signs_in() {
             return self.access_token().await;
         }
-        if self.uses_command() {
-            // After a refusal, no login until the user asks again (R):
-            // trying the same refused password at every check can lock the
-            // account.
-            if self.is_refused() {
-                return Err(anyhow!(NeedPassword));
-            }
+        // After a refusal, no login until the user asks again (R): trying
+        // the same refused password at every check can lock the account.
+        if self.uses_command() && self.is_refused() {
+            return Err(anyhow!(NeedPassword));
+        }
+        if self.uses_command() && self.account.auth == Auth::Oauth2 {
             // A token may be short-lived: the command is asked each time.
             return run_command(&self.account.password_command, false).await;
         }
         let mut kept = self.secret.lock().await;
         if let Some(secret) = kept.as_ref() {
             return Ok(secret.clone());
+        }
+        if self.uses_command() {
+            // It ran at start, with the terminal: again only if that failed,
+            // or its password was refused and the user asked again (R).
+            let secret = run_command(&self.account.password_command, false).await?;
+            *kept = Some(secret.clone());
+            return Ok(secret);
         }
         if self.uses_keychain()
             && !self.is_refused()
@@ -533,5 +540,36 @@ mod tests {
         assert_eq!(creds.get().await.unwrap().expose(), "typed again");
         creds.refused(&Secret::new("typed again")).await;
         assert!(creds.get().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_password_command_runs_once_and_its_password_is_kept() {
+        let runs = std::env::temp_dir().join(format!("tm-runs-{}", std::process::id()));
+        let _ = std::fs::remove_file(&runs);
+        let script = format!("echo run >> '{}'; echo from-command", runs.display());
+        let account = Account {
+            email: "me@example.org".into(),
+            password: PasswordFrom::Command,
+            password_command: vec!["/bin/sh".into(), "-c".into(), script],
+            ..Account::default()
+        };
+        let creds = Credentials::new(Arc::new(account), false);
+        // What it printed at start, with the terminal.
+        creds.set(Secret::new("at-start")).await;
+        let used = creds.get().await.unwrap();
+        assert_eq!(used.expose(), "at-start");
+        assert_eq!(creds.get().await.unwrap().expose(), "at-start");
+        assert!(!runs.exists(), "not run for each login");
+        // Refused: not run again until the user asks, then once.
+        creds.refused(&used).await;
+        assert!(creds.get().await.is_err());
+        assert!(!runs.exists());
+        creds.retry();
+        assert_eq!(creds.get().await.unwrap().expose(), "from-command");
+        assert_eq!(creds.get().await.unwrap().expose(), "from-command");
+        let ran = std::fs::read_to_string(&runs).unwrap();
+        let _ = std::fs::remove_file(&runs);
+        assert_eq!(ran.lines().count(), 1);
     }
 }

@@ -164,7 +164,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Smtp<S> {
     pub async fn login(&mut self, user: &str, secret: &str, auth: Auth) -> Result<()> {
         crate::net::check_login(user, secret)?;
         let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
-        let refused = |reply: Reply| anyhow!(Refused(text::one_line(&reply.text, 200)));
+        // A 4xx is the server's trouble, for now (RFC 4954's 454): not a
+        // wrong password, so it isn't forgotten.
+        let refused = |reply: Reply| {
+            let words = text::one_line(&reply.text, 200);
+            if (400..500).contains(&reply.code) {
+                anyhow!("the server can't log in now: {words}")
+            } else {
+                anyhow!(Refused(words))
+            }
+        };
         match auth {
             Auth::Oauth2 => {
                 let token = format!("user={user}\x01auth=Bearer {secret}\x01\x01");
@@ -411,6 +420,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<Refused>().is_some(), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_server_busy_for_now_isnt_a_refused_password() {
+        let stream = scripted(vec![
+            ("", "220 ready\r\n"),
+            ("EHLO [127.0.0.1]", "250-hi\r\n250 AUTH PLAIN\r\n"),
+            (
+                "AUTH PLAIN AG1lAHNlY3JldA==",
+                "454 4.7.0 try again later\r\n",
+            ),
+        ]);
+        let mut smtp = Smtp::new(stream);
+        smtp.greeting().await.unwrap();
+        smtp.ehlo().await.unwrap();
+        let error = smtp
+            .login("me", "secret", Auth::Password)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<Refused>().is_none(), "{error}");
     }
 
     #[tokio::test]
