@@ -7,7 +7,9 @@
 
 use std::borrow::Cow;
 
-use mail_parser::{AddressList, MessageParser, MessagePart, PartKind, PartRole, TextList};
+use mail_parser::{
+    AddressList, HeaderName, MessageParser, MessagePart, PartId, PartKind, PartRole, TextList,
+};
 
 use crate::text;
 
@@ -99,6 +101,8 @@ pub struct Parsed {
     pub reply_to: Vec<Addr>,
     pub to: Vec<Addr>,
     pub cc: Vec<Addr>,
+    /// Kept by a draft; anyone else's message has none.
+    pub bcc: Vec<Addr>,
     /// The plain-text bodies, joined.
     pub text: Option<String>,
     /// The text is format=flowed: lines ending in a space go on.
@@ -127,12 +131,9 @@ fn addrs(address: Option<AddressList>) -> Vec<Addr> {
         .mailboxes()
         .filter_map(|a| {
             // Whole or not at all: a cut address is someone else's.
-            let addr = a.address().map(checked)?;
-            if addr.chars().count() > MAX_ADDRESS {
-                return None;
-            }
-            let addr = text::one_line(&addr, MAX_ADDRESS);
-            let name = text::one_line(&checked(a.name().unwrap_or("")), MAX_NAME);
+            let addr = a.address().filter(|a| a.chars().count() <= MAX_ADDRESS)?;
+            let addr = text::one_line(addr, MAX_ADDRESS);
+            let name = text::one_line(a.name().unwrap_or(""), MAX_NAME);
             // Quotes around a name are its spelling, not part of it.
             let name = name.trim_matches(['"', '\'']).trim().to_string();
             Some(Addr { name, addr })
@@ -155,7 +156,7 @@ fn ids(value: Option<TextList>) -> Vec<String> {
     value
         .iter()
         .flat_map(|list| list.iter())
-        .map(|id| checked(id).trim().trim_matches(['<', '>']).to_string())
+        .map(|id| id.trim().trim_matches(['<', '>']).to_string())
         .filter(|id| valid_id(id))
         .collect()
 }
@@ -176,21 +177,13 @@ fn summary(message: &mail_parser::Message) -> Summary {
     if references.len() > MAX_REFERENCES {
         references.drain(..references.len() - MAX_REFERENCES);
     }
-    // From the headers alone (a multipart whose parts weren't read),
-    // multipart/mixed is the sign; else whether anything is listed.
-    let unread = message
-        .content_type()
-        .is_some_and(|ct| ct.ctype().eq_ignore_ascii_case("multipart"))
-        && message.root_part().children().next().is_none();
-    let attachments = if unread {
-        message.is_content_type("multipart", "mixed")
-    } else {
-        attachment_parts(message).next().is_some()
-    };
+    // From the headers alone, which is all IMAP has of it, so the same for
+    // every account.
+    let attachments = message.is_content_type("multipart", "mixed");
     Summary {
         message_id: message
             .message_id()
-            .map(|id| checked(id).trim().trim_matches(['<', '>']).to_string())
+            .map(|id| id.trim().trim_matches(['<', '>']).to_string())
             .filter(|id| valid_id(id))
             .unwrap_or_default(),
         in_reply_to: ids(message.in_reply_to()).pop().unwrap_or_default(),
@@ -199,7 +192,7 @@ fn summary(message: &mail_parser::Message) -> Summary {
         from,
         to: list(&addrs(message.to())),
         cc: list(&addrs(message.cc())),
-        subject: text::one_line(&checked(message.subject().unwrap_or("")), MAX_SUBJECT),
+        subject: text::one_line(message.subject().unwrap_or(""), MAX_SUBJECT),
         attachments,
     }
 }
@@ -210,7 +203,10 @@ fn summary(message: &mail_parser::Message) -> Summary {
 /// 10,000 parts, 3 encoded levels), not left to them: nesting deeper than
 /// real mail, far more parts than [`Parsed::attachments`] lists, a forward
 /// of a forward encoded in each other. Past them the rest stays in one
-/// part, listed.
+/// part, listed. `.cargo/config.toml` builds it checking every string it
+/// makes (`mail_parser_checked_str`, not `from_utf8_unchecked`), and
+/// encodify, its base64 and quoted-printable, with its portable code
+/// (`encodify_scalar`, not its SIMD kernels).
 static PARSER: std::sync::LazyLock<MessageParser> = std::sync::LazyLock::new(|| {
     MessageParser::new()
         .max_depth(32)
@@ -218,41 +214,39 @@ static PARSER: std::sync::LazyLock<MessageParser> = std::sync::LazyLock::new(|| 
         .max_encoded_nesting(2)
 });
 
-/// Reads `raw` with [`PARSER`] and hands the message to `f`; `None` if it
-/// isn't a message, or if either panicked, which a crafted message could
-/// make them do: then only this message fails ([`contained`]). Every use
-/// of mail-parser goes through here.
-fn read<T>(raw: &[u8], f: impl FnOnce(&mail_parser::Message) -> T) -> Option<T> {
-    contained(|| PARSER.parse(raw).map(|message| f(&message))).flatten()
-}
+// A CI or release build (their workflows set TM_HARDENED) without
+// `.cargo/config.toml`'s flags, which a RUSTFLAGS replaces, fails here.
+const _: () = assert!(
+    option_env!("TM_HARDENED").is_none() || cfg!(all(mail_parser_checked_str, encodify_scalar)),
+    "built without --cfg mail_parser_checked_str --cfg encodify_scalar"
+);
 
-/// Text from mail-parser, checked again to be UTF-8 before tuimail uses
-/// it: 1.0 makes its strings without a second check after its own SIMD
-/// one (`from_utf8_unchecked`), and a bug there mustn't pass on anything
-/// else.
-fn checked<'a>(text: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
-    let text = text.into();
-    match std::str::from_utf8(text.as_bytes()) {
-        Ok(_) => text,
-        Err(_) => Cow::Owned(String::from_utf8_lossy(text.as_bytes()).into_owned()),
-    }
+/// Reads `raw` with [`PARSER`] and hands the message to `f`, panics in
+/// either contained ([`contained`]; mail-parser decodes as it's asked, so
+/// inside `f` too): `None` if one panicked, which a crafted message could
+/// make mail-parser do, `Some(None)` if `raw` isn't a message to it. Every
+/// use of mail-parser goes through here.
+fn read<T>(raw: &[u8], f: impl FnOnce(&mail_parser::Message) -> T) -> Option<Option<T>> {
+    contained(|| PARSER.parse(raw).map(|message| f(&message)))
 }
 
 /// The summary of a message from its headers (or the whole message).
 pub fn summarize(raw: &[u8]) -> Summary {
-    read(raw, summary).unwrap_or_default()
+    read(raw, summary).flatten().unwrap_or_default()
 }
 
-/// Parses a whole message; `None` if it's empty. What mail-parser can't
-/// read as one (no headers at all, or it panicked) is shown as the text it
-/// is.
+/// Parses a whole message; `None` if it's empty or couldn't be read (a
+/// panic, which then says so rather than show something else). One with
+/// no headers at all, which mail-parser takes for no message, is shown as
+/// the text it is.
 pub fn parse(raw: &[u8]) -> Option<Parsed> {
-    read(raw, parsed).or_else(|| {
-        (!raw.is_empty()).then(|| Parsed {
+    match read(raw, parsed)? {
+        Some(parsed) => Some(parsed),
+        None => (!raw.is_empty()).then(|| Parsed {
             text: Some(String::from_utf8_lossy(raw).into_owned()),
             ..Parsed::default()
-        })
-    })
+        }),
+    }
 }
 
 fn parsed(message: &mail_parser::Message) -> Parsed {
@@ -260,28 +254,19 @@ fn parsed(message: &mail_parser::Message) -> Parsed {
         let joined = parts.join("\n\n");
         (!joined.trim().is_empty()).then_some(joined)
     };
+    let [text_parts, html_parts] = bodies(message);
     let mut flowed = false;
     let mut texts = Vec::new();
-    for part in message.text_body() {
-        // An HTML part standing in for the text is read as HTML below.
-        if !matches!(part.kind(), PartKind::Text) {
-            continue;
-        }
+    for part in &text_parts {
         if let Some(text) = part.text() {
             flowed |= part
                 .content_type()
                 .and_then(|ct| ct.attribute("format"))
                 .is_some_and(|f| f.eq_ignore_ascii_case("flowed"));
-            texts.push(checked(text));
+            texts.push(text);
         }
     }
-    let htmls: Vec<Cow<str>> = message
-        .html_body()
-        .filter(|p| matches!(p.kind(), PartKind::Html))
-        .chain(message.root().parts().filter(html_alternative))
-        .filter_map(|p| p.text())
-        .map(checked)
-        .collect();
+    let htmls = html_parts.iter().filter_map(|p| p.text()).collect();
     let attachments = attachment_parts(message)
         .enumerate()
         .map(|(i, part)| {
@@ -301,29 +286,72 @@ fn parsed(message: &mail_parser::Message) -> Parsed {
         reply_to: addrs(message.reply_to()),
         to: addrs(message.to()),
         cc: addrs(message.cc()),
+        bcc: addrs(message.bcc()),
         text: join(texts),
         flowed,
         html: join(htmls),
         attachments,
-        unsubscribe: unsubscribe_link(message.list_unsubscribe()),
+        unsubscribe: unsubscribe_link(message),
     }
 }
 
-/// A message's Bcc (a draft keeps it), every address whole or dropped.
-pub fn bcc(raw: &[u8]) -> Vec<Addr> {
-    read(raw, |message| addrs(message.bcc())).unwrap_or_default()
+/// The parts read as the message's text and as its HTML. mail-parser makes
+/// a version in a multipart/alternative that has a file name an attachment
+/// (as RFC 8621 does); when the message has no other version of its kind,
+/// it's that one, as before mail-parser 1.0. (An HTML part standing in
+/// for the text is read as the HTML.)
+fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
+    [false, true].map(|html| {
+        let of_kind = |p: &MessagePart| match p.kind() {
+            PartKind::Text => !html,
+            PartKind::Html => html,
+            _ => false,
+        };
+        let listed: Vec<MessagePart<'m>> = if html {
+            message.html_body().filter(|p| of_kind(p)).collect()
+        } else {
+            message.text_body().filter(|p| of_kind(p)).collect()
+        };
+        if !listed.is_empty() {
+            return listed;
+        }
+        message
+            .root()
+            .parts()
+            .filter(|p| {
+                of_kind(p)
+                    && p.is_attachment()
+                    && p.parent()
+                        .is_some_and(|q| q.is_content_type("multipart", "alternative"))
+            })
+            .collect()
+    })
 }
 
-/// The first https or mailto link of List-Unsubscribe (mail-parser has
-/// split them at the commas between them, not those inside them).
-fn unsubscribe_link(value: Option<AddressList>) -> Option<String> {
-    value?
-        .mailboxes()
-        .filter_map(|a| a.address())
-        .map(checked)
-        .find(|l| l.starts_with("https://") || l.starts_with("mailto:"))
-        .filter(|l| l.len() < 2000 && usable_link(l))
-        .map(Cow::into_owned)
+/// The first https or mailto link of List-Unsubscribe, read from the field
+/// as written: each `<…>` in it (RFC 2369), else its whole value, then
+/// each piece between commas (many senders leave out the brackets, and
+/// mail-parser then finds no link).
+fn unsubscribe_link(message: &mail_parser::Message) -> Option<String> {
+    let field = message.headers().get(HeaderName::ListUnsubscribe)?;
+    let value = String::from_utf8_lossy(field.raw_value()).replace(['\r', '\n'], "");
+    let bracketed: Vec<String> = value
+        .split('<')
+        .skip(1)
+        .filter_map(|s| s.split_once('>'))
+        .map(|(link, _)| link.split_whitespace().collect())
+        .collect();
+    let links = if bracketed.is_empty() {
+        std::iter::once(value.trim())
+            .chain(value.split(',').map(str::trim))
+            .map(str::to_string)
+            .collect()
+    } else {
+        bracketed
+    };
+    links.into_iter().find(|l| {
+        (l.starts_with("https://") || l.starts_with("mailto:")) && l.len() < 2000 && usable_link(l)
+    })
 }
 
 /// The start of a message's text for the list. Lays out HTML, so it runs
@@ -334,48 +362,37 @@ pub fn preview_of(raw: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-/// The parts listed as attachments: mail-parser's, the pictures, sound and
-/// video it counts as part of the text, and the parts it puts nowhere
-/// (RFC 8621 drops some inside an alternative), since tuimail shows none
-/// of those itself and each should still be there to save.
+/// The parts listed as attachments: mail-parser's but those read as the
+/// body ([`bodies`]), the pictures, sound and video it counts as part of
+/// the text, and the parts it puts nowhere (RFC 8621 drops some inside an
+/// alternative), since tuimail shows none of those itself and each should
+/// still be there to save.
 fn attachment_parts<'m>(
     message: &'m mail_parser::Message,
 ) -> impl Iterator<Item = MessagePart<'m>> {
-    message.root().parts().filter(|p| {
-        !html_alternative(p)
+    let read: Vec<PartId> = bodies(message).iter().flatten().map(|p| p.id()).collect();
+    message.root().parts().filter(move |p| {
+        !read.contains(&p.id())
             && (p.is_attachment() || matches!(p.role(), PartRole::MediaBody | PartRole::Dropped))
     })
 }
 
-/// An HTML version in a multipart/alternative that mail-parser made an
-/// attachment because it has a file name (as RFC 8621 does): it's still the
-/// message's HTML, and shown as it.
-fn html_alternative(part: &MessagePart) -> bool {
-    part.is_attachment()
-        && !part.in_html_body()
-        && matches!(part.kind(), PartKind::Html)
-        && part
-            .parent()
-            .is_some_and(|p| p.is_content_type("multipart", "alternative"))
-}
-
 /// An attachment's type, lower case: `image/png`.
 fn mime_of(part: &MessagePart) -> String {
-    let mime = part
-        .content_type()
+    part.content_type()
         .map(|ct| match ct.subtype() {
             Some(sub) => format!("{}/{}", ct.ctype(), sub),
             None => ct.ctype().to_string(),
         })
-        .unwrap_or_else(|| "application/octet-stream".into());
-    checked(&mime).to_ascii_lowercase()
+        .unwrap_or_else(|| "application/octet-stream".into())
+        .to_ascii_lowercase()
 }
 
 /// An attachment's safe file name: the one listed, saved and opened
 /// alike, so what was checked before opening is what's opened.
 fn part_name(part: &MessagePart, mime: &str) -> String {
     let name = match part.attachment_name() {
-        Some(name) => checked(name).into_owned(),
+        Some(name) => name.to_string(),
         None if part.nested().is_some() => "forwarded message.eml".into(),
         None if mime.starts_with("image/") => {
             format!("image.{}", mime.trim_start_matches("image/"))
@@ -395,6 +412,25 @@ pub fn attachment(raw: &[u8], index: u32) -> Option<(String, Vec<u8>)> {
         ))
     })
     .flatten()
+    .flatten()
+}
+
+/// Every attachment listed, as [`attachment`] gives each, from one parse
+/// (a forward takes them all).
+pub fn attachments(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
+    read(raw, |message| {
+        attachment_parts(message)
+            .take(500)
+            .map(|part| {
+                (
+                    part_name(&part, &mime_of(&part)),
+                    part.decoded().into_owned(),
+                )
+            })
+            .collect()
+    })
+    .flatten()
+    .unwrap_or_default()
 }
 
 /// A file name from a sender, made safe to save under: no folders, no
@@ -1412,23 +1448,67 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
     }
 
     #[test]
-    fn an_unsubscribe_link_keeps_its_commas() {
-        let raw = b"From: a@b.c\r\n\
-List-Unsubscribe: <https://x.com/u?a=1,2>, <mailto:u@x.com?subject=unsub>\r\n\r\nhi\r\n";
-        let parsed = parse(raw).unwrap();
-        assert_eq!(parsed.unsubscribe.as_deref(), Some("https://x.com/u?a=1,2"));
+    fn an_unsubscribe_link_is_read_as_written() {
+        let link = |field: &str| {
+            let raw = format!("From: a@b.c\r\nList-Unsubscribe: {field}\r\n\r\nhi\r\n");
+            parse(raw.as_bytes()).unwrap().unsubscribe
+        };
+        let first = Some("https://x.com/u?a=1,2".to_string());
+        assert_eq!(
+            link("<https://x.com/u?a=1,2>, <mailto:u@x.com?subject=unsub>"),
+            first
+        );
+        // Without brackets, as many senders write it.
+        assert_eq!(link("https://x.com/u?a=1,2"), first);
+        assert_eq!(link("mailto:u@x.com"), Some("mailto:u@x.com".to_string()));
+        assert_eq!(
+            link("mailto:u@x.com, https://x.com/u"),
+            Some("mailto:u@x.com".to_string())
+        );
+        // Folded inside its brackets.
+        assert_eq!(
+            link("<https://x.com/\r\n u>"),
+            Some("https://x.com/u".to_string())
+        );
+        assert_eq!(link("<javascript:alert(1)>, <ftp://x.com/u>"), None);
     }
 
     #[test]
-    fn an_html_version_with_a_file_name_is_still_the_html() {
-        let raw = b"From: a@b.c\r\nContent-Type: multipart/alternative; boundary=x\r\n\r\n\
---x\r\nContent-Type: text/plain\r\n\r\nplain version\r\n\
---x\r\nContent-Type: text/html; name=\"msg.html\"\r\n\r\n<p>html version</p>\r\n--x--\r\n";
-        let parsed = parse(raw).unwrap();
-        assert!(render(&parsed, 60, false).line(0).contains("html version"));
-        assert!(render(&parsed, 60, true).line(0).contains("plain version"));
-        assert!(parsed.attachments.is_empty(), "{:?}", parsed.attachments);
-        assert!(!parsed.summary.attachments);
+    fn a_version_with_a_file_name_is_the_body_only_when_it_is_the_only_one() {
+        let alternative = |parts: &str| {
+            let raw = format!(
+                "From: a@b.c\r\nContent-Type: multipart/alternative; boundary=x\r\n\r\n{parts}--x--\r\n"
+            );
+            parse(raw.as_bytes()).unwrap()
+        };
+        let plain = "--x\r\nContent-Type: text/plain\r\n\r\nplain version\r\n";
+        let html = "--x\r\nContent-Type: text/html\r\n\r\n<p>html version</p>\r\n";
+        let named_plain =
+            "--x\r\nContent-Type: text/plain; name=\"msg.txt\"\r\n\r\nplain version\r\n";
+        let named_html =
+            "--x\r\nContent-Type: text/html; name=\"msg.html\"\r\n\r\n<p>html version</p>\r\n";
+        for parsed in [
+            alternative(&format!("{plain}{named_html}")),
+            alternative(&format!("{named_html}{plain}")),
+            alternative(&format!("{html}{named_plain}")),
+            alternative(&format!("{named_plain}{html}")),
+        ] {
+            assert!(
+                render(&parsed, 60, false).line(0).contains("html version"),
+                "{parsed:?}"
+            );
+            assert!(
+                render(&parsed, 60, true).line(0).contains("plain version"),
+                "{parsed:?}"
+            );
+            assert!(parsed.attachments.is_empty(), "{:?}", parsed.attachments);
+        }
+        // With an HTML version already, a named one is an attachment.
+        let print = "--x\r\nContent-Type: text/html; name=\"print.html\"\r\n\r\n<p>print</p>\r\n";
+        let parsed = alternative(&format!("{plain}{html}{print}"));
+        assert_eq!(parsed.html.as_deref(), Some("<p>html version</p>"));
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].name, "print.html");
     }
 
     #[test]
@@ -1439,28 +1519,30 @@ List-Unsubscribe: <https://x.com/u?a=1,2>, <mailto:u@x.com?subject=unsub>\r\n\r\
     }
 
     #[test]
-    fn the_paperclip_is_what_the_reader_lists() {
+    fn a_panic_reading_a_message_fails_that_message_only() {
+        assert_eq!(
+            read(SIMPLE, |_| -> () { panic!("a crafted message") }),
+            None
+        );
+        assert_eq!(read(b"no headers", |_| ()), Some(None));
+        assert_eq!(read(SIMPLE, |m| m.subject().is_some()), Some(Some(true)));
+    }
+
+    #[test]
+    fn the_paperclip_is_the_same_from_the_headers_or_the_whole_message() {
         let clip = |raw: &str| summarize(raw.as_bytes()).attachments;
-        // From the headers alone, multipart/mixed is the sign.
+        let mixed = "From: a@b.c\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n";
+        assert!(clip(mixed));
+        assert!(clip(&format!(
+            "{mixed}--x\r\nContent-Type: text/plain\r\n\r\nhi\r\n--x--\r\n"
+        )));
         assert!(clip(
-            "From: a@b.c\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n"
+            "From: a@b.c\r\nContent-Type: Multipart/MIXED; boundary=x\r\n\r\n"
         ));
         assert!(!clip(
             "From: a@b.c\r\nContent-Type: multipart/alternative; boundary=x\r\n\r\n"
         ));
-        assert!(clip("From: a@b.c\r\nContent-Type: application/pdf\r\n\r\n"));
         assert!(!clip("From: a@b.c\r\nSubject: x\r\n\r\n"));
-        // From the whole message, what's listed.
-        assert!(!clip(
-            "From: a@b.c\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n\
---x\r\nContent-Type: text/plain\r\n\r\nhi\r\n\
---x\r\nContent-Type: text/plain\r\n\r\nmore\r\n--x--\r\n"
-        ));
-        assert!(clip(
-            "From: a@b.c\r\nContent-Type: multipart/related; boundary=x\r\n\r\n\
---x\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:i\">\r\n\
---x\r\nContent-Type: image/png\r\nContent-ID: <i>\r\n\r\nPNG\r\n--x--\r\n"
-        ));
     }
 
     #[test]
@@ -1530,6 +1612,11 @@ Content-Type: multipart/mixed; boundary=n\r\n\r\n\
 Content-Type: multipart/mixed; boundary=x\r\n",
             b"From: a@b.c\r\nContent-Type: text/plain; charset=utf-7\r\n\
 Content-Transfer-Encoding: quoted-printable\r\n\r\n+AKM. ==3D =\r\n+-\r\n",
+            b"From: a@b.c\r\nList-Unsubscribe: https://x.com/u?a=1,2, <mailto:u@x.com>\r\n\
+Content-Type: multipart/alternative; boundary=x\r\n\r\n\
+--x\r\nContent-Type: text/html\r\n\r\n<p>html</p>\r\n\
+--x\r\nContent-Type: text/plain; name=\"msg.txt\"\r\n\r\nplain\r\n\
+--x\r\nContent-Type: text/html; name=\"print.html\"\r\n\r\n<p>print</p>\r\n--x--\r\n",
         ];
         const PIECES: &[&[u8]] = &[
             b"\r\n",
@@ -1568,6 +1655,26 @@ Content-Transfer-Encoding: quoted-printable\r\n\r\n+AKM. ==3D =\r\n+-\r\n",
             b"\t",
         ];
         fn check(raw: &[u8]) {
+            // mail-parser's SIMD scanners (its `unsafe` code that this
+            // build keeps) find what its scalar one finds, at every step.
+            use mail_parser::scan::Kernel;
+            type Find = fn(Kernel, &[u8], usize) -> Option<usize>;
+            for kernel in Kernel::available() {
+                for find in [Kernel::dash_line as Find, Kernel::field_end] {
+                    let mut from = 0;
+                    loop {
+                        let found = find(Kernel::SCALAR, raw, from);
+                        assert_eq!(
+                            find(kernel, raw, from),
+                            found,
+                            "{} from {from}",
+                            kernel.name()
+                        );
+                        let Some(at) = found else { break };
+                        from = at + 1;
+                    }
+                }
+            }
             let utf8 = |text: &str| assert!(std::str::from_utf8(text.as_bytes()).is_ok());
             let Some(message) = PARSER.parse(raw) else {
                 return;
@@ -1594,10 +1701,15 @@ Content-Transfer-Encoding: quoted-printable\r\n\r\n+AKM. ==3D =\r\n+-\r\n",
                 }
             }
             let parsed = parsed(&message);
-            for (index, listed) in parsed.attachments.iter().enumerate() {
-                let (name, bytes) = attachment(raw, index as u32).expect("listed, so it's there");
-                assert_eq!(name, listed.name);
+            let all = attachments(raw);
+            assert_eq!(all.len(), parsed.attachments.len());
+            for (listed, (name, bytes)) in parsed.attachments.iter().zip(&all) {
+                assert_eq!(*name, listed.name);
                 assert_eq!(bytes.len(), listed.size);
+            }
+            if let Some(last) = all.last() {
+                let index = all.len() as u32 - 1;
+                assert_eq!(attachment(raw, index).as_ref(), Some(last));
             }
         }
         let mut state = 0x2545_f491_4f6c_dd1d_u64;

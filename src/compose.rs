@@ -561,13 +561,11 @@ pub fn forward(parsed: &Parsed, raw: &[u8], account: &Account) -> Draft {
     let attachments = parsed
         .attachments
         .iter()
-        .filter_map(|a| {
-            let (name, bytes) = mail::attachment(raw, a.index)?;
-            Some(Attachment::Data {
-                name,
-                mime: a.mime.clone(),
-                bytes: Arc::new(bytes),
-            })
+        .zip(mail::attachments(raw))
+        .map(|(a, (name, bytes))| Attachment::Data {
+            name,
+            mime: a.mime.clone(),
+            bytes: Arc::new(bytes),
         })
         .collect();
     Draft {
@@ -589,12 +587,10 @@ pub fn from_saved(parsed: &Parsed, raw: &[u8]) -> Draft {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    // As every address read: whole or not at all.
-    let bcc = mail::bcc(raw);
     let mut draft = forward(parsed, raw, &Account::default());
     draft.to = joined(&parsed.to);
     draft.cc = joined(&parsed.cc);
-    draft.bcc = joined(&bcc);
+    draft.bcc = joined(&parsed.bcc);
     draft.subject = parsed.summary.subject.clone();
     // Its text, or what its HTML says (a draft written as HTML only, by
     // another program, would otherwise lose all of it when saved again).

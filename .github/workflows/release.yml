@@ -66,9 +66,13 @@ jobs:
             run: true
     env:
       EXE: ${{ startsWith(matrix.os, 'windows') && '.exe' || '' }}
-      # Windows binaries carry the C runtime, so nobody needs the Visual C++
+      # mail-parser checks every string it makes and encodify uses its
+      # portable code (.cargo/config.toml, which RUSTFLAGS replaces), and
+      # TM_HARDENED fails a build without them (src/mail.rs). Windows
+      # binaries carry the C runtime, so nobody needs the Visual C++
       # redistributable.
-      RUSTFLAGS: ${{ startsWith(matrix.os, 'windows') && '-C target-feature=+crt-static' || '' }}
+      RUSTFLAGS: --cfg mail_parser_checked_str --cfg encodify_scalar ${{ startsWith(matrix.os, 'windows') && '-C target-feature=+crt-static' || '' }}
+      TM_HARDENED: "1"
     steps:
       # Without the token left in .git/config, build scripts can't push.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

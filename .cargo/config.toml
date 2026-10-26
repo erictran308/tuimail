@@ -1,0 +1,7 @@
+# What reads senders' mail is built the cautious way (src/mail.rs, PARSER):
+# mail-parser checks every string it makes instead of trusting its own SIMD
+# check (from_utf8_unchecked), and encodify, its base64 and
+# quoted-printable, uses its portable code, not its unsafe SIMD kernels. A
+# RUSTFLAGS variable replaces these, so release.yml passes them too.
+[build]
+rustflags = ["--cfg", "mail_parser_checked_str", "--cfg", "encodify_scalar"]
