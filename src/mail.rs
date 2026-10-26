@@ -1679,14 +1679,19 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
         assert_eq!(link("<https:x.com/u>"), None);
         // A comment right against a bracketed link.
         assert_eq!(link("(one-click)<https://x.com/u>"), bare);
-        // A long field is read only so far, and quickly.
-        let started = std::time::Instant::now();
+        // A long field is read only so far.
         assert_eq!(
             link(&format!("{}<https://x.com/u>", "a,".repeat(500_000))),
             None
         );
         assert_eq!(link(&",".repeat(1_000_000)), None);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // And the reader takes time in step with what it reads, not its
+        // square (it once lower-cased the rest at each comma).
+        let started = std::time::Instant::now();
+        // (Commas followed by neither a space nor a link: one long link.)
+        assert_eq!(unsubscribe_links(&"a,".repeat(500_000)).len(), 1);
+        assert_eq!(unsubscribe_links(&",".repeat(1_000_000)).len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
         // One the 8 KB cuts short isn't taken; one before it still is.
         let padding = " ".repeat(MAX_UNSUBSCRIBE - 20);
         assert_eq!(
