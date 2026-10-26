@@ -94,6 +94,8 @@ pub enum AppEvent {
         draft: Option<Draft>,
         replying: Option<Kept>,
         draft_of: Option<Kept>,
+        /// Attachments listed that a forward couldn't read, so lacks.
+        lost: usize,
     },
     /// An attachment taken out of its message: saved, or to open.
     Extracted {
@@ -1152,6 +1154,7 @@ impl App {
                 draft,
                 replying,
                 draft_of,
+                lost,
             } => match (draft, self.account_index(&account)) {
                 // A reply made ready late never takes the place of a
                 // message being written, or of the one a question is about.
@@ -1163,6 +1166,11 @@ impl App {
                     composer.replying = replying;
                     composer.draft_of = draft_of;
                     self.composer = Some(composer);
+                    if lost > 0 {
+                        self.error(format!(
+                            "{lost} of its attachments couldn't be read, so aren't attached"
+                        ));
+                    }
                 }
                 _ => self.error("That message can't be read"),
             },
@@ -3931,7 +3939,7 @@ impl App {
         mail::in_background(
             move || {
                 let parsed = mail::parse(&raw)?;
-                Some(match pending {
+                let made = match pending {
                     Pending::Reply { all } => {
                         (Kind::Reply, compose::reply(&parsed, &account, all), None)
                     }
@@ -3945,16 +3953,23 @@ impl App {
                         compose::from_saved(&parsed, &raw),
                         Some(kept.clone()),
                     ),
-                })
-                .map(|(kind, draft, draft_of)| (kind, draft, draft_of, kept))
+                };
+                let lost = match made.0 {
+                    Kind::Reply => 0,
+                    _ => parsed
+                        .attachments
+                        .len()
+                        .saturating_sub(made.1.attachments.len()),
+                };
+                Some((made.0, made.1, made.2, kept, lost))
             },
             move |result| {
-                let (kind, draft, draft_of, replying) = match result.flatten() {
-                    Some((kind, draft, draft_of, kept)) => {
+                let (kind, draft, draft_of, replying, lost) = match result.flatten() {
+                    Some((kind, draft, draft_of, kept, lost)) => {
                         let replying = (kind == Kind::Reply).then_some(kept);
-                        (kind, Some(draft), draft_of, replying)
+                        (kind, Some(draft), draft_of, replying, lost)
                     }
-                    None => (Kind::New, None, None, None),
+                    None => (Kind::New, None, None, None, 0),
                 };
                 let _ = tx.send(AppEvent::Drafted {
                     account: account_id,
@@ -3962,6 +3977,7 @@ impl App {
                     draft,
                     replying,
                     draft_of,
+                    lost,
                 });
             },
         );

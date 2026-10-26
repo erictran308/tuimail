@@ -208,21 +208,14 @@ fn summary(message: &mail_parser::Message) -> Summary {
 /// part, listed. `.cargo/config.toml` builds it checking every string it
 /// makes (`mail_parser_checked_str`, not `from_utf8_unchecked`), and
 /// encodify, its base64 and quoted-printable, with its portable code
-/// (`encodify_scalar`, not its SIMD kernels); build.rs warns of a build
-/// without them, and fails one for CI or a release.
+/// (`encodify_scalar`, not its SIMD kernels); build.rs refuses a build
+/// without them.
 static PARSER: std::sync::LazyLock<MessageParser> = std::sync::LazyLock::new(|| {
     MessageParser::new()
         .max_depth(32)
         .max_parts(2_000)
         .max_encoded_nesting(2)
 });
-
-/// Whether this build has `.cargo/config.toml`'s flags for [`PARSER`]. One
-/// from crates.io without the README's RUSTFLAGS hasn't, and build.rs's
-/// warning isn't shown there, so `--check` and the start say so.
-pub const HARDENED: bool = cfg!(all(mail_parser_checked_str, encodify_scalar));
-pub const NOT_HARDENED: &str = "built without the flags that make reading mail safer: \
-    the README's \"build it from source\" says how";
 
 /// Reads `raw` with [`PARSER`] and hands the message to `f`, panics in
 /// either contained ([`contained`]; mail-parser decodes as it's asked, so
@@ -314,7 +307,13 @@ fn parsed(message: &mail_parser::Message) -> Parsed {
 fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
     [false, true].map(|html| {
         let of_kind = |p: &MessagePart| match p.kind() {
-            PartKind::Text => !html,
+            // mail-parser reads a message/rfc822 with no headers as Text:
+            // never the body of this one.
+            PartKind::Text => {
+                !html
+                    && p.content_type()
+                        .is_none_or(|ct| ct.ctype().eq_ignore_ascii_case("text"))
+            }
             PartKind::Html => html,
             _ => false,
         };
@@ -342,10 +341,15 @@ fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
 
 /// The first https or mailto link of List-Unsubscribe, read from the field
 /// as written (many senders leave out RFC 2369's `<…>`, and mail-parser
-/// then finds no link at all), its scheme in lower case.
+/// then finds no link at all), its scheme in lower case. Only the field's
+/// first [`MAX_UNSUBSCRIBE`] bytes are read: a link is shorter than 2,000.
 fn unsubscribe_link(message: &mail_parser::Message) -> Option<String> {
-    let field = message.headers().get(HeaderName::ListUnsubscribe)?;
-    let value = String::from_utf8_lossy(field.raw_value()).replace(['\r', '\n'], "");
+    let field = message
+        .headers()
+        .get(HeaderName::ListUnsubscribe)?
+        .raw_value();
+    let field = &field[..field.len().min(MAX_UNSUBSCRIBE)];
+    let value = String::from_utf8_lossy(field).replace(['\r', '\n'], "");
     unsubscribe_links(&value)
         .into_iter()
         .filter_map(|link| {
@@ -357,17 +361,20 @@ fn unsubscribe_link(message: &mail_parser::Message) -> Option<String> {
         .find(|l| l.len() < 2000 && usable_link(l))
 }
 
+const MAX_UNSUBSCRIBE: usize = 8 << 10;
+
 /// The links of a List-Unsubscribe field, in order. A `<` that starts
-/// one takes all to its `>`, commas too, without the spaces folding left;
-/// other text is a link up to a space, or a comma that a space or another
-/// link follows (a comma inside a link is followed by neither). What's
-/// between them (comments) comes out as links nobody would take.
+/// one (where no link has started: after a comment too) takes all to its
+/// `>`, commas too, without the spaces folding left; other text is a link
+/// up to a space, or a comma that a space or another link follows (a comma
+/// inside a link is followed by neither). What's between them (comments)
+/// comes out as links nobody would take.
 fn unsubscribe_links(value: &str) -> Vec<String> {
-    let starts_link = |rest: &str| {
-        let rest = rest.to_ascii_lowercase();
-        ["<", "https:", "http:", "mailto:"]
-            .iter()
-            .any(|start| rest.starts_with(start))
+    let starts_link = |text: &str| {
+        ["<", "https:", "http:", "mailto:"].iter().any(|start| {
+            text.get(..start.len())
+                .is_some_and(|s| s.eq_ignore_ascii_case(start))
+        })
     };
     let mut links = Vec::new();
     let mut link = String::new();
@@ -383,7 +390,8 @@ fn unsubscribe_links(value: &str) -> Vec<String> {
                 c if !c.is_whitespace() => link.push(c),
                 _ => {}
             }
-        } else if c == '<' && link.is_empty() {
+        } else if c == '<' && !starts_link(&link) {
+            link.clear();
             bracketed = true;
         } else if c.is_whitespace()
             || (c == ','
@@ -410,19 +418,27 @@ pub fn preview_of(raw: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-/// The parts listed as attachments: mail-parser's but those read as the
-/// body (`body`, from [`bodies`]), the pictures, sound and video it counts
-/// as part of the text, and the parts it puts nowhere (RFC 8621 drops some
-/// inside an alternative), since tuimail shows none of those itself and
-/// each should still be there to save.
+/// The parts listed as attachments: every part but the multiparts and
+/// those read as the body (`body`, from [`bodies`]), so mail-parser's
+/// attachments, the pictures, sound and video it counts as part of the
+/// text, and parts it puts nowhere (RFC 8621 drops some inside a mixed in
+/// an alternative), since tuimail shows none of those itself and each
+/// should be there to save. Not a text or HTML version an alternative
+/// leaves out, though (a second text/plain, Apple's text/watch-html): its
+/// sender never meant it to be seen, unless they named it or marked it as
+/// a download.
 fn attachment_parts<'m>(
     message: &'m mail_parser::Message,
     body: &[Vec<MessagePart<'m>>; 2],
 ) -> impl Iterator<Item = MessagePart<'m>> + use<'m> {
     let read: Vec<PartId> = body.iter().flatten().map(|p| p.id()).collect();
     message.root().parts().filter(move |p| {
-        !read.contains(&p.id())
-            && (p.is_attachment() || matches!(p.role(), PartRole::MediaBody | PartRole::Dropped))
+        let left_out = p.is_text()
+            && p.attachment_name().is_none()
+            && !p.content_disposition().is_some_and(|d| d.is_attachment())
+            && p.parent()
+                .is_some_and(|q| q.is_content_type("multipart", "alternative"));
+        !read.contains(&p.id()) && p.role() != PartRole::Container && !left_out
     })
 }
 
@@ -1546,6 +1562,28 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
         assert_eq!(link("<MAILTO:u@x.com>"), Some("mailto:u@x.com".to_string()));
         assert_eq!(link("<HTTPS://x.com/u>"), bare);
         assert_eq!(link("<https:x.com/u>"), None);
+        // A comment right against a bracketed link.
+        assert_eq!(link("(one-click)<https://x.com/u>"), bare);
+        // A long field is read only so far, and quickly.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            link(&format!("{}<https://x.com/u>", "a,".repeat(500_000))),
+            None
+        );
+        assert_eq!(link(&",".repeat(1_000_000)), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_version_an_alternative_leaves_out_is_not_listed() {
+        let raw = b"From: a@b.c\r\nContent-Type: multipart/alternative; boundary=x\r\n\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\none\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\ntwo\r\n\
+--x\r\nContent-Type: text/watch-html\r\n\r\n<p>watch</p>\r\n\
+--x\r\nContent-Type: text/html\r\n\r\n<p>html</p>\r\n--x--\r\n";
+        let parsed = parse(raw).unwrap();
+        assert_eq!(parsed.html.as_deref(), Some("<p>html</p>"));
+        assert!(parsed.attachments.is_empty(), "{:?}", parsed.attachments);
     }
 
     #[test]
