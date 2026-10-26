@@ -1173,7 +1173,7 @@ impl App {
                     self.composer = Some(composer);
                     if lost > 0 {
                         self.error(format!(
-                            "{lost} of its attachments couldn't be read, so aren't attached{kept_too}"
+                            "{lost} of its attachments couldn't be taken, so aren't attached{kept_too}"
                         ));
                     }
                 }
@@ -3956,13 +3956,13 @@ impl App {
                     }
                     Pending::Forward => {
                         let (parsed, contents) = mail::parse_with_contents(&raw)?;
-                        let lost = contents.lost;
+                        let lost = contents.lost();
                         let draft = compose::forward(&parsed, contents.files, &account);
                         (Kind::Forward, draft, None, kept, lost)
                     }
                     Pending::EditDraft => {
                         let (parsed, contents) = mail::parse_with_contents(&raw)?;
-                        let lost = contents.lost;
+                        let lost = contents.lost();
                         let draft = compose::from_saved(&parsed, contents);
                         // Saving or sending deletes the draft it's made from:
                         // not one with attachments this one lacks.

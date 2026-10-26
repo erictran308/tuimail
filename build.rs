@@ -18,7 +18,9 @@ fn main() {
         and decodes without unsafe SIMD code, by two flags. Build it with them:\n\n    \
         RUSTFLAGS=\"--cfg mail_parser_checked_str --cfg encodify_scalar\" \
         cargo install tuimail --locked\n\n\
-        (A RUSTFLAGS of your own replaces the repository's .cargo/config.toml: add them to it.)"
+        (In Windows PowerShell: $env:RUSTFLAGS = \"--cfg mail_parser_checked_str \
+        --cfg encodify_scalar\"; cargo install tuimail --locked. A RUSTFLAGS of your own \
+        replaces the repository's .cargo/config.toml: add them to it.)"
     );
     std::process::exit(1);
 }

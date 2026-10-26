@@ -253,16 +253,23 @@ pub struct File {
 /// What a forward or a draft takes from a message besides [`Parsed`].
 #[derive(Default)]
 pub struct Contents {
-    /// Every attachment, past the [`MAX_LISTED`] the reader lists too,
+    /// Its first [`MAX_LISTED`] attachments, the ones the reader lists,
     /// each decoded on its own ([`contained`]): `None` for one that
     /// couldn't be read, all that's lost of it.
     pub files: Vec<Option<File>>,
-    /// How many of `files` couldn't be read.
-    pub lost: usize,
+    /// How many attachments it has past those.
+    pub left: usize,
     /// The message's own Bcc field: what a draft kept. Anyone else's
     /// message says what its sender wrote there, so it's read for this
     /// alone.
     pub bcc: Vec<Addr>,
+}
+
+impl Contents {
+    /// How many of its attachments aren't in `files`, or couldn't be read.
+    pub fn lost(&self) -> usize {
+        self.left + self.files.iter().filter(|file| file.is_none()).count()
+    }
 }
 
 /// [`parse`], with what a forward or a draft takes from the same parse.
@@ -275,13 +282,14 @@ fn parse_message(raw: &[u8], contents: bool) -> Option<(Parsed, Option<Contents>
         let body = bodies(message);
         let listed: Vec<MessagePart> = attachment_parts(message, &body).collect();
         let contents = contents.then(|| {
-            let files: Vec<Option<File>> = listed
+            let files = listed
                 .iter()
+                .take(MAX_LISTED)
                 .map(|part| contained(|| extract(part)))
                 .collect();
             Contents {
-                lost: files.iter().filter(|file| file.is_none()).count(),
                 files,
+                left: listed.len().saturating_sub(MAX_LISTED),
                 bcc: addrs(message.bcc()),
             }
         });
@@ -401,13 +409,20 @@ fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
 /// The first https or mailto link of List-Unsubscribe, read from the field
 /// as written (many senders leave out RFC 2369's `<…>`, and mail-parser
 /// then finds no link at all), its scheme in lower case. Only the field's
-/// first [`MAX_UNSUBSCRIBE`] bytes are read: a link is shorter than 2,000.
+/// first [`MAX_UNSUBSCRIBE`] bytes are read, to the last `,` or `>` in
+/// them, so no link is taken cut short: a link is shorter than 2,000.
 fn unsubscribe_link(message: &mail_parser::Message) -> Option<String> {
     let field = message
         .headers()
         .get(HeaderName::ListUnsubscribe)?
         .raw_value();
-    let field = &field[..field.len().min(MAX_UNSUBSCRIBE)];
+    let field = match field.get(..MAX_UNSUBSCRIBE) {
+        Some(first) => {
+            let end = first.iter().rposition(|&b| b == b',' || b == b'>');
+            &first[..end.map_or(0, |at| at + 1)]
+        }
+        None => field,
+    };
     // Folds stay line breaks, for unsubscribe_links to read.
     let value = String::from_utf8_lossy(field).replace('\r', "");
     unsubscribe_links(&value)
@@ -547,15 +562,7 @@ fn attachment_parts<'m>(
 /// Whether a part is text of this subtype; one without a Content-Type is
 /// text/plain.
 fn is_type(part: &MessagePart, subtype: &str) -> bool {
-    match part.content_type() {
-        Some(ct) => {
-            ct.ctype().eq_ignore_ascii_case("text")
-                && ct
-                    .subtype()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(subtype))
-        }
-        None => subtype == "plain",
-    }
+    part.is_content_type("text", subtype) || (subtype == "plain" && part.content_type().is_none())
 }
 
 /// An attachment's type, lower case: `image/png`.
@@ -1680,6 +1687,20 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
         );
         assert_eq!(link(&",".repeat(1_000_000)), None);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // One the 8 KB cuts short isn't taken; one before it still is.
+        let padding = " ".repeat(MAX_UNSUBSCRIBE - 20);
+        assert_eq!(
+            link(&format!(
+                "{padding}<https://x.com/unsub?token=abcdefghijklmn>"
+            )),
+            None
+        );
+        assert_eq!(
+            link(&format!(
+                "<https://x.com/u>,{padding}<https://x.com/unsub?token=abcdefghijklmn>"
+            )),
+            bare
+        );
         // A link without brackets a fold cuts could end anywhere: not taken.
         assert_eq!(link("https://x.com/unsub?list=a&\r\n token=abc"), None);
         assert_eq!(link("https://x.com/u\r\n one-click"), None);
@@ -1785,7 +1806,7 @@ Content-Disposition: attachment; filename=\"print.html\"\r\n\r\n<p>print</p>\r\n
     }
 
     #[test]
-    fn a_forward_takes_every_attachment_the_reader_lists_some_of() {
+    fn a_forward_takes_the_attachments_the_reader_lists_and_says_how_many_more() {
         let parts: String = (0..600)
             .map(|n| {
                 format!("--b\r\nContent-Type: application/pdf; name=\"f{n}.pdf\"\r\n\r\n{n}\r\n")
@@ -1797,8 +1818,9 @@ Content-Disposition: attachment; filename=\"print.html\"\r\n\r\n<p>print</p>\r\n
         );
         let (parsed, contents) = parse_with_contents(raw.as_bytes()).unwrap();
         assert_eq!(parsed.attachments.len(), MAX_LISTED);
-        assert_eq!((contents.files.len(), contents.lost), (600, 0));
-        assert_eq!(contents.files[599].as_ref().unwrap().name, "f599.pdf");
+        assert_eq!(contents.files.len(), MAX_LISTED);
+        assert_eq!(contents.lost(), 100);
+        assert_eq!(contents.files[499].as_ref().unwrap().name, "f499.pdf");
     }
 
     #[test]

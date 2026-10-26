@@ -78,6 +78,12 @@ If `tuimail` isn't found afterwards, add `~/.local/bin` to your `PATH`. Each fil
 RUSTFLAGS="--cfg mail_parser_checked_str --cfg encodify_scalar" cargo install tuimail --locked
 ```
 
+In Windows PowerShell:
+
+```powershell
+$env:RUSTFLAGS = "--cfg mail_parser_checked_str --cfg encodify_scalar"; cargo install tuimail --locked
+```
+
 **2. Run it.**
 
 ```sh
