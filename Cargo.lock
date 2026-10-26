@@ -3338,6 +3338,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "dotenvy",
+ "encodify",
  "futures",
  "html2text",
  "keyring-core",

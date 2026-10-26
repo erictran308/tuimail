@@ -3,10 +3,11 @@
 # GitHub release; running it by hand only builds them, as artifacts of the
 # run.
 #
-# There's no key to build in: a release binary is exactly what `cargo
-# install tuimail` builds. Actions are pinned to commits, since
-# they make the release files, nothing is cached between runs, and only the
-# release job can write to the repository.
+# There's no key to build in: a release binary is what `cargo install
+# tuimail` builds with the README's RUSTFLAGS (.cargo/config.toml's, set
+# below). Actions are pinned to commits, since they make the release files,
+# nothing is cached between runs, and only the release job can write to the
+# repository.
 
 name: Release
 
@@ -68,7 +69,7 @@ jobs:
       EXE: ${{ startsWith(matrix.os, 'windows') && '.exe' || '' }}
       # mail-parser checks every string it makes and encodify uses its
       # portable code (.cargo/config.toml, which RUSTFLAGS replaces), and
-      # TM_HARDENED fails a build without them (src/mail.rs). Windows
+      # TM_HARDENED fails a build without them (build.rs). Windows
       # binaries carry the C runtime, so nobody needs the Visual C++
       # redistributable.
       RUSTFLAGS: --cfg mail_parser_checked_str --cfg encodify_scalar ${{ startsWith(matrix.os, 'windows') && '-C target-feature=+crt-static' || '' }}

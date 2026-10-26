@@ -562,10 +562,13 @@ pub fn forward(parsed: &Parsed, raw: &[u8], account: &Account) -> Draft {
         .attachments
         .iter()
         .zip(mail::attachments(raw))
-        .map(|(a, (name, bytes))| Attachment::Data {
-            name,
-            mime: a.mime.clone(),
-            bytes: Arc::new(bytes),
+        .filter_map(|(a, read)| {
+            let (name, bytes) = read?;
+            Some(Attachment::Data {
+                name,
+                mime: a.mime.clone(),
+                bytes: Arc::new(bytes),
+            })
         })
         .collect();
     Draft {

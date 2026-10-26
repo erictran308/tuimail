@@ -101,7 +101,9 @@ pub struct Parsed {
     pub reply_to: Vec<Addr>,
     pub to: Vec<Addr>,
     pub cc: Vec<Addr>,
-    /// Kept by a draft; anyone else's message has none.
+    /// The message's own Bcc field: what a draft kept, or whatever the
+    /// sender of anyone else's message wrote there; read for drafts only
+    /// (`compose::from_saved`).
     pub bcc: Vec<Addr>,
     /// The plain-text bodies, joined.
     pub text: Option<String>,
@@ -206,7 +208,8 @@ fn summary(message: &mail_parser::Message) -> Summary {
 /// part, listed. `.cargo/config.toml` builds it checking every string it
 /// makes (`mail_parser_checked_str`, not `from_utf8_unchecked`), and
 /// encodify, its base64 and quoted-printable, with its portable code
-/// (`encodify_scalar`, not its SIMD kernels).
+/// (`encodify_scalar`, not its SIMD kernels); build.rs warns of a build
+/// without them, and fails one for CI or a release.
 static PARSER: std::sync::LazyLock<MessageParser> = std::sync::LazyLock::new(|| {
     MessageParser::new()
         .max_depth(32)
@@ -214,25 +217,24 @@ static PARSER: std::sync::LazyLock<MessageParser> = std::sync::LazyLock::new(|| 
         .max_encoded_nesting(2)
 });
 
-// A CI or release build (their workflows set TM_HARDENED) without
-// `.cargo/config.toml`'s flags, which a RUSTFLAGS replaces, fails here.
-const _: () = assert!(
-    option_env!("TM_HARDENED").is_none() || cfg!(all(mail_parser_checked_str, encodify_scalar)),
-    "built without --cfg mail_parser_checked_str --cfg encodify_scalar"
-);
-
 /// Reads `raw` with [`PARSER`] and hands the message to `f`, panics in
 /// either contained ([`contained`]; mail-parser decodes as it's asked, so
 /// inside `f` too): `None` if one panicked, which a crafted message could
 /// make mail-parser do, `Some(None)` if `raw` isn't a message to it. Every
-/// use of mail-parser goes through here.
+/// use of mail-parser goes through here or [`read_headers`].
 fn read<T>(raw: &[u8], f: impl FnOnce(&mail_parser::Message) -> T) -> Option<Option<T>> {
     contained(|| PARSER.parse(raw).map(|message| f(&message)))
 }
 
-/// The summary of a message from its headers (or the whole message).
+/// [`read`], of the headers alone: none of the parts below them are read.
+fn read_headers<T>(raw: &[u8], f: impl FnOnce(&mail_parser::Message) -> T) -> Option<Option<T>> {
+    contained(|| PARSER.parse_headers(raw).map(|message| f(&message)))
+}
+
+/// The summary of a message from its headers, whether `raw` is the
+/// headers (IMAP) or the whole message: the rest is never read for it.
 pub fn summarize(raw: &[u8]) -> Summary {
-    read(raw, summary).flatten().unwrap_or_default()
+    read_headers(raw, summary).flatten().unwrap_or_default()
 }
 
 /// Parses a whole message; `None` if it's empty or couldn't be read (a
@@ -254,10 +256,11 @@ fn parsed(message: &mail_parser::Message) -> Parsed {
         let joined = parts.join("\n\n");
         (!joined.trim().is_empty()).then_some(joined)
     };
-    let [text_parts, html_parts] = bodies(message);
+    let body = bodies(message);
+    let [text_parts, html_parts] = &body;
     let mut flowed = false;
     let mut texts = Vec::new();
-    for part in &text_parts {
+    for part in text_parts {
         if let Some(text) = part.text() {
             flowed |= part
                 .content_type()
@@ -267,7 +270,7 @@ fn parsed(message: &mail_parser::Message) -> Parsed {
         }
     }
     let htmls = html_parts.iter().filter_map(|p| p.text()).collect();
-    let attachments = attachment_parts(message)
+    let attachments = attachment_parts(message, &body)
         .enumerate()
         .map(|(i, part)| {
             let mime = mime_of(&part);
@@ -329,29 +332,46 @@ fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
 }
 
 /// The first https or mailto link of List-Unsubscribe, read from the field
-/// as written: each `<…>` in it (RFC 2369), else its whole value, then
-/// each piece between commas (many senders leave out the brackets, and
-/// mail-parser then finds no link).
+/// as written, links in order: one starts each piece between commas that
+/// starts as one (`<`, `https:`, `http:` or `mailto:`), and goes on through
+/// those that don't, its own commas. Its `<…>` (RFC 2369) are taken off,
+/// with the spaces folding left inside; many senders leave them out, and
+/// mail-parser then finds no link at all.
 fn unsubscribe_link(message: &mail_parser::Message) -> Option<String> {
     let field = message.headers().get(HeaderName::ListUnsubscribe)?;
     let value = String::from_utf8_lossy(field.raw_value()).replace(['\r', '\n'], "");
-    let bracketed: Vec<String> = value
-        .split('<')
-        .skip(1)
-        .filter_map(|s| s.split_once('>'))
-        .map(|(link, _)| link.split_whitespace().collect())
-        .collect();
-    let links = if bracketed.is_empty() {
-        std::iter::once(value.trim())
-            .chain(value.split(',').map(str::trim))
-            .map(str::to_string)
-            .collect()
-    } else {
-        bracketed
+    let starts_link = |piece: &str| {
+        let piece = piece.trim_start().to_ascii_lowercase();
+        ["<", "https:", "http:", "mailto:"]
+            .iter()
+            .any(|start| piece.starts_with(start))
     };
-    links.into_iter().find(|l| {
-        (l.starts_with("https://") || l.starts_with("mailto:")) && l.len() < 2000 && usable_link(l)
-    })
+    let mut links: Vec<String> = Vec::new();
+    for piece in value.split(',') {
+        match links.last_mut() {
+            Some(link) if !starts_link(piece) => {
+                link.push(',');
+                link.push_str(piece);
+            }
+            _ => links.push(piece.to_string()),
+        }
+    }
+    links
+        .iter()
+        .map(|link| match link.trim().strip_prefix('<') {
+            Some(inside) => inside
+                .split('>')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .collect(),
+            None => link.trim().to_string(),
+        })
+        .find(|l| {
+            (l.starts_with("https://") || l.starts_with("mailto:"))
+                && l.len() < 2000
+                && usable_link(l)
+        })
 }
 
 /// The start of a message's text for the list. Lays out HTML, so it runs
@@ -363,14 +383,15 @@ pub fn preview_of(raw: &[u8]) -> String {
 }
 
 /// The parts listed as attachments: mail-parser's but those read as the
-/// body ([`bodies`]), the pictures, sound and video it counts as part of
-/// the text, and the parts it puts nowhere (RFC 8621 drops some inside an
-/// alternative), since tuimail shows none of those itself and each should
-/// still be there to save.
+/// body (`body`, from [`bodies`]), the pictures, sound and video it counts
+/// as part of the text, and the parts it puts nowhere (RFC 8621 drops some
+/// inside an alternative), since tuimail shows none of those itself and
+/// each should still be there to save.
 fn attachment_parts<'m>(
     message: &'m mail_parser::Message,
-) -> impl Iterator<Item = MessagePart<'m>> {
-    let read: Vec<PartId> = bodies(message).iter().flatten().map(|p| p.id()).collect();
+    body: &[Vec<MessagePart<'m>>; 2],
+) -> impl Iterator<Item = MessagePart<'m>> + use<'m> {
+    let read: Vec<PartId> = body.iter().flatten().map(|p| p.id()).collect();
     message.root().parts().filter(move |p| {
         !read.contains(&p.id())
             && (p.is_attachment() || matches!(p.role(), PartRole::MediaBody | PartRole::Dropped))
@@ -405,7 +426,7 @@ fn part_name(part: &MessagePart, mime: &str) -> String {
 /// The bytes of attachment `index`, and its safe file name.
 pub fn attachment(raw: &[u8], index: u32) -> Option<(String, Vec<u8>)> {
     read(raw, |message| {
-        let part = attachment_parts(message).nth(index as usize)?;
+        let part = attachment_parts(message, &bodies(message)).nth(index as usize)?;
         Some((
             part_name(&part, &mime_of(&part)),
             part.decoded().into_owned(),
@@ -416,16 +437,19 @@ pub fn attachment(raw: &[u8], index: u32) -> Option<(String, Vec<u8>)> {
 }
 
 /// Every attachment listed, as [`attachment`] gives each, from one parse
-/// (a forward takes them all).
-pub fn attachments(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
+/// (a forward takes them all); `None` for one that couldn't be read, each
+/// decoded on its own ([`contained`]) so that one is all that's lost.
+pub fn attachments(raw: &[u8]) -> Vec<Option<(String, Vec<u8>)>> {
     read(raw, |message| {
-        attachment_parts(message)
+        attachment_parts(message, &bodies(message))
             .take(500)
             .map(|part| {
-                (
-                    part_name(&part, &mime_of(&part)),
-                    part.decoded().into_owned(),
-                )
+                contained(|| {
+                    (
+                        part_name(&part, &mime_of(&part)),
+                        part.decoded().into_owned(),
+                    )
+                })
             })
             .collect()
     })
@@ -1471,6 +1495,13 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
             Some("https://x.com/u".to_string())
         );
         assert_eq!(link("<javascript:alert(1)>, <ftp://x.com/u>"), None);
+        // Links in order, with or without brackets.
+        assert_eq!(link("https://x.com/u?a=1,2, <mailto:u@x.com>"), first);
+        assert_eq!(
+            link("<mailto:u@x.com>, https://x.com/u"),
+            Some("mailto:u@x.com".to_string())
+        );
+        assert_eq!(link("<https://x.com/u?a=1,2>,<mailto:u@x.com>"), first);
     }
 
     #[test]
@@ -1703,11 +1734,12 @@ Content-Type: multipart/alternative; boundary=x\r\n\r\n\
             let parsed = parsed(&message);
             let all = attachments(raw);
             assert_eq!(all.len(), parsed.attachments.len());
-            for (listed, (name, bytes)) in parsed.attachments.iter().zip(&all) {
+            for (listed, read) in parsed.attachments.iter().zip(&all) {
+                let (name, bytes) = read.as_ref().expect("decoded without a panic");
                 assert_eq!(*name, listed.name);
                 assert_eq!(bytes.len(), listed.size);
             }
-            if let Some(last) = all.last() {
+            if let Some(Some(last)) = all.last() {
                 let index = all.len() as u32 - 1;
                 assert_eq!(attachment(raw, index).as_ref(), Some(last));
             }
