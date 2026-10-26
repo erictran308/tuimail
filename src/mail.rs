@@ -217,6 +217,13 @@ static PARSER: std::sync::LazyLock<MessageParser> = std::sync::LazyLock::new(|| 
         .max_encoded_nesting(2)
 });
 
+/// Whether this build has `.cargo/config.toml`'s flags for [`PARSER`]. One
+/// from crates.io without the README's RUSTFLAGS hasn't, and build.rs's
+/// warning isn't shown there, so `--check` and the start say so.
+pub const HARDENED: bool = cfg!(all(mail_parser_checked_str, encodify_scalar));
+pub const NOT_HARDENED: &str = "built without the flags that make reading mail safer: \
+    the README's \"build it from source\" says how";
+
 /// Reads `raw` with [`PARSER`] and hands the message to `f`, panics in
 /// either contained ([`contained`]; mail-parser decodes as it's asked, so
 /// inside `f` too): `None` if one panicked, which a crafted message could
@@ -301,8 +308,9 @@ fn parsed(message: &mail_parser::Message) -> Parsed {
 /// The parts read as the message's text and as its HTML. mail-parser makes
 /// a version in a multipart/alternative that has a file name an attachment
 /// (as RFC 8621 does); when the message has no other version of its kind,
-/// it's that one, as before mail-parser 1.0. (An HTML part standing in
-/// for the text is read as the HTML.)
+/// it's that one, as before mail-parser 1.0, unless its sender marked it
+/// one to download (`Content-Disposition: attachment`). (An HTML part
+/// standing in for the text is read as the HTML.)
 fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
     [false, true].map(|html| {
         let of_kind = |p: &MessagePart| match p.kind() {
@@ -324,6 +332,7 @@ fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
             .filter(|p| {
                 of_kind(p)
                     && p.is_attachment()
+                    && !p.content_disposition().is_some_and(|d| d.is_attachment())
                     && p.parent()
                         .is_some_and(|q| q.is_content_type("multipart", "alternative"))
             })
@@ -332,46 +341,65 @@ fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
 }
 
 /// The first https or mailto link of List-Unsubscribe, read from the field
-/// as written, links in order: one starts each piece between commas that
-/// starts as one (`<`, `https:`, `http:` or `mailto:`), and goes on through
-/// those that don't, its own commas. Its `<…>` (RFC 2369) are taken off,
-/// with the spaces folding left inside; many senders leave them out, and
-/// mail-parser then finds no link at all.
+/// as written (many senders leave out RFC 2369's `<…>`, and mail-parser
+/// then finds no link at all), its scheme in lower case.
 fn unsubscribe_link(message: &mail_parser::Message) -> Option<String> {
     let field = message.headers().get(HeaderName::ListUnsubscribe)?;
     let value = String::from_utf8_lossy(field.raw_value()).replace(['\r', '\n'], "");
-    let starts_link = |piece: &str| {
-        let piece = piece.trim_start().to_ascii_lowercase();
+    unsubscribe_links(&value)
+        .into_iter()
+        .filter_map(|link| {
+            let (scheme, rest) = link.split_once(':')?;
+            let scheme = scheme.to_ascii_lowercase();
+            let web = scheme == "https" && rest.starts_with("//");
+            (web || scheme == "mailto").then(|| format!("{scheme}:{rest}"))
+        })
+        .find(|l| l.len() < 2000 && usable_link(l))
+}
+
+/// The links of a List-Unsubscribe field, in order. A `<` that starts
+/// one takes all to its `>`, commas too, without the spaces folding left;
+/// other text is a link up to a space, or a comma that a space or another
+/// link follows (a comma inside a link is followed by neither). What's
+/// between them (comments) comes out as links nobody would take.
+fn unsubscribe_links(value: &str) -> Vec<String> {
+    let starts_link = |rest: &str| {
+        let rest = rest.to_ascii_lowercase();
         ["<", "https:", "http:", "mailto:"]
             .iter()
-            .any(|start| piece.starts_with(start))
+            .any(|start| rest.starts_with(start))
     };
-    let mut links: Vec<String> = Vec::new();
-    for piece in value.split(',') {
-        match links.last_mut() {
-            Some(link) if !starts_link(piece) => {
-                link.push(',');
-                link.push_str(piece);
+    let mut links = Vec::new();
+    let mut link = String::new();
+    let mut bracketed = false;
+    for (at, c) in value.char_indices() {
+        let rest = &value[at + c.len_utf8()..];
+        if bracketed {
+            match c {
+                '>' => {
+                    links.push(std::mem::take(&mut link));
+                    bracketed = false;
+                }
+                c if !c.is_whitespace() => link.push(c),
+                _ => {}
             }
-            _ => links.push(piece.to_string()),
+        } else if c == '<' && link.is_empty() {
+            bracketed = true;
+        } else if c.is_whitespace()
+            || (c == ','
+                && (rest.is_empty() || rest.starts_with(char::is_whitespace) || starts_link(rest)))
+        {
+            if !link.is_empty() {
+                links.push(std::mem::take(&mut link));
+            }
+        } else {
+            link.push(c);
         }
     }
+    if !link.is_empty() {
+        links.push(link);
+    }
     links
-        .iter()
-        .map(|link| match link.trim().strip_prefix('<') {
-            Some(inside) => inside
-                .split('>')
-                .next()
-                .unwrap_or("")
-                .split_whitespace()
-                .collect(),
-            None => link.trim().to_string(),
-        })
-        .find(|l| {
-            (l.starts_with("https://") || l.starts_with("mailto:"))
-                && l.len() < 2000
-                && usable_link(l)
-        })
 }
 
 /// The start of a message's text for the list. Lays out HTML, so it runs
@@ -414,7 +442,10 @@ fn mime_of(part: &MessagePart) -> String {
 fn part_name(part: &MessagePart, mime: &str) -> String {
     let name = match part.attachment_name() {
         Some(name) => name.to_string(),
-        None if part.nested().is_some() => "forwarded message.eml".into(),
+        // Past PARSER's limits a forwarded message isn't read as one.
+        None if part.nested().is_some() || mime == "message/rfc822" => {
+            "forwarded message.eml".into()
+        }
         None if mime.starts_with("image/") => {
             format!("image.{}", mime.trim_start_matches("image/"))
         }
@@ -423,14 +454,17 @@ fn part_name(part: &MessagePart, mime: &str) -> String {
     safe_file_name(&name)
 }
 
+/// An attachment's safe file name and its bytes, as listed ([`parsed`]
+/// names it the same way), saved and opened.
+fn extract(part: &MessagePart) -> (String, Vec<u8>) {
+    (part_name(part, &mime_of(part)), part.decoded().into_owned())
+}
+
 /// The bytes of attachment `index`, and its safe file name.
 pub fn attachment(raw: &[u8], index: u32) -> Option<(String, Vec<u8>)> {
     read(raw, |message| {
         let part = attachment_parts(message, &bodies(message)).nth(index as usize)?;
-        Some((
-            part_name(&part, &mime_of(&part)),
-            part.decoded().into_owned(),
-        ))
+        Some(extract(&part))
     })
     .flatten()
     .flatten()
@@ -443,14 +477,7 @@ pub fn attachments(raw: &[u8]) -> Vec<Option<(String, Vec<u8>)>> {
     read(raw, |message| {
         attachment_parts(message, &bodies(message))
             .take(500)
-            .map(|part| {
-                contained(|| {
-                    (
-                        part_name(&part, &mime_of(&part)),
-                        part.decoded().into_owned(),
-                    )
-                })
-            })
+            .map(|part| contained(|| extract(&part)))
             .collect()
     })
     .flatten()
@@ -1502,6 +1529,23 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
             Some("mailto:u@x.com".to_string())
         );
         assert_eq!(link("<https://x.com/u?a=1,2>,<mailto:u@x.com>"), first);
+        // A comment after a bare link, or before a bracketed one.
+        let bare = Some("https://x.com/u".to_string());
+        assert_eq!(link("https://x.com/u, (one-click)"), bare);
+        assert_eq!(link("https://x.com/u (one-click)"), bare);
+        assert_eq!(
+            link("(note) <mailto:u@x.com>"),
+            Some("mailto:u@x.com".to_string())
+        );
+        // All of a bracketed link, whatever its commas are followed by.
+        assert_eq!(
+            link("<https://x.com/u?r=https://x.com/done,mailto:a@b>"),
+            Some("https://x.com/u?r=https://x.com/done,mailto:a@b".to_string())
+        );
+        // Schemes in capitals, given back in lower case.
+        assert_eq!(link("<MAILTO:u@x.com>"), Some("mailto:u@x.com".to_string()));
+        assert_eq!(link("<HTTPS://x.com/u>"), bare);
+        assert_eq!(link("<https:x.com/u>"), None);
     }
 
     #[test]
@@ -1540,6 +1584,34 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
         assert_eq!(parsed.html.as_deref(), Some("<p>html version</p>"));
         assert_eq!(parsed.attachments.len(), 1);
         assert_eq!(parsed.attachments[0].name, "print.html");
+        // Nor is one its sender marked as a download.
+        let download = "--x\r\nContent-Type: text/html\r\n\
+Content-Disposition: attachment; filename=\"print.html\"\r\n\r\n<p>print</p>\r\n";
+        let parsed = alternative(&format!("{plain}{download}"));
+        assert_eq!(parsed.html, None);
+        assert_eq!(parsed.text.as_deref(), Some("plain version"));
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].name, "print.html");
+    }
+
+    #[test]
+    fn a_forwarded_message_past_the_limits_is_still_named_as_one() {
+        let multipart =
+            |n: usize| format!("Content-Type: multipart/mixed; boundary=b{n}\r\n\r\n--b{n}\r\n");
+        let mut forwards = 0;
+        for depth in 25..40 {
+            let raw = format!(
+                "From: a@b.c\r\n{}Content-Type: message/rfc822\r\n\r\nFrom: x@y.z\r\n\r\nhi\r\n",
+                (0..depth).map(multipart).collect::<String>()
+            );
+            for a in parse(raw.as_bytes()).unwrap().attachments {
+                if a.mime == "message/rfc822" {
+                    assert_eq!(a.name, "forwarded message.eml", "at depth {depth}");
+                    forwards += 1;
+                }
+            }
+        }
+        assert!(forwards > 0);
     }
 
     #[test]

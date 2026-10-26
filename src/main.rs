@@ -92,7 +92,10 @@ async fn run() -> Result<()> {
     let config = config::Config::load()?;
     let settings_path = settings::path(&config.data_dir);
     let (settings, unknown_settings) = settings::Settings::load_checked(&settings_path)?;
-    let (accounts, warnings) = account::load(&account::path(&config.data_dir))?;
+    let (accounts, mut warnings) = account::load(&account::path(&config.data_dir))?;
+    if !mail::HARDENED {
+        warnings.push(mail::NOT_HARDENED.into());
+    }
     let keychain = secrets::init_keychain();
     if check {
         return print_check(&config, &accounts, &warnings, keychain);
