@@ -242,27 +242,37 @@ pub fn summarize(raw: &[u8]) -> Summary {
 /// no headers at all, which mail-parser takes for no message, is shown as
 /// the text it is.
 pub fn parse(raw: &[u8]) -> Option<Parsed> {
-    match read(raw, |message| parsed(message, &bodies(message)))? {
+    let parsed = read(raw, |message| {
+        let body = bodies(message);
+        let listed: Vec<MessagePart> = attachment_parts(message, &body).collect();
+        parsed(message, &body, &listed)
+    })?;
+    match parsed {
         Some(parsed) => Some(parsed),
         None => as_text(raw),
     }
 }
 
-/// An attachment taken out of its message, its safe file name and bytes;
-/// `None` for one that couldn't be read.
-pub type Taken = Option<(String, Vec<u8>)>;
+/// An attachment taken out of its message, as it's listed.
+pub struct File {
+    pub name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
 
-/// [`parse`], with every attachment listed taken out of the same parse (a
-/// forward or a draft takes them all), each decoded on its own
-/// ([`contained`]) so one that can't be read is all that's lost.
-pub fn parse_with_files(raw: &[u8]) -> Option<(Parsed, Vec<Taken>)> {
+/// [`parse`], with every attachment taken out of the same parse (a forward
+/// or a draft takes them all, past the [`MAX_LISTED`] the reader lists
+/// too), each decoded on its own ([`contained`]): `None` for one that
+/// couldn't be read, all that's lost of it.
+pub fn parse_with_files(raw: &[u8]) -> Option<(Parsed, Vec<Option<File>>)> {
     let both = read(raw, |message| {
         let body = bodies(message);
-        let files = attachment_parts(message, &body)
-            .take(500)
-            .map(|part| contained(|| extract(&part)))
+        let listed: Vec<MessagePart> = attachment_parts(message, &body).collect();
+        let files = listed
+            .iter()
+            .map(|part| contained(|| extract(part)))
             .collect();
-        (parsed(message, &body), files)
+        (parsed(message, &body, &listed), files)
     })?;
     match both {
         Some(both) => Some(both),
@@ -279,7 +289,14 @@ fn as_text(raw: &[u8]) -> Option<Parsed> {
     })
 }
 
-fn parsed(message: &mail_parser::Message, body: &[Vec<MessagePart>; 2]) -> Parsed {
+/// The most attachments the reader lists.
+const MAX_LISTED: usize = 500;
+
+fn parsed(
+    message: &mail_parser::Message,
+    body: &[Vec<MessagePart>; 2],
+    listed: &[MessagePart],
+) -> Parsed {
     let join = |parts: Vec<Cow<str>>| -> Option<String> {
         let joined = parts.join("\n\n");
         (!joined.trim().is_empty()).then_some(joined)
@@ -297,18 +314,19 @@ fn parsed(message: &mail_parser::Message, body: &[Vec<MessagePart>; 2]) -> Parse
         }
     }
     let htmls = html_parts.iter().filter_map(|p| p.text()).collect();
-    let attachments = attachment_parts(message, body)
+    let attachments = listed
+        .iter()
+        .take(MAX_LISTED)
         .enumerate()
         .map(|(i, part)| {
-            let mime = mime_of(&part);
+            let mime = mime_of(part);
             Attachment {
                 index: i as u32,
-                name: part_name(&part, &mime),
+                name: part_name(part, &mime),
                 mime: text::one_line(&mime, 100),
                 size: part.decoded_len(),
             }
         })
-        .take(500)
         .collect();
     Parsed {
         summary: summary(message),
@@ -378,21 +396,22 @@ fn unsubscribe_link(message: &mail_parser::Message) -> Option<String> {
         .get(HeaderName::ListUnsubscribe)?
         .raw_value();
     let field = &field[..field.len().min(MAX_UNSUBSCRIBE)];
-    // Unfolded without the space a fold leaves, so a link folded in two
-    // is one again.
+    // Unfolded without the space a fold leaves inside a link, so one folded
+    // in two is one again, but with it before a link or a comment.
     let text = String::from_utf8_lossy(field);
-    let value: String = text
-        .split('\n')
-        .enumerate()
-        .map(|(n, line)| {
-            let line = line.trim_end_matches('\r');
-            if n == 0 {
-                line
-            } else {
-                line.trim_start_matches([' ', '\t'])
-            }
-        })
-        .collect();
+    let mut value = String::new();
+    for (n, line) in text.split('\n').enumerate() {
+        let line = line.trim_end_matches('\r');
+        if n == 0 {
+            value.push_str(line);
+            continue;
+        }
+        let line = line.trim_start_matches([' ', '\t']);
+        if line.starts_with('(') || starts_link(line) {
+            value.push(' ');
+        }
+        value.push_str(line);
+    }
     unsubscribe_links(&value)
         .into_iter()
         .filter_map(|link| {
@@ -406,19 +425,25 @@ fn unsubscribe_link(message: &mail_parser::Message) -> Option<String> {
 
 const MAX_UNSUBSCRIBE: usize = 8 << 10;
 
+/// Whether text starts as a List-Unsubscribe link does: `<`, `https:`,
+/// `http:` or `mailto:`, in any case.
+fn starts_link(text: &str) -> bool {
+    ["<", "https:", "http:", "mailto:"].iter().any(|start| {
+        text.get(..start.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(start))
+    })
+}
+
 /// The links of a List-Unsubscribe field, in order. A `<` that starts
 /// one (where no link has started: after a comment too) takes all to its
-/// `>`, commas too, without the spaces folding left; other text is a link
-/// up to a space, or a comma that a space or another link follows (a comma
-/// inside a link is followed by neither). What's between them (comments)
-/// comes out as links nobody would take.
+/// `>`, commas too, without the spaces folding left, or to the next `<`
+/// if it's never closed; other text is a link up to a space, or a comma
+/// that a space or another link follows (a comma inside a link is
+/// followed by neither). What's between them (comments) comes out as links
+/// nobody would take.
 fn unsubscribe_links(value: &str) -> Vec<String> {
-    let starts_link = |text: &str| {
-        ["<", "https:", "http:", "mailto:"].iter().any(|start| {
-            text.get(..start.len())
-                .is_some_and(|s| s.eq_ignore_ascii_case(start))
-        })
-    };
+    // An unclosed `<…`'s link, without the comma that ended it.
+    let unclosed = |link: &str| link.trim_end_matches(',').to_string();
     let mut links = Vec::new();
     let mut link = String::new();
     let mut bracketed = false;
@@ -429,6 +454,10 @@ fn unsubscribe_links(value: &str) -> Vec<String> {
                 '>' => {
                     links.push(std::mem::take(&mut link));
                     bracketed = false;
+                }
+                '<' => {
+                    links.push(unclosed(&link));
+                    link.clear();
                 }
                 c if !c.is_whitespace() => link.push(c),
                 _ => {}
@@ -447,7 +476,9 @@ fn unsubscribe_links(value: &str) -> Vec<String> {
             link.push(c);
         }
     }
-    if !link.is_empty() {
+    if bracketed {
+        links.push(unclosed(&link));
+    } else if !link.is_empty() {
         links.push(link);
     }
     links
@@ -475,7 +506,7 @@ fn attachment_parts<'m>(
     message: &'m mail_parser::Message,
     body: &[Vec<MessagePart<'m>>; 2],
 ) -> impl Iterator<Item = MessagePart<'m>> + use<'m> {
-    let read: Vec<PartId> = body.iter().flatten().map(|p| p.id()).collect();
+    let read: std::collections::HashSet<PartId> = body.iter().flatten().map(|p| p.id()).collect();
     message.root().parts().filter(move |p| {
         let left_out = ["plain", "html", "watch-html", "x-amp-html", "enriched"]
             .iter()
@@ -530,17 +561,23 @@ fn part_name(part: &MessagePart, mime: &str) -> String {
     safe_file_name(&name)
 }
 
-/// An attachment's safe file name and its bytes, as listed ([`parsed`]
-/// names it the same way), saved and opened.
-fn extract(part: &MessagePart) -> (String, Vec<u8>) {
-    (part_name(part, &mime_of(part)), part.decoded().into_owned())
+/// An attachment as listed ([`parsed`] names it the same way), saved and
+/// opened.
+fn extract(part: &MessagePart) -> File {
+    let mime = mime_of(part);
+    File {
+        name: part_name(part, &mime),
+        mime: text::one_line(&mime, 100),
+        bytes: part.decoded().into_owned(),
+    }
 }
 
 /// The bytes of attachment `index`, and its safe file name.
 pub fn attachment(raw: &[u8], index: u32) -> Option<(String, Vec<u8>)> {
     read(raw, |message| {
         let part = attachment_parts(message, &bodies(message)).nth(index as usize)?;
-        Some(extract(&part))
+        let file = extract(&part);
+        Some((file.name, file.bytes))
     })
     .flatten()
     .flatten()
@@ -1623,6 +1660,14 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
             link("https://x.com/unsub?list=a&\r\n token=abc"),
             Some("https://x.com/unsub?list=a&token=abc".to_string())
         );
+        // Folded before a comment or another link, the fold still parts them.
+        assert_eq!(link("https://x.com/u\r\n (one-click)"), bare);
+        assert_eq!(
+            link("mailto:u@x.com\r\n https://x.com/u"),
+            Some("mailto:u@x.com".to_string())
+        );
+        // A `<` never closed ends at the next one.
+        assert_eq!(link("<https://x.com/u, <mailto:u@x.com>"), bare);
     }
 
     #[test]
@@ -1704,6 +1749,23 @@ Content-Disposition: attachment; filename=\"print.html\"\r\n\r\n<p>print</p>\r\n
         assert_eq!(parsed.text.as_deref(), Some("plain version"));
         assert_eq!(parsed.attachments.len(), 1);
         assert_eq!(parsed.attachments[0].name, "print.html");
+    }
+
+    #[test]
+    fn a_forward_takes_every_attachment_the_reader_lists_some_of() {
+        let parts: String = (0..600)
+            .map(|n| {
+                format!("--b\r\nContent-Type: application/pdf; name=\"f{n}.pdf\"\r\n\r\n{n}\r\n")
+            })
+            .collect();
+        let raw = format!(
+            "From: a@b.c\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nsee\r\n{parts}--b--\r\n"
+        );
+        let (parsed, files) = parse_with_files(raw.as_bytes()).unwrap();
+        assert_eq!(parsed.attachments.len(), MAX_LISTED);
+        assert_eq!(files.len(), 600);
+        assert_eq!(files[599].as_ref().unwrap().name, "f599.pdf");
     }
 
     #[test]
@@ -1920,15 +1982,18 @@ Content-Type: multipart/alternative; boundary=x\r\n\r\n\
                 parsed.attachments,
                 crate::mail::parse(raw).unwrap().attachments
             );
-            assert_eq!(all.len(), parsed.attachments.len());
-            for (listed, read) in parsed.attachments.iter().zip(&all) {
-                let (name, bytes) = read.as_ref().expect("decoded without a panic");
-                assert_eq!(*name, listed.name);
-                assert_eq!(bytes.len(), listed.size);
+            assert!(all.len() >= parsed.attachments.len());
+            for (listed, file) in parsed.attachments.iter().zip(&all) {
+                let file = file.as_ref().expect("decoded without a panic");
+                assert_eq!((&file.name, &file.mime), (&listed.name, &listed.mime));
+                assert_eq!(file.bytes.len(), listed.size);
             }
-            if let Some(Some(last)) = all.last() {
-                let index = all.len() as u32 - 1;
-                assert_eq!(attachment(raw, index).as_ref(), Some(last));
+            if let Some(Some(last)) = all.get(parsed.attachments.len().wrapping_sub(1)) {
+                let index = parsed.attachments.len() as u32 - 1;
+                assert_eq!(
+                    attachment(raw, index),
+                    Some((last.name.clone(), last.bytes.clone()))
+                );
             }
         }
         let mut state = 0x2545_f491_4f6c_dd1d_u64;

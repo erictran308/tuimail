@@ -544,7 +544,7 @@ pub fn reply(parsed: &Parsed, account: &Account, all: bool) -> Draft {
 /// A forward of `parsed`, with its text below and its attachments attached
 /// again: `files`, as [`mail::parse_with_files`] took them out (`None` for
 /// one that couldn't be read, which the app says).
-pub fn forward(parsed: &Parsed, files: Vec<mail::Taken>, account: &Account) -> Draft {
+pub fn forward(parsed: &Parsed, files: Vec<Option<mail::File>>, account: &Account) -> Draft {
     let s = &parsed.summary;
     let mut header = String::from("---------- Forwarded message ----------\n");
     header.push_str(&format!("From: {}\n", s.from.display()));
@@ -559,17 +559,13 @@ pub fn forward(parsed: &Parsed, files: Vec<mail::Taken>, account: &Account) -> D
     if !s.cc.is_empty() {
         header.push_str(&format!("Cc: {}\n", s.cc));
     }
-    let attachments = parsed
-        .attachments
-        .iter()
-        .zip(files)
-        .filter_map(|(a, read)| {
-            let (name, bytes) = read?;
-            Some(Attachment::Data {
-                name,
-                mime: a.mime.clone(),
-                bytes: Arc::new(bytes),
-            })
+    let attachments = files
+        .into_iter()
+        .flatten()
+        .map(|file| Attachment::Data {
+            name: file.name,
+            mime: file.mime,
+            bytes: Arc::new(file.bytes),
         })
         .collect();
     Draft {
@@ -584,7 +580,7 @@ pub fn forward(parsed: &Parsed, files: Vec<mail::Taken>, account: &Account) -> D
 }
 
 /// A draft saved earlier, to write on: its fields, text and attachments.
-pub fn from_saved(parsed: &Parsed, files: Vec<mail::Taken>) -> Draft {
+pub fn from_saved(parsed: &Parsed, files: Vec<Option<mail::File>>) -> Draft {
     let joined = |list: &[Addr]| {
         list.iter()
             .map(Addr::display)

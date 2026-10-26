@@ -1162,13 +1162,18 @@ impl App {
                     self.info("A message is open: finish it, then start the reply again")
                 }
                 (Some(draft), Some(account)) => {
+                    let kept_too = if kind == Kind::Draft {
+                        "; the saved draft is kept, with them"
+                    } else {
+                        ""
+                    };
                     let mut composer = Composer::new(account, kind, draft);
                     composer.replying = replying;
                     composer.draft_of = draft_of;
                     self.composer = Some(composer);
                     if lost > 0 {
                         self.error(format!(
-                            "{lost} of its attachments couldn't be read, so aren't attached"
+                            "{lost} of its attachments couldn't be read, so aren't attached{kept_too}"
                         ));
                     }
                 }
@@ -3938,27 +3943,35 @@ impl App {
         let account_id = self.accounts[key.0].id.clone();
         mail::in_background(
             move || {
-                let (parsed, files) = match pending {
-                    Pending::Reply { .. } => (mail::parse(&raw)?, Vec::new()),
-                    _ => mail::parse_with_files(&raw)?,
-                };
-                let lost = files.iter().filter(|file| file.is_none()).count();
-                let made = match pending {
+                let lost_of =
+                    |files: &[Option<mail::File>]| files.iter().filter(|f| f.is_none()).count();
+                Some(match pending {
                     Pending::Reply { all } => {
-                        (Kind::Reply, compose::reply(&parsed, &account, all), None)
+                        let parsed = mail::parse(&raw)?;
+                        (
+                            Kind::Reply,
+                            compose::reply(&parsed, &account, all),
+                            None,
+                            kept,
+                            0,
+                        )
                     }
-                    Pending::Forward => (
-                        Kind::Forward,
-                        compose::forward(&parsed, files, &account),
-                        None,
-                    ),
-                    Pending::EditDraft => (
-                        Kind::Draft,
-                        compose::from_saved(&parsed, files),
-                        Some(kept.clone()),
-                    ),
-                };
-                Some((made.0, made.1, made.2, kept, lost))
+                    Pending::Forward => {
+                        let (parsed, files) = mail::parse_with_files(&raw)?;
+                        let lost = lost_of(&files);
+                        let draft = compose::forward(&parsed, files, &account);
+                        (Kind::Forward, draft, None, kept, lost)
+                    }
+                    Pending::EditDraft => {
+                        let (parsed, files) = mail::parse_with_files(&raw)?;
+                        let lost = lost_of(&files);
+                        let draft = compose::from_saved(&parsed, files);
+                        // Saving or sending deletes the draft it's made from:
+                        // not one with attachments this one lacks.
+                        let draft_of = (lost == 0).then(|| kept.clone());
+                        (Kind::Draft, draft, draft_of, kept, lost)
+                    }
+                })
             },
             move |result| {
                 let (kind, draft, draft_of, replying, lost) = match result.flatten() {
