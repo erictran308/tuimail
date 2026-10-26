@@ -72,7 +72,7 @@ Swap the file name for your computer's:
 
 If `tuimail` isn't found afterwards, add `~/.local/bin` to your `PATH`. Each file comes with a signed record of the commit it was built from; to check one, run `gh attestation verify <file> --repo erictran308/tuimail --signer-workflow erictran308/tuimail/.github/workflows/release.yml`.
 
-**Or build it from source** (Rust 1.90 or newer, and a C compiler for SQLite):
+**Or build it from source** (Rust 1.98 or newer, and a C compiler for SQLite):
 
 ```sh
 cargo install tuimail --locked

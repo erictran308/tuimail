@@ -6,7 +6,7 @@ description = "Email in your terminal: a vim-style IMAP, POP3 and SMTP client"
 license = "MIT"
 repository = "https://github.com/erictran308/tuimail"
 readme = "README.md"
-rust-version = "1.90"
+rust-version = "1.98"
 keywords = ["email", "imap", "tui", "terminal", "vim"]
 categories = ["command-line-utilities", "email"]
 include = ["src/**/*.rs", "themes/*.toml", "README.md", "LICENSE", "SECURITY.md", "Cargo.toml", "Cargo.lock"]
@@ -36,7 +36,8 @@ pkg-fmt = "zip"
 anyhow = "1.0.104"
 arboard = { version = "3.6.1", default-features = false }
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
-base64 = "0.22"
+# Without its default `simd-unsafe` engines: tuimail encodes a few short strings.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 chrono = "0.4.45"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 dirs = "7.0.0"
@@ -44,14 +45,14 @@ dotenvy = "0.15.7"
 futures = "0.3.34"
 html2text = "0.17"
 keyring-core = "1.0"
-mail-builder = { version = "1.0", default-features = false }
-mail-parser = "0.11"
+mail-builder = { version = "2.0", default-features = false }
+mail-parser = "1.0"
 open = { version = "5.4.4", features = ["shellexecute-on-windows"] }
 ratatui = "0.30.2"
 ratatui-textarea = "0.9.3"
 ring = "0.17.14"
 rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = "0.7.1"
 schemars = "1.2.3"

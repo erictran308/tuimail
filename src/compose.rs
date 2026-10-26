@@ -590,10 +590,7 @@ pub fn from_saved(parsed: &Parsed, raw: &[u8]) -> Draft {
             .join(", ")
     };
     // As every address read: whole or not at all.
-    let bcc = mail_parser::MessageParser::default()
-        .parse(raw)
-        .map(|m| mail::addrs(m.bcc()))
-        .unwrap_or_default();
+    let bcc = mail::bcc(raw);
     let mut draft = forward(parsed, raw, &Account::default());
     draft.to = joined(&parsed.to);
     draft.cc = joined(&parsed.cc);
