@@ -3943,8 +3943,6 @@ impl App {
         let account_id = self.accounts[key.0].id.clone();
         mail::in_background(
             move || {
-                let lost_of =
-                    |files: &[Option<mail::File>]| files.iter().filter(|f| f.is_none()).count();
                 Some(match pending {
                     Pending::Reply { all } => {
                         let parsed = mail::parse(&raw)?;
@@ -3957,15 +3955,15 @@ impl App {
                         )
                     }
                     Pending::Forward => {
-                        let (parsed, files) = mail::parse_with_files(&raw)?;
-                        let lost = lost_of(&files);
-                        let draft = compose::forward(&parsed, files, &account);
+                        let (parsed, contents) = mail::parse_with_contents(&raw)?;
+                        let lost = contents.lost;
+                        let draft = compose::forward(&parsed, contents.files, &account);
                         (Kind::Forward, draft, None, kept, lost)
                     }
                     Pending::EditDraft => {
-                        let (parsed, files) = mail::parse_with_files(&raw)?;
-                        let lost = lost_of(&files);
-                        let draft = compose::from_saved(&parsed, files);
+                        let (parsed, contents) = mail::parse_with_contents(&raw)?;
+                        let lost = contents.lost;
+                        let draft = compose::from_saved(&parsed, contents);
                         // Saving or sending deletes the draft it's made from:
                         // not one with attachments this one lacks.
                         let draft_of = (lost == 0).then(|| kept.clone());

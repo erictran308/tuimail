@@ -542,7 +542,7 @@ pub fn reply(parsed: &Parsed, account: &Account, all: bool) -> Draft {
 }
 
 /// A forward of `parsed`, with its text below and its attachments attached
-/// again: `files`, as [`mail::parse_with_files`] took them out (`None` for
+/// again: `files`, as [`mail::parse_with_contents`] took them out (`None` for
 /// one that couldn't be read, which the app says).
 pub fn forward(parsed: &Parsed, files: Vec<Option<mail::File>>, account: &Account) -> Draft {
     let s = &parsed.summary;
@@ -580,17 +580,17 @@ pub fn forward(parsed: &Parsed, files: Vec<Option<mail::File>>, account: &Accoun
 }
 
 /// A draft saved earlier, to write on: its fields, text and attachments.
-pub fn from_saved(parsed: &Parsed, files: Vec<Option<mail::File>>) -> Draft {
+pub fn from_saved(parsed: &Parsed, contents: mail::Contents) -> Draft {
     let joined = |list: &[Addr]| {
         list.iter()
             .map(Addr::display)
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let mut draft = forward(parsed, files, &Account::default());
+    let mut draft = forward(parsed, contents.files, &Account::default());
     draft.to = joined(&parsed.to);
     draft.cc = joined(&parsed.cc);
-    draft.bcc = joined(&parsed.bcc);
+    draft.bcc = joined(&contents.bcc);
     draft.subject = parsed.summary.subject.clone();
     // Its text, or what its HTML says (a draft written as HTML only, by
     // another program, would otherwise lose all of it when saved again).
@@ -871,8 +871,8 @@ Date: Sat, 11 Oct 2026 10:42:00 +0000\r\n\r\nSee you there.\r\n";
             "never me"
         );
 
-        let (parsed, files) = mail::parse_with_files(raw).unwrap();
-        let fwd = forward(&parsed, files, &me());
+        let (parsed, contents) = mail::parse_with_contents(raw).unwrap();
+        let fwd = forward(&parsed, contents.files, &me());
         assert_eq!(fwd.subject, "Fwd: Re: Plans");
         assert!(fwd.body.contains("From: Alice <alice@example.com>"));
         assert!(fwd.body.contains("See you there."));
