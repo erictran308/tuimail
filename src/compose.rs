@@ -541,9 +541,10 @@ pub fn reply(parsed: &Parsed, account: &Account, all: bool) -> Draft {
     }
 }
 
-/// A forward of `parsed`, with its text below and its attachments
-/// (taken from `raw`) attached again.
-pub fn forward(parsed: &Parsed, raw: &[u8], account: &Account) -> Draft {
+/// A forward of `parsed`, with its text below and its attachments attached
+/// again: `files`, as [`mail::parse_with_files`] took them out (`None` for
+/// one that couldn't be read, which the app says).
+pub fn forward(parsed: &Parsed, files: Vec<mail::Taken>, account: &Account) -> Draft {
     let s = &parsed.summary;
     let mut header = String::from("---------- Forwarded message ----------\n");
     header.push_str(&format!("From: {}\n", s.from.display()));
@@ -561,7 +562,7 @@ pub fn forward(parsed: &Parsed, raw: &[u8], account: &Account) -> Draft {
     let attachments = parsed
         .attachments
         .iter()
-        .zip(mail::attachments(raw))
+        .zip(files)
         .filter_map(|(a, read)| {
             let (name, bytes) = read?;
             Some(Attachment::Data {
@@ -583,14 +584,14 @@ pub fn forward(parsed: &Parsed, raw: &[u8], account: &Account) -> Draft {
 }
 
 /// A draft saved earlier, to write on: its fields, text and attachments.
-pub fn from_saved(parsed: &Parsed, raw: &[u8]) -> Draft {
+pub fn from_saved(parsed: &Parsed, files: Vec<mail::Taken>) -> Draft {
     let joined = |list: &[Addr]| {
         list.iter()
             .map(Addr::display)
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let mut draft = forward(parsed, raw, &Account::default());
+    let mut draft = forward(parsed, files, &Account::default());
     draft.to = joined(&parsed.to);
     draft.cc = joined(&parsed.cc);
     draft.bcc = joined(&parsed.bcc);
@@ -874,7 +875,8 @@ Date: Sat, 11 Oct 2026 10:42:00 +0000\r\n\r\nSee you there.\r\n";
             "never me"
         );
 
-        let fwd = forward(&parsed, raw, &me());
+        let (parsed, files) = mail::parse_with_files(raw).unwrap();
+        let fwd = forward(&parsed, files, &me());
         assert_eq!(fwd.subject, "Fwd: Re: Plans");
         assert!(fwd.body.contains("From: Alice <alice@example.com>"));
         assert!(fwd.body.contains("See you there."));

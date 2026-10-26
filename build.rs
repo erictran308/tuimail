@@ -6,6 +6,9 @@
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
+    // A RUSTFLAGS set later replaces the flags: check again.
+    println!("cargo::rerun-if-env-changed=RUSTFLAGS");
+    println!("cargo::rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
     let set = |name: &str| std::env::var_os(format!("CARGO_CFG_{name}")).is_some();
     if set("MAIL_PARSER_CHECKED_STR") && set("ENCODIFY_SCALAR") {
         return;

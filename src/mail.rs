@@ -242,22 +242,49 @@ pub fn summarize(raw: &[u8]) -> Summary {
 /// no headers at all, which mail-parser takes for no message, is shown as
 /// the text it is.
 pub fn parse(raw: &[u8]) -> Option<Parsed> {
-    match read(raw, parsed)? {
+    match read(raw, |message| parsed(message, &bodies(message)))? {
         Some(parsed) => Some(parsed),
-        None => (!raw.is_empty()).then(|| Parsed {
-            text: Some(String::from_utf8_lossy(raw).into_owned()),
-            ..Parsed::default()
-        }),
+        None => as_text(raw),
     }
 }
 
-fn parsed(message: &mail_parser::Message) -> Parsed {
+/// An attachment taken out of its message, its safe file name and bytes;
+/// `None` for one that couldn't be read.
+pub type Taken = Option<(String, Vec<u8>)>;
+
+/// [`parse`], with every attachment listed taken out of the same parse (a
+/// forward or a draft takes them all), each decoded on its own
+/// ([`contained`]) so one that can't be read is all that's lost.
+pub fn parse_with_files(raw: &[u8]) -> Option<(Parsed, Vec<Taken>)> {
+    let both = read(raw, |message| {
+        let body = bodies(message);
+        let files = attachment_parts(message, &body)
+            .take(500)
+            .map(|part| contained(|| extract(&part)))
+            .collect();
+        (parsed(message, &body), files)
+    })?;
+    match both {
+        Some(both) => Some(both),
+        None => Some((as_text(raw)?, Vec::new())),
+    }
+}
+
+/// What mail-parser takes for no message (no headers at all), as the text
+/// it is; `None` if it's empty.
+fn as_text(raw: &[u8]) -> Option<Parsed> {
+    (!raw.is_empty()).then(|| Parsed {
+        text: Some(String::from_utf8_lossy(raw).into_owned()),
+        ..Parsed::default()
+    })
+}
+
+fn parsed(message: &mail_parser::Message, body: &[Vec<MessagePart>; 2]) -> Parsed {
     let join = |parts: Vec<Cow<str>>| -> Option<String> {
         let joined = parts.join("\n\n");
         (!joined.trim().is_empty()).then_some(joined)
     };
-    let body = bodies(message);
-    let [text_parts, html_parts] = &body;
+    let [text_parts, html_parts] = body;
     let mut flowed = false;
     let mut texts = Vec::new();
     for part in text_parts {
@@ -270,7 +297,7 @@ fn parsed(message: &mail_parser::Message) -> Parsed {
         }
     }
     let htmls = html_parts.iter().filter_map(|p| p.text()).collect();
-    let attachments = attachment_parts(message, &body)
+    let attachments = attachment_parts(message, body)
         .enumerate()
         .map(|(i, part)| {
             let mime = mime_of(&part);
@@ -301,9 +328,10 @@ fn parsed(message: &mail_parser::Message) -> Parsed {
 /// The parts read as the message's text and as its HTML. mail-parser makes
 /// a version in a multipart/alternative that has a file name an attachment
 /// (as RFC 8621 does); when the message has no other version of its kind,
-/// it's that one, as before mail-parser 1.0, unless its sender marked it
-/// one to download (`Content-Disposition: attachment`). (An HTML part
-/// standing in for the text is read as the HTML.)
+/// it's that one (text/plain, or text/html), as before mail-parser 1.0,
+/// unless its sender marked it one to download (`Content-Disposition:
+/// attachment`). (An HTML part standing in for the text is read as the
+/// HTML.)
 fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
     [false, true].map(|html| {
         let of_kind = |p: &MessagePart| match p.kind() {
@@ -330,6 +358,7 @@ fn bodies<'m>(message: &'m mail_parser::Message) -> [Vec<MessagePart<'m>>; 2] {
             .parts()
             .filter(|p| {
                 of_kind(p)
+                    && (html || is_type(p, "plain"))
                     && p.is_attachment()
                     && !p.content_disposition().is_some_and(|d| d.is_attachment())
                     && p.parent()
@@ -349,7 +378,21 @@ fn unsubscribe_link(message: &mail_parser::Message) -> Option<String> {
         .get(HeaderName::ListUnsubscribe)?
         .raw_value();
     let field = &field[..field.len().min(MAX_UNSUBSCRIBE)];
-    let value = String::from_utf8_lossy(field).replace(['\r', '\n'], "");
+    // Unfolded without the space a fold leaves, so a link folded in two
+    // is one again.
+    let text = String::from_utf8_lossy(field);
+    let value: String = text
+        .split('\n')
+        .enumerate()
+        .map(|(n, line)| {
+            let line = line.trim_end_matches('\r');
+            if n == 0 {
+                line
+            } else {
+                line.trim_start_matches([' ', '\t'])
+            }
+        })
+        .collect();
     unsubscribe_links(&value)
         .into_iter()
         .filter_map(|link| {
@@ -423,23 +466,40 @@ pub fn preview_of(raw: &[u8]) -> String {
 /// attachments, the pictures, sound and video it counts as part of the
 /// text, and parts it puts nowhere (RFC 8621 drops some inside a mixed in
 /// an alternative), since tuimail shows none of those itself and each
-/// should be there to save. Not a text or HTML version an alternative
+/// should be there to save. Not a version of the text an alternative
 /// leaves out, though (a second text/plain, Apple's text/watch-html): its
 /// sender never meant it to be seen, unless they named it or marked it as
-/// a download.
+/// a download. Anything else in an alternative is listed: an invite
+/// (text/calendar) beside the text, what's left past [`PARSER`]'s limits.
 fn attachment_parts<'m>(
     message: &'m mail_parser::Message,
     body: &[Vec<MessagePart<'m>>; 2],
 ) -> impl Iterator<Item = MessagePart<'m>> + use<'m> {
     let read: Vec<PartId> = body.iter().flatten().map(|p| p.id()).collect();
     message.root().parts().filter(move |p| {
-        let left_out = p.is_text()
+        let left_out = ["plain", "html", "watch-html", "x-amp-html", "enriched"]
+            .iter()
+            .any(|version| is_type(p, version))
             && p.attachment_name().is_none()
             && !p.content_disposition().is_some_and(|d| d.is_attachment())
             && p.parent()
                 .is_some_and(|q| q.is_content_type("multipart", "alternative"));
         !read.contains(&p.id()) && p.role() != PartRole::Container && !left_out
     })
+}
+
+/// Whether a part is text of this subtype; one without a Content-Type is
+/// text/plain.
+fn is_type(part: &MessagePart, subtype: &str) -> bool {
+    match part.content_type() {
+        Some(ct) => {
+            ct.ctype().eq_ignore_ascii_case("text")
+                && ct
+                    .subtype()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(subtype))
+        }
+        None => subtype == "plain",
+    }
 }
 
 /// An attachment's type, lower case: `image/png`.
@@ -484,20 +544,6 @@ pub fn attachment(raw: &[u8], index: u32) -> Option<(String, Vec<u8>)> {
     })
     .flatten()
     .flatten()
-}
-
-/// Every attachment listed, as [`attachment`] gives each, from one parse
-/// (a forward takes them all); `None` for one that couldn't be read, each
-/// decoded on its own ([`contained`]) so that one is all that's lost.
-pub fn attachments(raw: &[u8]) -> Vec<Option<(String, Vec<u8>)>> {
-    read(raw, |message| {
-        attachment_parts(message, &bodies(message))
-            .take(500)
-            .map(|part| contained(|| extract(&part)))
-            .collect()
-    })
-    .flatten()
-    .unwrap_or_default()
 }
 
 /// A file name from a sender, made safe to save under: no folders, no
@@ -1572,6 +1618,11 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
         );
         assert_eq!(link(&",".repeat(1_000_000)), None);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // A link without brackets folded in two.
+        assert_eq!(
+            link("https://x.com/unsub?list=a&\r\n token=abc"),
+            Some("https://x.com/unsub?list=a&token=abc".to_string())
+        );
     }
 
     #[test]
@@ -1584,6 +1635,29 @@ This is a long \r\nline that was \r\nsplit.\r\n>quoted \r\n>more\r\n-- \r\nsig\r
         let parsed = parse(raw).unwrap();
         assert_eq!(parsed.html.as_deref(), Some("<p>html</p>"));
         assert!(parsed.attachments.is_empty(), "{:?}", parsed.attachments);
+    }
+
+    #[test]
+    fn an_invite_beside_the_text_is_listed_and_never_the_text() {
+        let invite =
+            "--x\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\nBEGIN:VCALENDAR\r\n";
+        let alternative = |parts: &str| {
+            let raw = format!(
+                "From: a@b.c\r\nContent-Type: multipart/alternative; boundary=x\r\n\r\n{parts}{invite}--x--\r\n"
+            );
+            parse(raw.as_bytes()).unwrap()
+        };
+        let plain = "--x\r\nContent-Type: text/plain\r\n\r\nplain version\r\n";
+        let html = "--x\r\nContent-Type: text/html\r\n\r\n<p>html version</p>\r\n";
+        for parsed in [alternative(&format!("{plain}{html}")), alternative(html)] {
+            assert!(
+                !parsed.text.as_deref().unwrap_or("").contains("VCALENDAR"),
+                "{parsed:?}"
+            );
+            assert_eq!(parsed.html.as_deref(), Some("<p>html version</p>"));
+            assert_eq!(parsed.attachments.len(), 1, "{:?}", parsed.attachments);
+            assert_eq!(parsed.attachments[0].mime, "text/calendar");
+        }
     }
 
     #[test]
@@ -1841,8 +1915,11 @@ Content-Type: multipart/alternative; boundary=x\r\n\r\n\
                     }
                 }
             }
-            let parsed = parsed(&message);
-            let all = attachments(raw);
+            let (parsed, all) = parse_with_files(raw).expect("read without a panic");
+            assert_eq!(
+                parsed.attachments,
+                crate::mail::parse(raw).unwrap().attachments
+            );
             assert_eq!(all.len(), parsed.attachments.len());
             for (listed, read) in parsed.attachments.iter().zip(&all) {
                 let (name, bytes) = read.as_ref().expect("decoded without a panic");

@@ -3938,28 +3938,25 @@ impl App {
         let account_id = self.accounts[key.0].id.clone();
         mail::in_background(
             move || {
-                let parsed = mail::parse(&raw)?;
+                let (parsed, files) = match pending {
+                    Pending::Reply { .. } => (mail::parse(&raw)?, Vec::new()),
+                    _ => mail::parse_with_files(&raw)?,
+                };
+                let lost = files.iter().filter(|file| file.is_none()).count();
                 let made = match pending {
                     Pending::Reply { all } => {
                         (Kind::Reply, compose::reply(&parsed, &account, all), None)
                     }
                     Pending::Forward => (
                         Kind::Forward,
-                        compose::forward(&parsed, &raw, &account),
+                        compose::forward(&parsed, files, &account),
                         None,
                     ),
                     Pending::EditDraft => (
                         Kind::Draft,
-                        compose::from_saved(&parsed, &raw),
+                        compose::from_saved(&parsed, files),
                         Some(kept.clone()),
                     ),
-                };
-                let lost = match made.0 {
-                    Kind::Reply => 0,
-                    _ => parsed
-                        .attachments
-                        .len()
-                        .saturating_sub(made.1.attachments.len()),
                 };
                 Some((made.0, made.1, made.2, kept, lost))
             },
