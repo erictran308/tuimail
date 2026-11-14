@@ -143,6 +143,9 @@ Writing:
 | `x` on Files | Take a file off |
 | `Esc` | Close: `y` keeps it in Drafts, `n` throws it away |
 
+`Ctrl-e` hands the terminal to your editor, then repaints tuimail and resumes
+input without asking the terminal for its cursor position.
+
 ## Accounts
 
 Accounts are kept in `accounts.toml` in [your data folder](#your-data). The setup screen (`+`) writes it; you can also edit it while tuimail isn't running:

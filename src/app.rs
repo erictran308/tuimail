@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use futures::StreamExt;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
+use ratatui::backend::Backend;
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -127,6 +127,85 @@ pub enum AppEvent {
     /// The terminal closed, or tuimail was asked to stop (Unix signals).
     #[cfg_attr(not(unix), allow(dead_code))]
     Quit,
+}
+
+/// The only terminal reader. Joining it before a foreground program starts
+/// leaves neither a reader nor an EventStream shutdown wake-up behind.
+struct TerminalEvents {
+    events: tokio::sync::mpsc::Receiver<std::io::Result<Vec<Event>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    finished: std::sync::mpsc::Receiver<()>,
+}
+
+impl TerminalEvents {
+    fn new() -> std::io::Result<Self> {
+        let (tx, events) = tokio::sync::mpsc::channel(1);
+        let (finished_tx, finished) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::Builder::new().spawn(move || {
+            while !tx.is_closed() {
+                // A bounded wait lets stop join without injecting a wake-up
+                // into Crossterm's shared reader.
+                let result = match crossterm::event::poll(Duration::from_millis(100)) {
+                    Ok(false) => continue,
+                    Ok(true) => Self::read_waiting(),
+                    Err(e) => Err(e),
+                };
+                let failed = result.is_err();
+                if tx.blocking_send(result).is_err() || failed {
+                    break;
+                }
+            }
+            let _ = finished_tx.send(());
+        })?;
+        Ok(Self {
+            events,
+            reader: Some(reader),
+            finished,
+        })
+    }
+
+    fn stop(mut self) -> std::io::Result<()> {
+        // Release a reader blocked on the full queue before waiting for it.
+        self.events.close();
+        if matches!(
+            self.finished.recv_timeout(Duration::from_secs(1)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            // Crossterm can spin on EOF after a hangup. Abort the handoff,
+            // never start another reader or a foreground program beside it.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "terminal input reader did not stop",
+            ));
+        }
+        if let Some(reader) = self.reader.take() {
+            reader
+                .join()
+                .map_err(|_| std::io::Error::other("terminal input reader panicked"))?;
+        }
+        Ok(())
+    }
+
+    fn read_waiting() -> std::io::Result<Vec<Event>> {
+        // Batch before sending: a paste must not wake the app with its
+        // first key while the rest are still waiting in the terminal.
+        let mut events = vec![crossterm::event::read()?];
+        while events.len() < MAX_PROMPT && crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+            match crossterm::event::read() {
+                Ok(event) => events.push(event),
+                Err(_) => break,
+            }
+        }
+        Ok(events)
+    }
+}
+
+impl Drop for TerminalEvents {
+    fn drop(&mut self) {
+        // At exit Crossterm may be stuck reading a terminal that hung up.
+        // Only foreground handoffs must wait, through the bounded stop().
+        self.events.close();
+    }
 }
 
 /// A message held on to for later (the one being replied to, the saved
@@ -858,7 +937,7 @@ impl App {
         terminal: &mut DefaultTerminal,
         mut rx: UnboundedReceiver<AppEvent>,
     ) -> Result<()> {
-        let mut keys = EventStream::new();
+        let mut keys = TerminalEvents::new()?;
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         #[cfg(unix)]
         quit_on_hangup(self.tx.clone())?;
@@ -877,31 +956,20 @@ impl App {
             if std::mem::take(&mut self.edit_request) {
                 // The editor gets the terminal: key reading stops, the screen
                 // goes back to normal, and both come back after.
-                drop(keys);
+                keys.stop()?;
                 self.run_editor();
                 *terminal = ratatui::init();
                 let _ =
                     crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
-                terminal.clear()?;
-                keys = EventStream::new();
+                // A fresh fullscreen terminal has empty buffers: clear the
+                // backend without querying a cursor position to preserve.
+                terminal.backend_mut().clear()?;
+                keys = TerminalEvents::new()?;
                 continue;
             }
             tokio::select! {
-                event = keys.next() => match event {
-                    Some(Ok(event)) => {
-                        // Whatever else is already waiting is read with it:
-                        // a paste that comes as keystrokes arrives at once.
-                        let mut events = vec![event];
-                        while events.len() < MAX_PROMPT
-                            && crossterm::event::poll(Duration::ZERO).unwrap_or(false)
-                        {
-                            match crossterm::event::read() {
-                                Ok(event) => events.push(event),
-                                Err(_) => break,
-                            }
-                        }
-                        self.on_terminal_events(events);
-                    }
+                event = keys.events.recv() => match event {
+                    Some(Ok(events)) => self.on_terminal_events(events),
                     Some(Err(_)) | None => self.quit = true,
                 },
                 Some(event) = rx.recv() => {

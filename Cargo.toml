@@ -40,7 +40,7 @@ async-imap = { version = "0.12", default-features = false, features = ["runtime-
 # reviewed, is plenty for tuimail's logins, PKCE and agents' message ids.
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 chrono = "0.4.45"
-crossterm = { version = "0.29.0", features = ["event-stream"] }
+crossterm = "0.29.0"
 dirs = "7.0.0"
 dotenvy = "0.15.7"
 # Not called here: under mail-parser and mail-builder, and 1.0.0 ignored
