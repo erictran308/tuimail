@@ -32,6 +32,40 @@ pub struct Placed {
     pub same_subject: bool,
 }
 
+/// Messages connected to the first `listed` by their conversation headers.
+/// Shared references count even when the message they name isn't cached.
+pub fn connected(summaries: &[&Summary], listed: usize) -> Vec<bool> {
+    fn ids(s: &Summary) -> impl Iterator<Item = &str> {
+        std::iter::once(s.message_id.as_str())
+            .chain(std::iter::once(s.in_reply_to.as_str()))
+            .chain(s.references.split_whitespace())
+            .filter(|id| !id.is_empty())
+    }
+    let mut by_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, summary) in summaries.iter().enumerate().skip(listed) {
+        for id in ids(summary) {
+            by_id.entry(id).or_default().push(i);
+        }
+    }
+    let mut keep = vec![false; summaries.len()];
+    let mut pending: Vec<usize> = (0..listed).collect();
+    keep[..listed].fill(true);
+    while let Some(i) = pending.pop() {
+        for id in ids(summaries[i]) {
+            // Each header id is visited once, even in long conversations.
+            if let Some(messages) = by_id.remove(id) {
+                for j in messages {
+                    if !keep[j] {
+                        keep[j] = true;
+                        pending.push(j);
+                    }
+                }
+            }
+        }
+    }
+    keep
+}
+
 /// `summaries` as threads: each conversation in turn, newest first.
 #[cfg(test)]
 pub fn arrange(summaries: &[&Summary]) -> Vec<Placed> {
@@ -303,6 +337,26 @@ mod tests {
             roots >= 20_000 / (MAX_CHAIN + 1),
             "a new one every thousand: {roots}"
         );
+    }
+
+    #[test]
+    fn sent_messages_follow_connections_not_subjects_or_empty_ids() {
+        let list = [
+            summary("received", "sent", "missing sent", 30, "Plan"),
+            summary("sent-again", "sent", "missing sent", 40, "Re: Plan"),
+            summary("sent", "", "", 20, "Plan"),
+            summary("sibling", "missing", "missing", 10, "Re: Plan"),
+            summary("unrelated", "", "", 50, "Plan"),
+            summary("", "", "", 60, "Plan"),
+            summary("loop-a", "loop-b", "", 70, "Plan"),
+            summary("loop-b", "loop-a", "", 80, "Plan"),
+        ];
+        let refs: Vec<&Summary> = list.iter().collect();
+        assert_eq!(
+            connected(&refs, 1),
+            [true, true, true, true, false, false, false, false]
+        );
+        assert_eq!(connected(&refs, 0), [false; 8]);
     }
 
     #[test]

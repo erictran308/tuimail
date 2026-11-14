@@ -191,12 +191,24 @@ fn row(
     };
     let who_style = strong(Style::new().fg(if unread { c.text } else { c.subtext }));
     let subject_style = strong(Style::new().fg(if unread { c.text } else { c.subtext }));
-    // Search results from other folders say which.
+    // Results outside the displayed folder say where they are kept.
+    let outside = match &app.place {
+        Place::Folder { account, folder } => *account != item.account || *folder != m.folder,
+        Place::AllInboxes => app.accounts[item.account].inbox() != m.folder,
+    };
     let folder = if app.search.is_some()
+        || outside
         || matches!(app.place, Place::AllInboxes) && app.accounts.len() > 1
     {
         let label = match app.place {
-            Place::AllInboxes => app.account_tag(item.account),
+            Place::AllInboxes if app.accounts.len() > 1 && outside => {
+                format!(
+                    "{} · {}",
+                    app.folder_name(item.account, &m.folder),
+                    app.account_tag(item.account)
+                )
+            }
+            Place::AllInboxes if app.accounts.len() > 1 => app.account_tag(item.account),
             _ => app.folder_name(item.account, &m.folder),
         };
         format!("[{}] ", fit(&label, 10))

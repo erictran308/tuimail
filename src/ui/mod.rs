@@ -801,6 +801,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         check(settings.threads),
         "Group conversations (threads)",
     );
+    add(
+        &mut lines,
+        HelpMenu::THREADS_INCLUDE_SENT,
+        check(settings.threads_include_sent),
+        "Include Sent in threads",
+    );
     lines.push(Line::default());
     lines.push(heading(" Asking first"));
     add(

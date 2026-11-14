@@ -36,7 +36,7 @@ const MAX_PROMPT: usize = 4096;
 /// Different keys read together, with nothing open to type in, that are
 /// taken for a paste and ignored rather than run as commands.
 const PASTED_KEYS: usize = 3;
-/// The most messages listed from the cache at once.
+/// The most messages listed from one folder's cache at once.
 const MAX_LISTED: usize = 20_000;
 /// A message shown beside the list is marked read after this long.
 const PREVIEW_READ_AFTER: Duration = Duration::from_millis(1500);
@@ -478,12 +478,13 @@ impl HelpMenu {
     pub const PREFER_PLAIN: usize = 1;
     pub const MARK_READ: usize = 2;
     pub const THREADS: usize = 3;
-    pub const CONFIRM_DELETE: usize = 4;
-    pub const CONFIRM_SEND: usize = 5;
-    pub const NOTIFICATIONS: usize = 6;
-    pub const AGENTS: usize = 7;
-    pub const CONFIRM_AGENTS: usize = 8;
-    pub const THEMES: usize = 9;
+    pub const THREADS_INCLUDE_SENT: usize = 4;
+    pub const CONFIRM_DELETE: usize = 5;
+    pub const CONFIRM_SEND: usize = 6;
+    pub const NOTIFICATIONS: usize = 7;
+    pub const AGENTS: usize = 8;
+    pub const CONFIRM_AGENTS: usize = 9;
+    pub const THEMES: usize = 10;
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
     pub fn new(tab: HelpTab) -> Self {
@@ -1009,8 +1010,8 @@ impl App {
             .sum()
     }
 
-    /// Looks for new mail in account `i`: its inbox, the folder open, and
-    /// the folders' counts (`all`, or now and then).
+    /// Looks for new mail in account `i`: its inbox, the folder open, Sent
+    /// for conversations, and the folders' counts (`all`, or now and then).
     fn check(&mut self, i: usize, all: bool) {
         if self.demo {
             return;
@@ -1033,6 +1034,7 @@ impl App {
         {
             self.sync_folder(i, &folder);
         }
+        self.sync_sent(i);
     }
 
     fn pop_check(&mut self, i: usize) {
@@ -1057,6 +1059,19 @@ impl App {
                 first_check,
             },
         );
+    }
+
+    /// Keeps the outgoing half of conversations cached too.
+    fn sync_sent(&mut self, i: usize) {
+        if self.settings.threads
+            && self.settings.threads_include_sent
+            && let Some(folder) = self.accounts[i]
+                .folder_for(Role::Sent)
+                .map(|f| f.name.clone())
+        {
+            // A running check may have looked for new mail before a send.
+            self.sync_folder(i, &folder);
+        }
     }
 
     fn sync_folder(&mut self, i: usize, folder: &str) {
@@ -1287,8 +1302,9 @@ impl App {
                         account: i,
                         folder: inbox,
                     };
-                    self.reload();
                 }
+                self.sync_sent(i);
+                self.reload();
             }
             E::Synced(synced) => self.on_synced(i, synced),
             E::Older {
@@ -1711,12 +1727,20 @@ impl App {
         }
     }
 
-    /// Whether the list shows account `i`'s `folder`.
+    /// Whether changes to account `i`'s `folder` can affect the list.
     fn shows(&self, i: usize, folder: &str) -> bool {
-        match &self.place {
+        let here = match &self.place {
             Place::Folder { account, folder: f } => *account == i && f == folder,
             Place::AllInboxes => self.accounts[i].inbox() == folder,
-        }
+        };
+        here || self.settings.threads
+            && self.settings.threads_include_sent
+            && self.search.is_none()
+            && self.role_of(i, folder) == Some(Role::Sent)
+            && match self.place {
+                Place::Folder { account, .. } => account == i,
+                Place::AllInboxes => true,
+            }
     }
 
     /// Deletes for good the server hadn't confirmed when tuimail last
@@ -1878,15 +1902,43 @@ impl App {
         };
         for (i, folder) in targets {
             let id = &self.accounts[i].id;
-            let found = match (&self.search, folder) {
+            let found = match (&self.search, folder.as_deref()) {
                 (Some(query), Some(folder)) => {
-                    self.store.search(id, Some(&folder), query, MAX_LISTED)
+                    self.store.search(id, Some(folder), query, MAX_LISTED)
                 }
                 (Some(query), None) => self.store.search(id, None, query, MAX_LISTED),
-                (None, Some(folder)) => self.store.messages(id, &folder, MAX_LISTED),
+                (None, Some(folder)) => self.store.messages(id, folder, MAX_LISTED),
                 (None, None) => Ok(Vec::new()),
             };
-            items.extend(found.unwrap_or_default().into_iter().map(|message| Item {
+            let mut found = found.unwrap_or_default();
+            if self.settings.threads
+                && self.settings.threads_include_sent
+                && self.search.is_none()
+                && !found.is_empty()
+                && let Some(sent) = self.accounts[i].folder_for(Role::Sent)
+                && folder.as_deref() != Some(sent.name.as_str())
+            {
+                let listed = found.len();
+                let mut outgoing = self
+                    .store
+                    .messages(id, &sent.name, MAX_LISTED)
+                    .unwrap_or_default();
+                // A sent copy already in this folder (All Mail, or mail to
+                // yourself) is shown once, with this folder's identity.
+                let ids: HashSet<&str> = found
+                    .iter()
+                    .map(|m| m.summary.message_id.as_str())
+                    .filter(|id| !id.is_empty())
+                    .collect();
+                outgoing.retain(|m| !ids.contains(m.summary.message_id.as_str()));
+                if !outgoing.is_empty() {
+                    found.extend(outgoing);
+                    let summaries: Vec<&mail::Summary> = found.iter().map(|m| &m.summary).collect();
+                    let mut keep = crate::threads::connected(&summaries, listed).into_iter();
+                    found.retain(|_| keep.next().unwrap_or(false));
+                }
+            }
+            items.extend(found.into_iter().map(|message| Item {
                 account: i,
                 message,
                 thread: Thread::default(),
@@ -1954,11 +2006,13 @@ impl App {
                     return;
                 }
                 self.sync_folder(account, &folder);
+                self.sync_sent(account);
             }
             Place::AllInboxes => {
                 for i in 0..self.accounts.len() {
                     let inbox = self.accounts[i].inbox();
                     self.sync_folder(i, &inbox);
+                    self.sync_sent(i);
                 }
             }
         }
@@ -3633,6 +3687,9 @@ impl App {
                 self.focus = Focus::List;
             }
         }
+        if self.settings.threads && self.settings.threads_include_sent && self.search.is_none() {
+            self.reload();
+        }
         self.selected = self.selected.min(self.items.len().saturating_sub(1));
         self.moved_at = Some(Instant::now());
     }
@@ -4224,6 +4281,9 @@ impl App {
                     retry: true,
                 },
             );
+        } else {
+            // Gmail and Outlook keep the copy themselves.
+            self.sync_sent(i);
         }
         if let Some(key) = sent.replying.and_then(|k| self.resolve(&k)) {
             self.set_flag(&[key], FlagKind::Answered, true);
@@ -5359,9 +5419,19 @@ impl App {
                 self.render();
             }
             HelpMenu::MARK_READ => self.save_setting("mark_read", flip(self.settings.mark_read)),
-            HelpMenu::THREADS => {
-                self.save_setting("threads", flip(self.settings.threads));
+            HelpMenu::THREADS | HelpMenu::THREADS_INCLUDE_SENT => {
+                if row == HelpMenu::THREADS {
+                    self.save_setting("threads", flip(self.settings.threads));
+                } else {
+                    self.save_setting(
+                        "threads_include_sent",
+                        flip(self.settings.threads_include_sent),
+                    );
+                }
                 self.reload();
+                for i in 0..self.accounts.len() {
+                    self.sync_sent(i);
+                }
             }
             HelpMenu::CONFIRM_DELETE => {
                 self.save_setting("confirm_delete", flip(self.settings.confirm_delete))
@@ -6388,6 +6458,7 @@ pub mod tests {
     async fn a_reply_is_written_and_sent_in_the_demo() {
         let mut app = app();
         with_mail(&mut app);
+        app.change_setting(HelpMenu::THREADS_INCLUDE_SENT);
         open_first(&mut app).await;
         app.on_key(key(KeyCode::Char('r')));
         app.wait_until(|app| app.composer.is_some()).await;
@@ -6412,6 +6483,198 @@ pub mod tests {
             .unwrap()
             .unwrap();
         assert!(original.flags.answered, "marked answered");
+        let reply = &app.items[1];
+        assert_eq!(reply.message.folder, "Sent");
+        assert_eq!(reply.message.uid, sent[0].uid);
+        assert_eq!(reply.thread.tree, "└─");
+        let shown = crate::ui::tests::screen(&mut app, 160, 30);
+        let lines: Vec<&str> = shown.lines().collect();
+        let root = lines
+            .iter()
+            .position(|l| l.contains("Lunch tomorrow?"))
+            .unwrap();
+        assert!(lines[root + 1].contains("To Alice"), "{shown}");
+        assert!(lines[root + 1].contains("[Sent]"), "{shown}");
+        app.focus = Focus::List;
+        app.selected = 1;
+        app.open_selected(true);
+        wait_for_layout(&mut app).await;
+        assert_eq!(app.reader.as_ref().unwrap().folder, "Sent");
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(
+            app.store
+                .message(&app.accounts[0].id, "Sent", sent[0].uid)
+                .unwrap()
+                .unwrap()
+                .flags
+                .flagged
+        );
+        assert!(
+            !app.store
+                .message(&app.accounts[0].id, "INBOX", original.uid)
+                .unwrap()
+                .unwrap()
+                .flags
+                .flagged
+        );
+    }
+
+    #[tokio::test]
+    async fn sent_messages_join_only_their_accounts_listed_conversations() {
+        let mut app = two_accounts();
+        for a in &app.accounts {
+            app.store.reset_folder(&a.id, &a.inbox()).unwrap();
+            app.store.reset_folder(&a.id, "Sent").unwrap();
+        }
+        let header = |uid, id: &str, parent: &str, date| {
+            let mut h = store::tests::header(uid, "Plan", date);
+            h.summary.message_id = id.into();
+            h.summary.in_reply_to = parent.into();
+            h
+        };
+        let id = app.accounts[0].id.clone();
+        app.store
+            .add_headers(&id, "INBOX", &[header(1, "in", "out", 20)])
+            .unwrap();
+        app.store
+            .save_body(&id, "INBOX", 1, b"Subject: Plan\r\n\r\nPlan")
+            .unwrap();
+        app.reload();
+        app.on_worker(
+            0,
+            worker::Event::Headers {
+                folder: "Sent".into(),
+                headers: vec![
+                    header(1, "out", "", 10),
+                    header(2, "followup", "in", 30),
+                    header(4, "unrelated", "", 50),
+                    header(5, "in", "out", 20),
+                ],
+            },
+        );
+        app.store
+            .add_headers(
+                &app.accounts[1].id,
+                "Sent",
+                &[header(1, "other-account", "in", 60)],
+            )
+            .unwrap();
+        let ids = |app: &App| {
+            app.items
+                .iter()
+                .map(|it| it.message.summary.message_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&app), ["in"], "Sent threads are opt-in");
+        app.on_key(key(KeyCode::Char('O')));
+        app.help.as_mut().unwrap().selected = HelpMenu::THREADS_INCLUDE_SENT;
+        app.on_key(key(KeyCode::Enter));
+        let shown = crate::ui::tests::screen(&mut app, 120, 40);
+        let setting = shown
+            .lines()
+            .find(|line| line.contains("Include Sent in threads"))
+            .unwrap();
+        assert!(setting.contains("[✓]"), "{shown}");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(ids(&app), ["out", "in", "followup"]);
+        app.on_worker(
+            0,
+            worker::Event::Headers {
+                folder: "Sent".into(),
+                headers: vec![header(3, "last", "followup", 40)],
+            },
+        );
+        assert_eq!(ids(&app), ["out", "in", "followup", "last"]);
+        assert_eq!(app.items[1].message.folder, "INBOX", "keep the listed copy");
+        app.open_place(Place::AllInboxes);
+        assert_eq!(ids(&app), ["out", "in", "followup", "last"]);
+        app.change_setting(HelpMenu::THREADS_INCLUDE_SENT);
+        assert_eq!(
+            ids(&app),
+            ["in"],
+            "turning Sent threads off restores the list"
+        );
+        app.change_setting(HelpMenu::THREADS_INCLUDE_SENT);
+        app.settings.threads = false;
+        app.reload();
+        assert_eq!(ids(&app), ["in"]);
+        app.settings.threads = true;
+        app.run_search("Alice");
+        assert_eq!(ids(&app), ["in"], "search doesn't add related Sent mail");
+        app.search = None;
+        app.reload();
+        app.move_messages(0, "INBOX", &[1], "Archive");
+        assert!(
+            app.items.is_empty(),
+            "no Sent-only threads left in the inbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_sent_during_sent_sync_appears_without_another_manual_check() {
+        let mut app = app();
+        with_mail(&mut app);
+        let id = app.accounts[0].id.clone();
+        app.store.reset_folder(&id, "INBOX").unwrap();
+        app.store.reset_folder(&id, "Sent").unwrap();
+        let mut incoming = store::tests::header(1, "Plan", 10);
+        incoming.summary.message_id = "<incoming@example.org>".into();
+        app.store.add_headers(&id, "INBOX", &[incoming]).unwrap();
+        app.settings.threads_include_sent = true;
+        app.demo = false;
+        Arc::make_mut(&mut app.accounts[0].account).save_sent = Some(false);
+        app.reload();
+
+        app.sync_sent(0);
+        assert!(app.accounts[0].syncing.contains("Sent"));
+        // That check already looked for new mail before the server saved
+        // the reply. Only a check queued after sending can see it.
+        app.test_sent.borrow_mut().clear();
+        app.on_sent(
+            &id,
+            Ok(()),
+            false,
+            SentCopy {
+                raw: b"Message-ID: <outgoing@example.org>\r\nIn-Reply-To: <incoming@example.org>\r\nSubject: Re: Plan\r\n\r\nAgreed.".to_vec(),
+                to: vec![Addr {
+                    name: String::new(),
+                    addr: "alice@example.com".into(),
+                }],
+                replying: None,
+                draft_of: None,
+            },
+        );
+        let first_check = worker::Synced {
+            folder: "Sent".into(),
+            uidvalidity: 1,
+            ..Default::default()
+        };
+        app.on_worker(0, worker::Event::Synced(first_check.clone()));
+        let mut reply = store::tests::header(1, "Re: Plan", 20);
+        reply.summary.message_id = "<outgoing@example.org>".into();
+        reply.summary.in_reply_to = "<incoming@example.org>".into();
+        let requests = app.test_sent.take();
+        for (i, request) in requests {
+            if matches!(request, Request::Sync { ref folder, .. } if folder == "Sent") {
+                app.on_worker(
+                    i,
+                    worker::Event::Synced(worker::Synced {
+                        new: vec![reply.clone()],
+                        low: 1,
+                        high: 1,
+                        total: 1,
+                        ..first_check.clone()
+                    }),
+                );
+            }
+        }
+        let folders: Vec<_> = app
+            .items
+            .iter()
+            .map(|it| it.message.folder.as_str())
+            .collect();
+        assert_eq!(folders, ["INBOX", "Sent"], "the new reply is displayed");
+        assert_eq!(app.items[1].thread.tree, "└─");
     }
 
     /// Opens a new message, writes `to` and `subject`, and presses Ctrl-s.
