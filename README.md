@@ -260,6 +260,34 @@ confirm_agents = true    # ask before each change an agent makes
 # editor = ["/usr/bin/vim"]
 ```
 
+### Attachment viewers
+
+`A` opens the attachment picker; `Enter` opens the selected file. To use
+[pdfterm](https://github.com/jrf/pdfterm) for PDFs, add this to `settings.toml`:
+
+```toml
+[attachment_openers.pdf]
+command = ["pdfterm"]
+terminal = true
+```
+
+Each rule matches the final filename extension, without the dot and ignoring
+case (`pdf` also matches `report.PDF`). With no matching rule, tuimail uses the
+system's usual app. Saving with `s` is unchanged.
+
+`command` is the program followed by its arguments. Use a full program path or
+a name found on `PATH`; the saved attachment's full path is appended as one
+literal argument. No shell runs it: quotes, `$VARIABLES`, `~` and placeholders
+aren't expanded. A missing or failing terminal viewer is reported in tuimail,
+not retried through the system opener.
+
+`terminal = true` gives the viewer the screen and keyboard until it exits,
+then restores tuimail, as `Ctrl-e` does for the editor. pdfterm needs a terminal
+with Kitty graphics support, such as Ghostty or Kitty. Leave `terminal` out (or
+set it to `false`) for a graphical viewer that runs detached without terminal
+input or output. Files still open from tuimail's private `opened/` folder, and
+risky file types still ask before opening, regardless of their viewer.
+
 ## AI agents (MCP)
 
 `tuimail mcp` is an [MCP](https://modelcontextprotocol.io) server: an AI agent starts it, and it reaches your mail through the tuimail you have open. Nothing is kept in it and nothing goes around tuimail: every request is checked, and every change is made by tuimail as your keys would make it.

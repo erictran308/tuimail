@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -111,6 +111,148 @@ pub fn open_externally(target: &str) -> std::io::Result<()> {
     let mut child = command.spawn()?;
     std::thread::spawn(move || child.wait());
     Ok(())
+}
+
+/// An attachment opener with the file as one literal, absolute argument.
+/// Like the system opener, it runs from home, not beside untrusted files.
+pub fn attachment_command(argv: &[String], path: &Path) -> Result<Command> {
+    let name = argv
+        .first()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow!("the attachment opener's command is empty"))?;
+    let program = on_path(name).ok_or_else(|| {
+        anyhow!(
+            "attachment opener {} wasn't found; check its command in settings.toml",
+            crate::text::one_line(name, 80)
+        )
+    })?;
+    let mut command = Command::new(program);
+    command
+        .args(&argv[1..])
+        .arg(path)
+        .current_dir(dirs::home_dir().unwrap_or_else(|| "/".into()));
+    Ok(command)
+}
+
+/// Foreground viewers inherit the released terminal. Other viewers get
+/// no terminal streams and run detached, just like the system opener.
+pub fn open_attachment(mut command: Command, terminal: bool) -> Result<()> {
+    if terminal {
+        let status = foreground_status(&mut command).context("cannot run attachment opener")?;
+        if !status.success() {
+            bail!("attachment opener ended with {status}");
+        }
+    } else {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command.spawn().context("cannot run attachment opener")?;
+        std::thread::spawn(move || child.wait());
+    }
+    Ok(())
+}
+
+/// Ignore terminal interrupts in tuimail, not in the program using its
+/// terminal. Serialize this process-wide signal change, including in tests.
+fn foreground_status(command: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(unix)]
+    let _signals = ForegroundSignals::new(command)?;
+    #[cfg(windows)]
+    let _signals = ForegroundSignals::new()?;
+    command.status()
+}
+
+#[cfg(unix)]
+struct ForegroundSignals([libc::sigaction; 2]);
+
+#[cfg(unix)]
+impl ForegroundSignals {
+    fn new(command: &mut Command) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: these are initialized sigactions and valid signal numbers.
+        let signals = unsafe {
+            let mut previous: [libc::sigaction; 2] = std::mem::zeroed();
+            for (i, signal) in [libc::SIGINT, libc::SIGQUIT].into_iter().enumerate() {
+                if libc::sigaction(signal, std::ptr::null(), &mut previous[i]) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            let signals = Self(previous);
+            let mut ignored: libc::sigaction = std::mem::zeroed();
+            ignored.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut ignored.sa_mask);
+            for signal in [libc::SIGINT, libc::SIGQUIT] {
+                if libc::sigaction(signal, &ignored, std::ptr::null_mut()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            signals
+        };
+        // SAFETY: after fork, only async-signal-safe operations run here.
+        // Ignored dispositions survive exec, so reset them in the child.
+        unsafe {
+            command.pre_exec(|| {
+                let mut default: libc::sigaction = std::mem::zeroed();
+                default.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(&mut default.sa_mask);
+                for signal in [libc::SIGINT, libc::SIGQUIT] {
+                    if libc::sigaction(signal, &default, std::ptr::null_mut()) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        Ok(signals)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForegroundSignals {
+    fn drop(&mut self) {
+        for (signal, previous) in [libc::SIGINT, libc::SIGQUIT].into_iter().zip(&self.0) {
+            // SAFETY: restores the complete action read before the handoff.
+            unsafe { libc::sigaction(signal, previous, std::ptr::null_mut()) };
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ForegroundSignals;
+
+#[cfg(windows)]
+unsafe extern "system" fn foreground_control(control: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    i32::from(matches!(control, CTRL_C_EVENT | CTRL_BREAK_EVENT))
+}
+
+#[cfg(windows)]
+impl ForegroundSignals {
+    fn new() -> std::io::Result<Self> {
+        // A handler, unlike the inherited ignore flag, leaves the child
+        // interruptible. Only this process handles its Ctrl-C and Ctrl-Break.
+        let installed = unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(foreground_control), 1)
+        };
+        if installed == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ForegroundSignals {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(foreground_control), 0);
+        }
+    }
 }
 
 /// File types opened without asking: pictures, sound, video, PDF and plain
@@ -235,11 +377,9 @@ pub fn edit(argv: &[String], dir: &Path, text: &str) -> Result<String> {
     let result = (|| {
         // In the private folder, not wherever tuimail was started: an
         // editor may read settings from the folder it runs in.
-        let status = std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .arg(&path)
-            .current_dir(dir)
-            .status()
+        let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]).arg(&path).current_dir(dir);
+        let status = foreground_status(&mut command)
             .with_context(|| format!("cannot run {}", crate::text::one_line(&argv[0], 80)))?;
         if !status.success() {
             bail!("the editor ended with {status}; the text wasn't changed");
@@ -345,6 +485,67 @@ mod tests {
             );
             assert_eq!(absolute_path_entries(Some(".:x".into())), None);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_openers_receive_literal_arguments_and_report_foreground_failure() {
+        let dir = private_temp_dir().unwrap();
+        let path = dir.join("report $(echo unsafe); two.PDF");
+        std::fs::write(&path, b"attachment bytes\n").unwrap();
+        let literal = "--title=$(echo unsafe); *";
+        for terminal in [true, false] {
+            let output = dir.join(if terminal { "foreground" } else { "detached" });
+            let done = output.with_extension("done");
+            let argv = vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "cat \"$2\" > \"$0\"; printf '%s' \"$1\" >> \"$0\"; mv \"$0\" \"$0.done\"; exit 7"
+                    .into(),
+                output.to_string_lossy().into_owned(),
+                literal.into(),
+            ];
+            let result = open_attachment(attachment_command(&argv, &path).unwrap(), terminal);
+            assert_eq!(
+                result.is_err(),
+                terminal,
+                "only foreground exits are awaited"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !done.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                std::fs::read_to_string(&done).unwrap(),
+                format!("attachment bytes\n{literal}")
+            );
+        }
+        assert!(attachment_command(&[], &path).is_err());
+        assert!(attachment_command(&["./untrusted-viewer".into()], &path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_viewer_interrupts_do_not_interrupt_tuimail() {
+        const CHILD: &str = "TUIMAIL_TEST_FOREGROUND_INTERRUPT";
+        if std::env::var_os(CHILD).is_some() {
+            let argv = ["/bin/sh".into(), "-c".into(), "kill -INT 0".into()];
+            let command = attachment_command(&argv, Path::new("/attachment.pdf")).unwrap();
+            assert!(open_attachment(command, true).is_err());
+            return;
+        }
+        // An isolated test process group: its viewer signals that whole
+        // group, as a cooked terminal does, without ever signalling cargo.
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "tools::tests::attachment_viewer_interrupts_do_not_interrupt_tuimail",
+            ])
+            .env(CHILD, "1");
+        std::os::unix::process::CommandExt::process_group(&mut child, 0);
+        assert!(child.status().unwrap().success());
     }
 
     #[test]
