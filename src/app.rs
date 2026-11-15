@@ -6487,14 +6487,19 @@ pub mod tests {
         assert_eq!(reply.message.folder, "Sent");
         assert_eq!(reply.message.uid, sent[0].uid);
         assert_eq!(reply.thread.tree, "└─");
-        let shown = crate::ui::tests::screen(&mut app, 160, 30);
-        let lines: Vec<&str> = shown.lines().collect();
-        let root = lines
-            .iter()
-            .position(|l| l.contains("Lunch tomorrow?"))
-            .unwrap();
-        assert!(lines[root + 1].contains("To Alice"), "{shown}");
-        assert!(lines[root + 1].contains("[Sent]"), "{shown}");
+        for icons in [crate::icons::NERD, crate::icons::PLAIN] {
+            app.icons = icons;
+            let shown = crate::ui::tests::screen(&mut app, 160, 30);
+            let lines: Vec<&str> = shown.lines().collect();
+            let root = lines
+                .iter()
+                .position(|l| l.contains("Lunch tomorrow?"))
+                .unwrap();
+            let reply = lines[root + 1];
+            assert!(reply.contains("To Alice"), "{shown}");
+            assert!(reply.contains(&format!("└─ {} ", icons.sent)), "{shown}");
+            assert!(!reply.contains("[Sent]"), "{shown}");
+        }
         app.focus = Focus::List;
         app.selected = 1;
         app.open_selected(true);
@@ -6588,6 +6593,11 @@ pub mod tests {
         assert_eq!(app.items[1].message.folder, "INBOX", "keep the listed copy");
         app.open_place(Place::AllInboxes);
         assert_eq!(ids(&app), ["out", "in", "followup", "last"]);
+        let shown = crate::ui::tests::screen(&mut app, 160, 30);
+        assert!(
+            shown.contains(&format!("{} [work]", app.icons.sent)),
+            "Sent rows keep their account label:\n{shown}"
+        );
         app.change_setting(HelpMenu::THREADS_INCLUDE_SENT);
         assert_eq!(
             ids(&app),
